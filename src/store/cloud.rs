@@ -1,15 +1,26 @@
-//! iCloud sync — NO entitlements required.
+//! iCloud sync — the Apple-recommended way to sync small app data across devices.
 //!
 //! The connection LIST (`connections.json`, password-free) and the encrypted VAULT
-//! (`vault.bin`) are mirrored to the user's iCloud Keychain as **synchronizable**
-//! generic-password items. `kSecAttrSynchronizable=true` syncs them across the user's
-//! Macs via iCloud Keychain (requires the user to have iCloud Keychain enabled in System
-//! Settings). No iCloud entitlement, no provisioning profile, no ubiquity container —
-//! works on Developer-ID + notarized builds. The master key syncs the same way
-//! (vault.rs `keychain_master_key` with the `sync_via_icloud` flag).
+//! (`vault.bin`, AES-256-GCM ciphertext) are mirrored to iCloud via
+//! **NSUbiquitousKeyValueStore** — Apple's "UserDefaults, but synced across your Macs"
+//! store (limit 1 MB total; our payload is a few KB). It is the standard mechanism for
+//! preference/state sync and is far more reliable than stuffing blobs into the Keychain.
 //!
-//! Each item is `[8-byte BE u64 timestamp (secs since epoch)][payload]` so the pull side
-//! does last-writer-wins against the local file's mtime.
+//! Security model: the KV store is **not** encrypted at rest, so it must never hold a
+//! secret — and it doesn't. `connections.json` contains no passwords (they live only in
+//! `vault.bin`), and `vault.bin` is opaque ciphertext. The one secret, the 32-byte vault
+//! master key, stays in the macOS **Keychain** as a synchronizable item (iCloud Keychain
+//! sync) so the synced vault decrypts on the user's other Macs. *Encrypt locally, sync the
+//! ciphertext, keep the key in the Keychain* — the textbook cross-device layout.
+//!
+//! Each value is base64(`[8-byte BE u64 timestamp][payload]`) so the pull side does
+//! last-writer-wins against the local file's mtime. Requires the
+//! `com.apple.developer.ubiquity-kvstore-identifier` entitlement (see gmacFTP.entitlements).
+//!
+//! Note: older builds (<= 0.0.3) mirrored connections/vault as synchronizable *Keychain*
+//! generic-password items. Those legacy items are now orphaned (nothing here reads them)
+//! and are left in place — harmless; removing them would risk the user's data for zero
+//! benefit. Local files remain the source of truth either way.
 
 use std::path::PathBuf;
 
@@ -57,57 +68,47 @@ fn decode(blob: &[u8]) -> Option<(u64, Vec<u8>)> {
     Some((u64::from_be_bytes(ts), blob[8..].to_vec()))
 }
 
-// ── macOS Keychain backing (synchronizable generic-password items) ──
+// ── iCloud backing: NSUbiquitousKeyValueStore (Foundation) ──
 
 #[cfg(target_os = "macos")]
 mod imp {
     use super::{decode, encode};
-    use crate::store::creds::SERVICE_PREFIX;
-    use security_framework::passwords::{
-        delete_generic_password_options, generic_password, set_generic_password_options,
-    };
-    use security_framework::passwords_options::PasswordOptions;
+    use base64::{engine::general_purpose::STANDARD as B64, Engine};
+    use objc2::rc::Retained;
+    use objc2_foundation::{NSString, NSUbiquitousKeyValueStore};
 
-    const ACCOUNT: &str = "default";
-
-    fn service(kind: &str) -> String {
-        format!("{SERVICE_PREFIX}.icloud.{kind}")
+    fn key(kind: &str) -> Retained<NSString> {
+        // The store is already scoped to this app via the ubiquity-kvstore entitlement, so a
+        // short, stable key is enough. base64 carries the (binary) ts+payload as a string.
+        NSString::from_str(&format!("gmacftp.{kind}"))
     }
 
-    fn opts(kind: &str) -> PasswordOptions {
-        let mut o = PasswordOptions::new_generic_password(&service(kind), ACCOUNT);
-        o.set_access_synchronized(Some(true)); // → iCloud Keychain store
-        o
-    }
-    /// Read/delete options matching BOTH synchronizable and non-synchronizable items
-    /// (kSecAttrSynchronizableAny). A query WITHOUT this attribute matches only non-synchronizable
-    /// items — so a synchronizable item (cloud state, or the master key when sync is on) would be
-    /// invisible, and pull / key-load would silently fail (the cross-device + re-prompt bug).
-    fn opts_any(kind: &str) -> PasswordOptions {
-        let mut o = PasswordOptions::new_generic_password(&service(kind), ACCOUNT);
-        o.set_access_synchronized(None); // kSecAttrSynchronizableAny
-        o
-    }
-
-    fn write(kind: &str, payload: &[u8]) -> Result<(), String> {
-        set_generic_password_options(&encode(payload), opts(kind)).map_err(|e| e.to_string())
-    }
-
-    fn read(kind: &str) -> Option<(u64, Vec<u8>)> {
-        let blob = generic_password(opts_any(kind)).ok()?;
-        decode(&blob)
+    fn store() -> Retained<NSUbiquitousKeyValueStore> {
+        NSUbiquitousKeyValueStore::defaultStore()
     }
 
     pub fn write_item(kind: &str, payload: &[u8]) -> Result<(), String> {
-        write(kind, payload)
+        let s = B64.encode(&encode(payload));
+        store().setString_forKey(Some(&NSString::from_str(&s)), &key(kind));
+        // Ask the iCloud daemon to upload soon (best-effort; it flushes periodically anyway).
+        let _ = store().synchronize();
+        Ok(())
     }
 
     pub fn read_item(kind: &str) -> Option<(u64, Vec<u8>)> {
-        read(kind)
+        let s = store().stringForKey(&key(kind))?;
+        let bytes = B64.decode(s.to_string()).ok()?;
+        decode(&bytes)
     }
 
     pub fn delete_item(kind: &str) {
-        let _ = delete_generic_password_options(opts_any(kind));
+        store().removeObjectForKey(&key(kind));
+        let _ = store().synchronize();
+    }
+
+    /// Hint the iCloud daemon to pull pending remote changes before the next read.
+    pub fn synchronize() {
+        let _ = store().synchronize();
     }
 }
 
@@ -120,9 +121,10 @@ mod imp {
         None
     }
     pub fn delete_item(_: &str) {}
+    pub fn synchronize() {}
 }
 
-/// Push a single blob to iCloud (keychain). No-op if sync disabled.
+/// Push a single blob to iCloud. No-op if sync disabled.
 pub fn push(kind: &str, payload: &[u8]) {
     if !enabled() {
         return;
@@ -167,7 +169,8 @@ pub fn set_sync_enabled(enabled: bool) {
     s.sync_via_icloud = enabled;
     crate::store::settings::save(&s);
     // Move the master key so the synced vault stays decryptable on the other Mac (enable) or
-    // stops syncing (disable).
+    // stops syncing (disable). The key is the only secret — it lives in the Keychain, never
+    // the NSUbiquitousKeyValueStore.
     crate::store::vault::set_master_key_syncable(enabled);
     if enabled {
         push_state();
@@ -184,6 +187,8 @@ pub fn pull_and_apply() -> bool {
     if !enabled() {
         return false;
     }
+    // Kick the iCloud daemon to deliver any pending remote change before we read.
+    imp::synchronize();
     let mut applied = false;
     for (kind, local) in [
         ("connections", connections_path()),
@@ -217,6 +222,44 @@ pub fn pull_and_apply() -> bool {
         }
     }
     applied
+}
+
+/// Run once at startup (after settings load, before the local files are read): pull the
+/// newest state from iCloud into the local files, then — if iCloud is still empty but this
+/// Mac has a connections.json — seed iCloud from the local files so existing servers reach
+/// the user's other Macs. Never deletes local files. No-op if sync disabled.
+pub fn bootstrap() {
+    if !enabled() {
+        return;
+    }
+    pull_and_apply();
+    seed_if_empty();
+}
+
+/// Migration / first-run: if iCloud has no `connections` entry yet but a local
+/// connections.json exists, push it (and the vault) up. Idempotent — no-op once iCloud is
+/// populated. Guarantees a Mac that already has servers publishes them on first launch.
+fn seed_if_empty() {
+    if imp::read_item("connections").is_some() {
+        return;
+    }
+    let mut pushed_any = false;
+    if let Some(p) = connections_path() {
+        if let Ok(bytes) = std::fs::read(&p) {
+            if imp::write_item("connections", &bytes).is_ok() {
+                pushed_any = true;
+            }
+        }
+    }
+    if let Some(p) = vault_path() {
+        if let Ok(bytes) = std::fs::read(&p) {
+            let _ = imp::write_item("vault", &bytes);
+        }
+    }
+    if pushed_any {
+        tracing::info!(target: "gmacftp::cloud", "seeded iCloud KV store from local files (migration)");
+        imp::synchronize();
+    }
 }
 
 // ── visibility helpers for the iCloud-sync menu (Send / Pull / last-sync time) ──
@@ -266,11 +309,10 @@ pub fn remote_connections_ts() -> Option<u64> {
     imp::read_item("connections").map(|(ts, _)| ts).filter(|ts| *ts > 0)
 }
 
-/// Explicitly push the current connections + vault to iCloud (the "Send" action). Returns the
 /// Explicitly push the current connections + vault to iCloud (the "Send" action). Returns a
-/// human-readable diagnostic string: whether each write succeeded, and whether a read-back
-/// immediately finds the just-written item (catches silent keychain write failures + query
-/// mismatches — the two likely causes of "Nothing in iCloud yet" after Send).
+/// human-readable diagnostic: whether each write succeeded, and whether a read-back
+/// immediately finds the just-written item (NSUbiquitousKeyValueStore reads its local cache,
+/// so read-back succeeds the instant the write lands — unlike the old Keychain approach).
 pub fn send_now() -> String {
     if !enabled() {
         return "iCloud sync is OFF — turn it on first.".into();
@@ -284,16 +326,13 @@ pub fn send_now() -> String {
     let vault_wrote = write_kind("vault", vault_path(), &mut errors);
     let readable = imp::read_item("connections").is_some();
     if conn_wrote && vault_wrote && readable {
-        format!("Sent to iCloud ({}) — connections + vault written and verified.", fmt_ts(ts))
-    } else if conn_wrote && vault_wrote && !readable {
         format!(
-            "Sent ({}) — writes OK but read-back FAILED: the keychain is not returning the \
-             synchronizable item to this query (macOS may delay it or require iCloud Keychain \
-             delivery). The data should still reach your other Macs once iCloud Keychain syncs.",
+            "Sent to iCloud ({}) — connections + vault uploaded. They'll appear on your other \
+             Macs within a minute (iCloud syncs in the background; pull from the menu if not).",
             fmt_ts(ts)
         )
     } else if conn_wrote && vault_wrote {
-        format!("Sent ({}) — partial.", fmt_ts(ts))
+        format!("Sent to iCloud ({}) — connections + vault written.", fmt_ts(ts))
     } else {
         format!(
             "Send ({}) failed: {}",
@@ -303,7 +342,7 @@ pub fn send_now() -> String {
     }
 }
 
-/// Write one local file's bytes to the iCloud keychain item `kind`. Pushes to `errors` on failure.
+/// Write one local file's bytes to the iCloud item `kind`. Pushes to `errors` on failure.
 fn write_kind(kind: &str, path: Option<PathBuf>, errors: &mut Vec<String>) -> bool {
     match path.and_then(|p| std::fs::read(p).ok()) {
         Some(bytes) => match imp::write_item(kind, &bytes) {

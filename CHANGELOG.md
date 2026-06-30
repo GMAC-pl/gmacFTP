@@ -4,6 +4,11 @@
 
 _(Nothing yet.)_
 
+## 0.0.4 — 2026-06-30
+
+- **iCloud sync rebuilt on the right mechanism.** v0.0.3 mirrored the connection list and the encrypted vault as _synchronizable Keychain_ items, which Apple's iCloud Keychain propagates unreliably between Macs (so the 2nd Mac often saw "Nothing in iCloud yet"). gmacFTP now syncs server data via **NSUbiquitousKeyValueStore** — Apple's standard "UserDefaults, but synced across your Macs" store for small app data — which is reliable and exactly what iCloud sync is designed for. Only the vault master key (a genuine secret) stays in the Keychain, synced via iCloud Keychain, so the synced vault decrypts on the other Mac. Encrypt locally, sync the ciphertext, keep the key in the Keychain.
+- **No data loss on upgrade.** Local `connections.json` + `vault.bin` are always the source of truth; the first launch with sync on seeds iCloud from them if it's empty. Existing servers are preserved.
+
 ## 0.0.3 — 2026-06-30
 
 - **Critical iCloud-sync fix**: synchronizable Keychain items (the master key + the synced connections/vault) were written with `kSecAttrSynchronizable=true` but READ without the matching query attribute, so macOS returned only non-synchronizable items. With iCloud sync ON this meant the master key could not be found (a fresh key was generated each launch → vault undecryptable → every connection re-prompted the Keychain) and the 2nd Mac's pull found nothing. Reads/deletes now use `kSecAttrSynchronizableAny` (match both stores).

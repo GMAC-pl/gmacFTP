@@ -97,7 +97,7 @@ PLIST
 <b style="font-size:13px">gmacFTP</b><br/>
 Native macOS FTP, FTPS and SFTP client. Built with Rust and Slint.<br/><br/>
 <b>Security.</b> Passwords live in the macOS Keychain inside an AES-256-GCM vault; the master key never touches disk.<br/>
-<b>Sync.</b> Optionally keep your saved servers across your Macs via iCloud Keychain.<br/><br/>
+<b>Sync.</b> Optionally keep your saved servers across your Macs via iCloud. Passwords travel only as encrypted ciphertext; the master key stays in your Keychain.<br/><br/>
 Open source under GPL v3 (or a commercial license — see the repo):<br/>
 <a href="https://github.com/GMAC-pl/gmacftp">github.com/GMAC-pl/gmacftp</a>
 </body></html>

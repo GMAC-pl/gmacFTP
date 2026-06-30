@@ -600,10 +600,12 @@ pub fn run() {
     ui.set_accept_any_cert(settings.accept_any_cert);
     refresh_local_favorites_model(&ui);
 
-    // iCloud sync pull (BEFORE bootstrap loads local files): if a newer connections.json /
-    // vault.bin exists in iCloud Keychain, overwrite the local copies so this Mac reflects
-    // the latest state from the user's other devices. No-op if sync disabled.
-    let _ = store::cloud::pull_and_apply();
+    // iCloud sync (BEFORE bootstrap loads local files): pull the newest connections.json /
+    // vault.bin from iCloud (NSUbiquitousKeyValueStore) into the local copies so this Mac
+    // reflects the latest state from the user's other devices — and, if iCloud is still
+    // empty but this Mac already has servers, seed iCloud from them (migration). No-op if
+    // sync disabled. Local files are never deleted, so existing servers are always kept.
+    let _ = store::cloud::bootstrap();
 
     let connections = if use_design_demo_connections() {
         design_demo_connections()

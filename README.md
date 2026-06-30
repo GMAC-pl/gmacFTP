@@ -16,7 +16,7 @@ files — quickly and safely.
 
 ## ⬇️ Download & install
 
-**[↓ Download gmacFTP for Mac — gmacFTP-0.0.3.dmg](https://github.com/GMAC-pl/gmacftp/releases/download/v0.0.3/gmacFTP-0.0.3.dmg)** · macOS 11+, Apple Silicon (M-series)
+**[↓ Download gmacFTP for Mac — gmacFTP-0.0.4.dmg](https://github.com/GMAC-pl/gmacftp/releases/download/v0.0.4/gmacFTP-0.0.4.dmg)** · macOS 11+, Apple Silicon (M-series)
 
 1. Download the `.dmg`.
 2. Open it and **drag gmacFTP into the Applications folder** (a shortcut is inside).
@@ -39,13 +39,14 @@ Signed with an **Apple Developer ID** and **notarized by Apple** — opens clean
   the master key never touches disk. FTPS is strict-by-default; SFTP verifies host keys.
 - 🍎 **Genuinely native.** A real macOS app: custom titlebar, native menu bar, drag-and-drop,
   light/dark themes, Apple Silicon. Not a web page in disguise.
-- ☁️ **Yours everywhere.** Optionally sync your saved servers across your Macs via iCloud Keychain.
+- ☁️ **Yours everywhere.** Optionally sync your saved servers across your Macs via iCloud —
+  passwords travel only as AES-256 ciphertext, with the master key in your Keychain.
 - 🔓 **Open & private.** GPL-3.0 licensed (with a commercial option). No accounts, no cloud dependency you didn't ask for, no
   telemetry. Your servers stay yours.
 
 ### Download
 
-**[⬇ gmacFTP-0.0.3.dmg](https://github.com/GMAC-pl/gmacftp/releases/download/v0.0.3/gmacFTP-0.0.3.dmg)** — install steps are at the top of this page.
+**[⬇ gmacFTP-0.0.4.dmg](https://github.com/GMAC-pl/gmacftp/releases/download/v0.0.4/gmacFTP-0.0.4.dmg)** — install steps are at the top of this page.
 
 Prefer to build it yourself? See [Build](#build).
 
@@ -55,7 +56,7 @@ Prefer to build it yourself? See [Build](#build).
 - **FTP**, **explicit-TLS FTPS**, and **SFTP** (pure-Rust SSH stack)
 - Upload / download / pane-to-pane transfers + a live **transfer queue**
 - **macOS Keychain** secret storage (master key never on disk)
-- Optional **iCloud Keychain sync** of saved servers (toggle in the app menu)
+- Optional **iCloud sync** of saved servers across your Macs (toggle in the app menu)
 - Connection manager, FileZilla `sitemanager.xml` + JSON import
 - Native macOS **menu bar** (App / File / Edit / View / Window / Help) + About panel
 - Light/dark themes, EN/PL UI
@@ -105,7 +106,7 @@ connection manager, and local copy flows with no server at all.
 
 ### Privacy & security
 
-- No telemetry, no accounts — the app only talks to the servers you configure. (iCloud Keychain sync is opt-in, off by default.)
+- No telemetry, no accounts — the app only talks to the servers you configure. (iCloud sync is opt-in, off by default; only the master key uses the Keychain — server data syncs via iCloud's key-value store.)
 - `data/`, `.env*`, build artifacts, and local tool state are gitignored; this repo contains no
   private data.
 - Passwords are never stored in connection metadata.
@@ -162,12 +163,14 @@ która po prostu przenosi Twoje pliki — szybko i bezpiecznie.
   nigdy nie ląduje na dysku. FTPS strict-by-default; SFTP weryfikuje klucze hostów.
 - 🍎 **Natywny.** Prawdziwa apka macOS: własny titlebar, natywne menu, drag-and-drop, jasny/ciemny
   motyw, Apple Silicon (v0.0.3: arm64).
-- ☁️ **Twój wszędzie.** Opcjonalna synchronizacja zapisanych serwerów przez iCloud Keychain.
+- ☁️ **Twój wszędzie.** Opcjonalna synchronizacja zapisanych serwerów przez iCloud — hasła
+  przesyłane są tylko jako zaszyfrowany szyfrogram (AES-256), a klucz mistrzowski zostaje w
+  Keychainie.
 - 🔓 **Otwarty i prywatny.** Licencja GPL-3.0 (z opcją komercyjną), bez kont, bez telemetrii.
 
 ### Pobranie i instalacja
 
-**[⬇ Pobierz gmacFTP dla Maca — gmacFTP-0.0.3.dmg](https://github.com/GMAC-pl/gmacftp/releases/download/v0.0.3/gmacFTP-0.0.3.dmg)** · macOS 11+, Apple Silicon (M-series)
+**[⬇ Pobierz gmacFTP dla Maca — gmacFTP-0.0.4.dmg](https://github.com/GMAC-pl/gmacftp/releases/download/v0.0.4/gmacFTP-0.0.4.dmg)** · macOS 11+, Apple Silicon (M-series)
 
 1. Pobierz plik `.dmg`.
 2. Otwórz go i **przeciągnij gmacFTP do folderu Aplikacje** (skrót jest w środku).
@@ -181,7 +184,7 @@ Podpisana **Apple Developer ID** i **zanotaryzowana przez Apple** — uruchamia 
 - **FTP**, **FTPS** (explicit TLS) i **SFTP** (SSH w czystym Ruście)
 - Transfery upload / download / panel-do-panelu + live **kolejka transferów**
 - Sekrety w **macOS Keychain** (klucz główny nigdy na dysku)
-- Opcjonalna **synchronizacja iCloud Keychain** zapisanych serwerów (przełącznik w menu)
+- Opcjonalna **synchronizacja iCloud** zapisanych serwerów między Macami (przełącznik w menu)
 - Menedżer połączeń, import z FileZilla `sitemanager.xml` + JSON
 - Natywne **menu** macOS (App / File / Edit / View / Window / Help) + panel About
 - Jasny/ciemny motyw, UI po ang. i pol.
@@ -227,7 +230,7 @@ sortowanie, menedżer połączeń i lokalne kopiowanie bez żadnego serwera.
 
 ### Prywatność i bezpieczeństwo
 
-- Brak telemetrii, brak kont — apka łączy się tylko z serwerami, które sam podałeś. (Synchronizacja iCloud Keychain jest opcjonalna, domyślnie wyłączona.)
+- Brak telemetrii, brak kont — apka łączy się tylko z serwerami, które sam podałeś. (Synchronizacja iCloud jest opcjonalna, domyślnie wyłączona; w Keychainie jest tylko klucz mistrzowski — dane serwerów synchronizuje magazyn klucz-wartość iCloud.)
 - `data/`, `.env*`, artefakty builda i stan narzędzi są gitignorowane; repo nie zawiera prywatnych danych.
 - Hasła nigdy nie trafiają do metadanych połączeń.
 

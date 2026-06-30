@@ -24,9 +24,10 @@ pub struct Settings {
     /// When true, it is the full user-controlled Favorites order.
     #[serde(default)]
     pub local_favorites_customized: bool,
-    /// Store the vault master key as an iCloud-Keychain-syncing item so saved FTP/SFTP
-    /// credentials decrypt on the user's other Macs (requires iCloud Keychain enabled in
-    /// System Settings). Default OFF: the key is a local, non-syncing Keychain item.
+    /// Enable iCloud sync of the connection list + encrypted vault across the user's Macs
+    /// (via NSUbiquitousKeyValueStore — requires an iCloud account). When on, the vault
+    /// master key is ALSO stored as an iCloud-Keychain-syncing item (requires iCloud Keychain
+    /// in System Settings) so the synced vault decrypts on the other Mac. Default OFF.
     #[serde(default)]
     pub sync_via_icloud: bool,
 }

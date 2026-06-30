@@ -1,6 +1,6 @@
 [package]
 name = "gmacftp"
-version = "0.0.3"
+version = "0.0.4"
 edition = "2021"
 rust-version = "1.88"
 description = "gmacFTP — native, lightweight FTP/FTPS/SFTP client for macOS"
