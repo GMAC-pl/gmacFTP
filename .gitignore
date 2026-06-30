@@ -19,3 +19,12 @@
 **/.DS_Store
 ._*
 Icon?
+
+# Apple signing material — NEVER commit (defense-in-depth; none should ever be staged)
+*.cer
+*.p12
+*.pfx
+*.provisionprofile
+*.mobileprovision
+master.key
+embedded.provisionprofile

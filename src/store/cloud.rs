@@ -130,9 +130,6 @@ mod imp {
             let _ = std::fs::remove_file(p);
         }
     }
-
-    /// No-op: the OS syncs the folder. Kept for symmetry with the push/pull call sites.
-    pub fn synchronize() {}
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -148,7 +145,6 @@ mod imp {
         None
     }
     pub fn delete_item(_: &str) {}
-    pub fn synchronize() {}
 }
 
 /// Push a single blob to iCloud. No-op if sync disabled.
@@ -197,7 +193,7 @@ pub fn set_sync_enabled(enabled: bool) {
     crate::store::settings::save(&s);
     // Move the master key so the synced vault stays decryptable on the other Mac (enable) or
     // stops syncing (disable). The key is the only secret — it lives in the Keychain, never
-    // the NSUbiquitousKeyValueStore.
+    // in the synced folder.
     crate::store::vault::set_master_key_syncable(enabled);
     if enabled {
         push_state();
@@ -214,8 +210,6 @@ pub fn pull_and_apply() -> bool {
     if !enabled() {
         return false;
     }
-    // Kick the iCloud daemon to deliver any pending remote change before we read.
-    imp::synchronize();
     let mut applied = false;
     for (kind, local) in [
         ("connections", connections_path()),
@@ -285,7 +279,6 @@ fn seed_if_empty() {
     }
     if pushed_any {
         tracing::info!(target: "gmacftp::cloud", "seeded sync folder (iCloud Drive) from local files (migration)");
-        imp::synchronize();
     }
 }
 

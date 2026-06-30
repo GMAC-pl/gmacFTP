@@ -74,7 +74,7 @@ security-framework = "3"   # one-time ForkLift internet-password import
 objc2 = "0.6"
 raw-window-handle = "0.6"
 objc2-app-kit = "0.3.2"     # native macOS menu bar / About panel (NSMenu, NSApp, NSWindow)
-objc2-foundation = "0.3.2"  # NSString, NSData, NSNumber for the menu
+objc2-foundation = "0.3.2"  # NSString for the menu; NSPoint used in app.rs
 
 [build-dependencies]
 slint-build = "1.16"

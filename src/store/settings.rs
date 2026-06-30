@@ -30,10 +30,11 @@ pub struct Settings {
     /// (`~/Library/Mobile Documents/com~apple~CloudDocs/gmacFTP`) when that exists.
     #[serde(default)]
     pub sync_folder: Option<String>,
-    /// Enable iCloud sync of the connection list + encrypted vault across the user's Macs
-    /// (via NSUbiquitousKeyValueStore — requires an iCloud account). When on, the vault
-    /// master key is ALSO stored as an iCloud-Keychain-syncing item (requires iCloud Keychain
-    /// in System Settings) so the synced vault decrypts on the other Mac. Default OFF.
+    /// Enable cross-device sync of the connection list + encrypted vault. Sync mirrors
+    /// `connections.json` + `vault.bin` as plain files in a synced folder (default the user's
+    /// iCloud Drive). When on, the vault master key is ALSO stored as an iCloud-Keychain-
+    /// syncing item (requires iCloud Keychain in System Settings) so the synced vault decrypts
+    /// on the other Mac. Default OFF.
     #[serde(default)]
     pub sync_via_icloud: bool,
 }

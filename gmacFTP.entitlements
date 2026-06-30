@@ -14,13 +14,14 @@
   <key>com.apple.security.network.client</key>
   <true/>
 
-  <!-- iCloud sync architecture: app DATA (connections.json + the AES-256-GCM vault) syncs via
-       NSUbiquitousKeyValueStore, which needs `icloud-services: CloudKit` + the
-       `ubiquity-kvstore-identifier` below. Only the vault MASTER KEY is a secret, so it is the
-       sole thing stored in the Keychain — as a synchronizable item (iCloud Keychain sync) so the
-       synced vault decrypts on the user's other Macs. A synchronizable Keychain write fails with
-       errSecMissingEntitlement (-34018) unless `keychain-access-groups` is present, hence it
-       stays here. Requires a Developer ID provisioning profile that includes iCloud. -->
+  <!-- Sync architecture: app DATA (connections.json + the AES-256-GCM vault) syncs as PLAIN
+       FILES in a synced folder (default ~/Library/Mobile Documents/com~apple~CloudDocs/gmacFTP/
+       — iCloud Drive); NO iCloud/CloudKit API is used. Only the vault MASTER KEY is a secret:
+       it lives in the Keychain as a synchronizable item (iCloud Keychain sync) so the synced
+       vault decrypts on the user's other Macs. The CloudKit + ubiquity-kvstore entitlements
+       below are no longer used by the data sync, but `keychain-access-groups` is retained — a
+       synchronizable Keychain write fails with errSecMissingEntitlement (-34018) without it.
+       They are inert otherwise. Requires a Developer ID provisioning profile that includes iCloud. -->
   <key>keychain-access-groups</key>
   <array>
     <string>SY4HQ4PWVU.app.mackftp.client</string>
