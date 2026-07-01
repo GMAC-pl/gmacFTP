@@ -2713,12 +2713,11 @@ dependencies = [
 
 [[package]]
 name = "gmacftp"
-version = "0.0.12"
+version = "0.0.13"
 dependencies = [
  "aes-gcm 0.10.3",
  "anyhow",
  "argon2 0.5.3",
- "async-trait",
  "base64",
  "directories",
  "drag",
@@ -2741,10 +2740,8 @@ dependencies = [
  "slint",
  "slint-build",
  "suppaftp",
- "tempfile",
  "thiserror 1.0.69",
  "tokio",
- "tokio-stream",
  "tracing",
  "tracing-subscriber",
  "trash",
@@ -7239,17 +7236,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.118",
-]
-
-[[package]]
-name = "tokio-stream"
-version = "0.1.18"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "32da49809aab5c3bc678af03902d4ccddea2a87d028d86392a4b1560c6906c70"
-dependencies = [
- "futures-core",
- "pin-project-lite",
- "tokio",
 ]
 
 [[package]]

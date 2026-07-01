@@ -86,31 +86,26 @@ impl FileVault {
         Self { map: Mutex::new(map), key: Mutex::new(key), vault_path }
     }
 
-    fn persist(&self) {
+    fn persist(&self) -> Result<(), CredentialError> {
         // The plaintext JSON of ALL secrets is the most sensitive transient buffer — wipe it.
         let plaintext = {
-            let map = match self.map.lock() {
-                Ok(m) => m,
-                Err(_) => return,
-            };
-            match serde_json::to_vec(&*map) {
-                Ok(v) => Zeroizing::new(v),
-                Err(_) => return,
-            }
+            let map = self
+                .map
+                .lock()
+                .map_err(|_| CredentialError::Other("vault mutex poisoned".to_string()))?;
+            serde_json::to_vec(&*map)
+                .map(Zeroizing::new)
+                .map_err(|e| CredentialError::Other(e.to_string()))?
         };
         // Reuse the in-memory key (Keychain-resolved at open) — do NOT re-hit the Keychain
         // or the master.key file on every write.
         let key = *self.key.lock().unwrap_or_else(|e| e.into_inner());
-        match encrypt(&key, &plaintext) {
-            Ok(blob) => {
-                if let Err(e) = atomic_write(&self.vault_path, &blob) {
-                    tracing::warn!(error = %e, "vault write failed");
-                }
-            }
-            Err(e) => tracing::warn!(error = %e, "vault encrypt failed"),
-        }
-        // Mirror the updated vault.bin (and connections.json) to iCloud if sync is on.
+        let blob = encrypt(&key, &plaintext).map_err(|e| CredentialError::Other(e))?;
+        atomic_write(&self.vault_path, &blob).map_err(|e| CredentialError::Other(e.to_string()))?;
+        // Best-effort mirror of vault.bin (and connections.json) to iCloud if sync is on —
+        // push_state warns internally, so it never turns a successful local write into a failure.
         crate::store::cloud::push_state();
+        Ok(())
     }
 
     /// True when the vault came up empty (undecryptable with the locally-available key) AND a
@@ -196,7 +191,7 @@ impl FileVault {
             }
             if n > 0 {
                 tracing::info!("migrated {n} keychain credentials into the vault");
-                self.persist(); // one batched write + sync
+                let _ = self.persist(); // one batched write + sync (best-effort)
             }
             n
         }
@@ -220,14 +215,12 @@ impl CredentialStore for FileVault {
             .lock()
             .expect("vault")
             .insert(pack_key(host, user), b64);
-        self.persist();
-        Ok(())
+        self.persist()
     }
 
     fn delete(&self, host: &str, user: &str) -> Result<(), CredentialError> {
         self.map.lock().expect("vault").remove(&pack_key(host, user));
-        self.persist();
-        Ok(())
+        self.persist()
     }
 }
 
@@ -247,6 +240,12 @@ impl MigratingStore {
     #[cfg(not(target_os = "macos"))]
     pub fn new() -> Self {
         Self { vault: FileVault::open() }
+    }
+}
+
+impl Default for MigratingStore {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -272,7 +271,7 @@ impl CredentialStore for MigratingStore {
     }
 
     fn delete(&self, host: &str, user: &str) -> Result<(), CredentialError> {
-        let _ = self.vault.delete(host, user);
+        self.vault.delete(host, user)?;
         #[cfg(target_os = "macos")]
         {
             let _ = self.keychain.delete(host, user);
@@ -452,9 +451,7 @@ mod keychain_master_key {
 
 #[cfg(target_os = "macos")]
 mod keychain_passphrase {
-    use security_framework::passwords::{
-        delete_generic_password_options, generic_password, set_generic_password_options,
-    };
+    use security_framework::passwords::{generic_password, set_generic_password_options};
     use security_framework::passwords_options::PasswordOptions;
 
     const SERVICE: &str = "gmacFTP.sync-passphrase";
@@ -475,11 +472,6 @@ mod keychain_passphrase {
     pub fn load() -> Option<String> {
         let bytes = generic_password(opts_any()).ok()?;
         String::from_utf8(bytes).ok()
-    }
-
-    #[allow(dead_code)]
-    pub fn delete() {
-        let _ = delete_generic_password_options(opts_any());
     }
 }
 
@@ -521,7 +513,7 @@ pub fn repush_sync_key() -> Result<(), String> {
         let wrapped = wrap_master_key(&key, &pp)?;
         crate::store::cloud::push_key(&wrapped);
         tracing::info!("re-pushed wrapped master key to the sync folder");
-        return Ok(());
+        Ok(())
     }
     #[cfg(not(target_os = "macos"))]
     Err("sync not supported on this platform".into())
@@ -602,7 +594,7 @@ fn unwrap_master_key(blob: &[u8], passphrase: &str) -> Option<[u8; 32]> {
     })
 }
 
-fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
+pub(crate) fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);

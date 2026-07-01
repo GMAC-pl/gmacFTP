@@ -165,7 +165,7 @@ pub fn save_metadata(specs: &[ConnectionSpec]) -> Result<(), ImportError> {
         fs::create_dir_all(parent)?;
     }
     let json = serde_json::to_string_pretty(specs)?;
-    fs::write(&path, json)?;
+    crate::store::vault::atomic_write(&path, json.as_bytes())?;
     // Mirror to iCloud (no-op if sync disabled) so the connection list appears on the user's
     // other Macs. See src/store/cloud.rs.
     crate::store::cloud::push_state();

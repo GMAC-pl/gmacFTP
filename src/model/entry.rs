@@ -19,7 +19,7 @@ impl RemoteEntry {
 
 /// Sort a list Warp-style (directories on top, then alphabetic, case-insensitive).
 pub fn sort_entries(entries: &mut [RemoteEntry]) {
-    entries.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
+    entries.sort_by_key(|e| e.sort_key());
 }
 
 #[cfg(test)]

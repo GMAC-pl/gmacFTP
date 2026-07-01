@@ -1,6 +1,6 @@
 [package]
 name = "gmacftp"
-version = "0.0.12"
+version = "0.0.13"
 edition = "2021"
 rust-version = "1.88"
 description = "gmacFTP — native, lightweight FTP/FTPS/SFTP client for macOS"
@@ -29,8 +29,6 @@ i-slint-backend-winit = { version = "=1.16.1", features = ["muda"] }
 
 # --- Async runtime (shared with net/transfer actors) ---
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "io-util", "net", "fs", "time"] }
-tokio-stream = "0.1"
-async-trait = "0.1"
 futures = "0.3"
 
 # --- FTP / FTPS (explicit-TLS; native-tls -> macOS Security.framework for CA compat) ---
@@ -66,9 +64,6 @@ trash = "5"   # move local files to the OS Trash on delete (reversible, never pe
 drag = "2.1"
 # In-app update check: query the GitHub Releases API + download the latest DMG.
 ureq = { version = "2.12", features = ["json"] }
-
-[dev-dependencies]
-tempfile = "3"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "3"   # one-time ForkLift internet-password import

@@ -16,7 +16,7 @@ files — quickly and safely.
 
 ## ⬇️ Download & install
 
-**[↓ Download gmacFTP for Mac — gmacFTP-0.0.12.dmg](https://github.com/GMAC-pl/gmacftp/releases/download/v0.0.12/gmacFTP-0.0.12.dmg)** · macOS 11+, Apple Silicon (M-series)
+**[↓ Download gmacFTP for Mac — gmacFTP-0.0.13.dmg](https://github.com/GMAC-pl/gmacftp/releases/download/v0.0.13/gmacFTP-0.0.13.dmg)** · macOS 11+, Apple Silicon (M-series)
 
 1. Download the `.dmg`.
 2. Open it and **drag gmacFTP into the Applications folder** (a shortcut is inside).
@@ -46,7 +46,7 @@ Signed with an **Apple Developer ID** and **notarized by Apple** — opens clean
 
 ### Download
 
-**[⬇ gmacFTP-0.0.12.dmg](https://github.com/GMAC-pl/gmacftp/releases/download/v0.0.12/gmacFTP-0.0.12.dmg)** — install steps are at the top of this page.
+**[⬇ gmacFTP-0.0.13.dmg](https://github.com/GMAC-pl/gmacftp/releases/download/v0.0.13/gmacFTP-0.0.13.dmg)** — install steps are at the top of this page.
 
 Prefer to build it yourself? See [Build](#build).
 
@@ -56,7 +56,7 @@ Prefer to build it yourself? See [Build](#build).
 - **FTP**, **explicit-TLS FTPS**, and **SFTP** (pure-Rust SSH stack)
 - Upload / download / pane-to-pane transfers + a live **transfer queue**
 - **macOS Keychain** secret storage (master key never on disk)
-- Optional **iCloud sync** of saved servers across your Macs (toggle in the app menu)
+- Optional **iCloud sync** of saved servers across your Macs (toggle in the app menu; if two Macs edit at once, the newest change wins)
 - Connection manager, FileZilla `sitemanager.xml` + JSON import
 - Native macOS **menu bar** (App / File / Edit / View / Window / Help) + About panel
 - Light/dark themes, EN/PL UI
@@ -106,7 +106,7 @@ connection manager, and local copy flows with no server at all.
 
 ### Privacy & security
 
-- No telemetry, no accounts — the app only talks to the servers you configure. (iCloud sync is opt-in, off by default; only the master key uses the Keychain — server data syncs via iCloud's key-value store.)
+- No telemetry, no accounts — the app only talks to the servers you configure. (iCloud sync is opt-in, off by default; the master key lives in the Keychain — your connections + the AES-256 vault mirror as plain files in your iCloud Drive.)
 - `data/`, `.env*`, build artifacts, and local tool state are gitignored; this repo contains no
   private data.
 - Passwords are never stored in connection metadata.
@@ -170,7 +170,7 @@ która po prostu przenosi Twoje pliki — szybko i bezpiecznie.
 
 ### Pobranie i instalacja
 
-**[⬇ Pobierz gmacFTP dla Maca — gmacFTP-0.0.12.dmg](https://github.com/GMAC-pl/gmacftp/releases/download/v0.0.12/gmacFTP-0.0.12.dmg)** · macOS 11+, Apple Silicon (M-series)
+**[⬇ Pobierz gmacFTP dla Maca — gmacFTP-0.0.13.dmg](https://github.com/GMAC-pl/gmacftp/releases/download/v0.0.13/gmacFTP-0.0.13.dmg)** · macOS 11+, Apple Silicon (M-series)
 
 1. Pobierz plik `.dmg`.
 2. Otwórz go i **przeciągnij gmacFTP do folderu Aplikacje** (skrót jest w środku).
@@ -184,7 +184,7 @@ Podpisana **Apple Developer ID** i **zanotaryzowana przez Apple** — uruchamia 
 - **FTP**, **FTPS** (explicit TLS) i **SFTP** (SSH w czystym Ruście)
 - Transfery upload / download / panel-do-panelu + live **kolejka transferów**
 - Sekrety w **macOS Keychain** (klucz główny nigdy na dysku)
-- Opcjonalna **synchronizacja iCloud** zapisanych serwerów między Macami (przełącznik w menu)
+- Opcjonalna **synchronizacja iCloud** zapisanych serwerów między Macami (przełącznik w menu; przy jednoczesnej edycji na dwóch Macach wygrywa najnowsza zmiana)
 - Menedżer połączeń, import z FileZilla `sitemanager.xml` + JSON
 - Natywne **menu** macOS (App / File / Edit / View / Window / Help) + panel About
 - Jasny/ciemny motyw, UI po ang. i pol.
@@ -230,7 +230,7 @@ sortowanie, menedżer połączeń i lokalne kopiowanie bez żadnego serwera.
 
 ### Prywatność i bezpieczeństwo
 
-- Brak telemetrii, brak kont — apka łączy się tylko z serwerami, które sam podałeś. (Synchronizacja iCloud jest opcjonalna, domyślnie wyłączona; w Keychainie jest tylko klucz mistrzowski — dane serwerów synchronizuje magazyn klucz-wartość iCloud.)
+- Brak telemetrii, brak kont — apka łączy się tylko z serwerami, które sam podałeś. (Synchronizacja iCloud jest opcjonalna, domyślnie wyłączona; w Keychainie jest tylko klucz mistrzowski — dane serwerów synchronizują się jako zwykłe pliki w folderze iCloud Drive.)
 - `data/`, `.env*`, artefakty builda i stan narzędzi są gitignorowane; repo nie zawiera prywatnych danych.
 - Hasła nigdy nie trafiają do metadanych połączeń.
 

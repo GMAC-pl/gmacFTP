@@ -174,7 +174,7 @@ fn jobs_set(id: i32, idx: &Arc<Mutex<HashMap<i32, usize>>>, state: &str, done: i
             row.done = done;
             row.total = total;
             row.fraction = if total > 0 { done as f32 / total as f32 } else if state == "done" { 1.0 } else { 0.0 };
-            row.progress_text = fmt_transfer_progress(done, total).into();
+            row.progress_text = fmt_transfer_progress(done.max(0) as u64, total.max(0) as u64).into();
             row.message = msg.into();
             jobs.set_row_data(i, row);
         }
@@ -316,10 +316,9 @@ fn fmt_size_partial(bytes: u64, partial: bool) -> String {
     s
 }
 
-fn fmt_transfer_progress(done: i32, total: i32) -> String {
-    let done = done.max(0) as u64;
+fn fmt_transfer_progress(done: u64, total: u64) -> String {
     if total > 0 {
-        format!("{} / {}", fmt_size(done), fmt_size(total as u64))
+        format!("{} / {}", fmt_size(done), fmt_size(total))
     } else {
         fmt_size(done)
     }
@@ -365,7 +364,7 @@ fn focus_root(ui: &App) {
     // (it does NOT advance from the currently-focused item): starting at the component root
     // (index 0) it lands on the first focusable item — the root FocusScope — regardless of what
     // (TextInput / nothing) held focus before. Idempotent and safe to call on every pane click.
-    let inner = i_slint_core::window::WindowInner::from_pub(&ui.window());
+    let inner = i_slint_core::window::WindowInner::from_pub(ui.window());
     let root = i_slint_core::item_tree::ItemRc::new_root(inner.component());
     inner.set_focus_item(&root, true, i_slint_core::items::FocusReason::Programmatic);
 }
@@ -399,6 +398,13 @@ fn apply_view_pane(ui: &App, pane: usize) {
         .ok()
         .map(|g| g.iter().filter(|((p, _), _)| *p == pane).map(|((_, n), s)| (n.clone(), *s)).collect())
         .unwrap_or_default();
+    // Same trick for mtimes: EntryRow.mtime is i32 and wraps after 2038-01-19, so the date sort
+    // would order future-dated files as pre-1970. Use the true i64 mtime when we have it.
+    let true_mtimes: HashMap<String, i64> = TRUE_MTIME
+        .lock()
+        .ok()
+        .map(|g| g.iter().filter(|((p, _), _)| *p == pane).map(|((_, n), m)| (n.clone(), *m)).collect())
+        .unwrap_or_default();
     rows.sort_by(|a, b| {
         let dirs = match (a.is_dir, b.is_dir) {
             (true, false) => Ordering::Less,
@@ -414,7 +420,11 @@ fn apply_view_pane(ui: &App, pane: usize) {
                 let sb = true_sizes.get(b.name.as_str()).map(|s| *s as i128).unwrap_or(b.size as i128);
                 sa.cmp(&sb)
             }
-            "date" => a.mtime.cmp(&b.mtime),
+            "date" => {
+                let ma = true_mtimes.get(a.name.as_str()).copied().unwrap_or(a.mtime as i64);
+                let mb = true_mtimes.get(b.name.as_str()).copied().unwrap_or(b.mtime as i64);
+                ma.cmp(&mb)
+            }
             _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
         };
         if desc {
@@ -556,7 +566,7 @@ pub fn run() {
             {
                 use slint::winit_030::winit::platform::macos::WindowAttributesExtMacOS;
 
-                return attributes
+                attributes
                     .with_transparent(true)
                     .with_decorations(true)
                     .with_titlebar_transparent(true)
@@ -564,7 +574,7 @@ pub fn run() {
                     .with_titlebar_hidden(true)
                     .with_titlebar_buttons_hidden(true)
                     .with_fullsize_content_view(true)
-                    .with_has_shadow(true);
+                    .with_has_shadow(true)
             }
 
             #[cfg(not(target_os = "macos"))]
@@ -987,7 +997,7 @@ fn apply_design_demo_main(ui: &App, panes: &Panes, sessions: &Sessions, conns: &
     ui.set_transfer_label("Downloading report-Q3.pdf".into());
     ui.set_transfer_done(1_400_000);
     ui.set_transfer_total(2_400_000);
-    ui.set_transfer_progress_text(fmt_transfer_progress(1_400_000, 2_400_000).into());
+    ui.set_transfer_progress_text(fmt_transfer_progress(1_400_000u64, 2_400_000u64).into());
     ui.set_error("".into());
     ui.set_status("".into());
     refresh_sessions_model(ui, sessions);
@@ -1336,7 +1346,9 @@ fn materialize_remote_drag(
 fn drag_preview_image() -> Option<drag::Image> {
     let exe = std::env::current_exe().ok()?;
     let bundled = exe.parent()?.parent()?.join("Resources/icon.icns");
-    let path = if bundled.exists() { bundled } else { PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/icon-preview.png") };
+    // Dev fallback only (the shipped .app always has the bundled icon). A RELATIVE path keeps the
+    // developer's absolute CARGO_MANIFEST_DIR out of the compiled binary.
+    let path = if bundled.exists() { bundled } else { PathBuf::from("assets/icon-preview.png") };
     path.exists().then_some(drag::Image::File(path))
 }
 
@@ -1484,6 +1496,12 @@ fn home_dir() -> PathBuf {
 static TRUE_SIZE: LazyLock<Mutex<HashMap<(usize, String), u64>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// True i64 mtimes for the current pane views, keyed by (pane, name). Slint's `int` is i32, so
+/// EntryRow.mtime truncates files dated after 2038-01-19; this sidecar carries the real i64 so the
+/// date sort stays correct for future-dated files. Populated alongside TRUE_SIZE on re-list.
+static TRUE_MTIME: LazyLock<Mutex<HashMap<(usize, String), i64>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
 #[derive(Debug, Clone, Copy, Default)]
 struct FolderStats {
     size: u64,
@@ -1506,6 +1524,9 @@ fn clear_pane_view(ui: &App, pane: usize, cwd: &str) {
     if let Ok(mut g) = TRUE_SIZE.lock() {
         g.retain(|(p, _), _| *p != pane);
     }
+    if let Ok(mut g) = TRUE_MTIME.lock() {
+        g.retain(|(p, _), _| *p != pane);
+    }
     if pane == 0 {
         ui.set_local_full(empty.clone());
         ui.set_local_entries(empty);
@@ -1524,11 +1545,13 @@ fn clear_pane_view(ui: &App, pane: usize, cwd: &str) {
     refresh_selected_path(ui);
 }
 
-fn set_true_sizes(pane: usize, sizes: &[(String, u64)]) {
-    if let Ok(mut g) = TRUE_SIZE.lock() {
-        g.retain(|(p, _), _| *p != pane);
-        for (n, s) in sizes {
-            g.insert((pane, n.clone()), *s);
+fn set_true_meta(pane: usize, items: &[(String, u64, i64)]) {
+    if let (Ok(mut sz), Ok(mut mt)) = (TRUE_SIZE.lock(), TRUE_MTIME.lock()) {
+        sz.retain(|(p, _), _| *p != pane);
+        mt.retain(|(p, _), _| *p != pane);
+        for (n, s, m) in items {
+            sz.insert((pane, n.clone()), *s);
+            mt.insert((pane, n.clone()), *m);
         }
     }
 }
@@ -1581,7 +1604,7 @@ fn local_folder_stats_inner(
 
 fn list_local_pane(ui: &App, pane: usize, path: &Path, cwd: &str) {
     let mut rows: Vec<EntryRow> = Vec::new();
-    let mut sizes: Vec<(String, u64)> = Vec::new();
+    let mut meta: Vec<(String, u64, i64)> = Vec::new();
     match std::fs::read_dir(path) {
         Ok(read) => {
             for entry in read.flatten() {
@@ -1609,12 +1632,12 @@ fn list_local_pane(ui: &App, pane: usize, path: &Path, cwd: &str) {
                     size_text: fmt_size_partial(display_size, partial).into(),
                     metadata_state: "ready".into(),
                 });
-                sizes.push((name, display_size));
+                meta.push((name, display_size, mtime));
             }
         }
         Err(e) => ui.set_error(format!("local: {e}").into()),
     }
-    set_true_sizes(pane, &sizes);
+    set_true_meta(pane, &meta);
     set_pane_full(ui, pane, rows, cwd);
 }
 
@@ -1643,8 +1666,8 @@ fn set_pane_entries(
                 .into(),
         }
     }).collect();
-    let sizes = entries.iter().map(|e| (e.name.clone(), e.size)).collect::<Vec<_>>();
-    set_true_sizes(pane, &sizes);
+    let meta = entries.iter().map(|e| (e.name.clone(), e.size, e.mtime.unwrap_or(0))).collect::<Vec<_>>();
+    set_true_meta(pane, &meta);
     set_pane_full(ui, pane, rows, cwd);
 }
 
@@ -1668,6 +1691,9 @@ fn update_pane_entry_metadata(
 
     if let Ok(mut sizes) = TRUE_SIZE.lock() {
         sizes.insert((pane, entry.name.clone()), entry.size);
+    }
+    if let Ok(mut mtimes) = TRUE_MTIME.lock() {
+        mtimes.insert((pane, entry.name.clone()), entry.mtime.unwrap_or(0));
     }
 
     // Update both backing models in place. Replacing either model would reset selection,
@@ -3229,7 +3255,7 @@ fn pane_enter(handle: &Handle, store: Arc<dyn CredentialStore>, panes: Panes, en
     let Some(ui) = ui.upgrade() else { return };
     let active = active_pane_idx(&ui);
     let (src, dst) = if active == 0 { (0, 1) } else { (1, 0) };
-    transfer(&handle, store, panes, engine, idx, ui.as_weak(), src, dst);
+    transfer(handle, store, panes, engine, idx, ui.as_weak(), src, dst);
 }
 
 /// Delete (Del/Backspace): delete the active pane's selected entry — routed through
@@ -3453,7 +3479,7 @@ fn wire_clear_finished(ui: &App, idx: Arc<Mutex<HashMap<i32, usize>>>) {
             let mut i = jobs.row_count();
             while i > 0 {
                 i -= 1;
-                let finished = jobs.row_data(i).map_or(false, |r| r.state.as_str() == "done" || r.state.as_str() == "failed");
+                let finished = jobs.row_data(i).is_some_and(|r| r.state.as_str() == "done" || r.state.as_str() == "failed");
                 if finished {
                     jobs.remove(i);
                 }
@@ -3896,7 +3922,10 @@ fn enqueue(
     let id = TransferId(NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
     let dir_s = match direction { TransferDirection::Download => "download", TransferDirection::Upload => "upload" };
     let verb = match direction { TransferDirection::Download => "Downloading", TransferDirection::Upload => "Uploading" };
-    let total_i = bytes_total.unwrap_or(0) as i32;
+    // Cap at i32::MAX (not wrap) for the Slint int fields — a >2 GiB file would otherwise wrap to
+    // a negative transfer-total and hide the bottom progress bar (gated on transfer-total > 0).
+    // The true u64 total still drives the progress TEXT via fmt_transfer_progress(u64).
+    let total_i = bytes_total.unwrap_or(0).min(i32::MAX as u64) as i32;
     let route = match direction {
         TransferDirection::Upload => format!("local -> {}", spec.host),
         TransferDirection::Download => format!("{} -> local", spec.host),
@@ -3909,7 +3938,7 @@ fn enqueue(
         direction: dir_s.into(),
         done: 0,
         total: total_i,
-        progress_text: fmt_transfer_progress(0, total_i).into(),
+        progress_text: fmt_transfer_progress(0, bytes_total.unwrap_or(0)).into(),
         fraction: 0.0,
         state: "queued".into(),
         message: "".into(),
@@ -3924,7 +3953,7 @@ fn enqueue(
     ui.set_transfer_total(total_i);
     ui.set_transfer_fraction(0.0);
     ui.set_transfer_label(format!("{verb} {label_name}").into());
-    ui.set_transfer_progress_text(fmt_transfer_progress(0, total_i).into());
+    ui.set_transfer_progress_text(fmt_transfer_progress(0, bytes_total.unwrap_or(0)).into());
     ui.set_status("".into());
     ui.set_error("".into());
 
@@ -3975,16 +4004,16 @@ fn spawn_progress_forwarder(
                         TransferState::Active => {
                             row.state = "active".into();
                             row.done = u.bytes_done as i32;
-                            row.total = total as i32;
+                            row.total = total.min(i32::MAX as u64) as i32;
                             row.fraction = if total > 0 { u.bytes_done as f32 / total as f32 } else { 0.0 };
-                            row.progress_text = fmt_transfer_progress(row.done, row.total).into();
+                            row.progress_text = fmt_transfer_progress(u.bytes_done, total).into();
                             row.message = format_eta(&eta, id, u.bytes_done, total);
                         }
                         TransferState::Done => {
                             row.state = "done".into();
                             row.fraction = 1.0;
                             row.done = row.total;
-                            row.progress_text = fmt_transfer_progress(row.done, row.total).into();
+                            row.progress_text = fmt_transfer_progress(total, total).into();
                             row.message = "".into();
                         }
                         TransferState::Failed(msg) => {
@@ -4002,9 +4031,9 @@ fn spawn_progress_forwarder(
                         let frac = if total > 0 { u.bytes_done as f32 / total as f32 } else { 0.0 };
                         ui.set_transfer_active(true);
                         ui.set_transfer_done(u.bytes_done as i32);
-                        ui.set_transfer_total(total as i32);
+                        ui.set_transfer_total(total.min(i32::MAX as u64) as i32);
                         ui.set_transfer_fraction(frac);
-                        ui.set_transfer_progress_text(fmt_transfer_progress(u.bytes_done as i32, total as i32).into());
+                        ui.set_transfer_progress_text(fmt_transfer_progress(u.bytes_done, total).into());
                     }
                     TransferState::Done => {
                         ui.set_transfer_active(false);

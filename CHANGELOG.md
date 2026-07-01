@@ -4,6 +4,18 @@
 
 _(Nothing yet.)_
 
+## 0.0.13 — 2026-07-01
+
+A hardening + privacy pass following a full code audit. No customer/personal data was ever leaked; this closes the remaining hygiene and correctness gaps.
+
+- **No developer build paths in the app.** The shipped binary no longer embeds `/Users/...` panic-location and cargo-registry paths (which exposed the developer's home folder). Release builds now use `--remap-path-prefix`. Purely cosmetic — no behavior change.
+- **Atomic writes everywhere user data lives.** `connections.json`, the vault, and sync-folder pulls all write via temp + fsync + rename now, so a crash or power loss mid-write can no longer truncate your saved-server list or the vault. (Previously only the vault and sync copies were atomic; the primary connections file used a bare truncate+write.)
+- **Big-file transfer counter fixed.** The transfer progress text wrapped to a negative number for files >2 GiB, and the bottom progress bar could hide — both now use the true 64-bit size.
+- **Future-dated sort fixed.** Files dated after 2038 sorted as pre-1970 (the same `i32` wrap class as the earlier size-sort bug) — now sorted by their true `i64` mtime.
+- **Vault write failures surface.** A failed vault encrypt or atomic-write is now returned to the caller instead of being silently logged, so the UI can warn that a credential wasn't durably saved.
+- **Sync-conflict model documented.** iCloud sync is last-writer-wins by file mtime (noted in the README) — if you edit servers on two Macs at once, the newest change wins.
+- Cleanups: removed 3 unused dependencies (`async-trait`, `tokio-stream`, `tempfile`), a dead keychain helper, and several clippy lints; corrected the README iCloud-sync description (plain files in iCloud Drive, not the abandoned key-value store) and the test-server TLS banner (strict by default). Added a CI workflow (clippy + tests + release build).
+
 ## 0.0.12 — 2026-07-01
 
 - **Clearer connect / disconnect icons in the sidebar (Apple HIG).** The per-server row buttons now use unambiguous, familiar symbols instead of generic arrows: **Connect** is a blue plug with a filled background, and **Disconnect** is an eject mark that turns red only when you hover it. Different actions now read as different symbols at a glance, per Apple's Human Interface Guidelines. This is a pure visual change — every callback and the drag-and-drop behaviour are unchanged.

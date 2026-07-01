@@ -6,6 +6,12 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 ENTITLEMENTS="${MACKFTP_ENTITLEMENTS:-$ROOT/gmacFTP.entitlements}"
+# Strip the developer's absolute home + project paths from the shipped binary (panic locations +
+# debug symbols) so the .app never leaks /Users/<name>/... . --remap-path-prefix only rewrites
+# paths embedded by file!()/env!()/panic locations — purely cosmetic, zero behavior change.
+# Preserves a caller-supplied RUSTFLAGS.
+CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }--remap-path-prefix $ROOT=gmacftp --remap-path-prefix $CARGO_HOME/registry/src=/cargo/registry/src"
 # Single source of truth for the version: Cargo.toml (override via MACKFTP_VERSION).
 # CFBundleVersion must be a monotonically-increasing integer (git commit count).
 PKG_VER="${MACKFTP_VERSION:-$(grep '^version' "$ROOT/Cargo.toml" | head -1 | sed 's/.*"\([^"]*\)".*/\1/')}"

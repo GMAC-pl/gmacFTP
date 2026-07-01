@@ -91,7 +91,7 @@ mod imp {
     }
 
     /// Atomic write (temp + rename) so a crash mid-write can't leave a half-written file.
-    fn atomic_write(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    pub fn atomic_write(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
         use std::io::Write;
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -140,6 +140,9 @@ mod imp {
         None
     }
     pub fn write_item(_: &str, _: &[u8]) -> Result<(), String> {
+        Ok(())
+    }
+    pub fn atomic_write(_: &std::path::Path, _: &[u8]) -> std::io::Result<()> {
         Ok(())
     }
     pub fn read_item(_: &str) -> Option<(u64, Vec<u8>)> {
@@ -264,7 +267,7 @@ pub fn pull_and_apply() -> bool {
                 if let Some(parent) = p.parent() {
                     let _ = std::fs::create_dir_all(parent);
                 }
-                if std::fs::write(p, &payload).is_ok() {
+                if imp::atomic_write(p, &payload).is_ok() {
                     tracing::info!(target: "gmacftp::cloud", kind, "pulled newer state from iCloud");
                     applied = true;
                 }
@@ -288,13 +291,14 @@ pub fn bootstrap() {
     // (e.g. purged by a sync off→on toggle, which only re-pushes connections/vault) →
     // re-create it from the cached passphrase. If the passphrase isn't cached either, clear
     // the flag so the SET dialog shows again on this Mac.
-    if crate::store::settings::load().sync_passphrase_set && read_key().is_none() {
-        if crate::store::vault::repush_sync_key().is_err() {
-            let mut s = crate::store::settings::load();
-            s.sync_passphrase_set = false;
-            crate::store::settings::save(&s);
-            tracing::warn!(target: "gmacftp::cloud", "sync passphrase not in Keychain — will prompt to set one");
-        }
+    if crate::store::settings::load().sync_passphrase_set
+        && read_key().is_none()
+        && crate::store::vault::repush_sync_key().is_err()
+    {
+        let mut s = crate::store::settings::load();
+        s.sync_passphrase_set = false;
+        crate::store::settings::save(&s);
+        tracing::warn!(target: "gmacftp::cloud", "sync passphrase not in Keychain — will prompt to set one");
     }
 }
 
