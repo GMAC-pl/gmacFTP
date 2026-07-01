@@ -4,6 +4,10 @@
 
 _(Nothing yet.)_
 
+## 0.0.10 — 2026-07-01
+
+- **"Send Servers to iCloud" now migrates ALL passwords first, then syncs — one action does the whole job.** The 0.0.9 startup migration could miss some Keychain entries, so connecting a never-before-used server still prompted for the Keychain. Now the menu action folds EVERY saved password into the vault (iterating your servers — guaranteed to find them, same access as connecting) before pushing. You get one Keychain prompt per not-yet-migrated server (click "Always Allow" + your Mac login password — one-time), then everything is in the vault → no more prompts + every server syncs + decrypts on the other Mac.
+
 ## 0.0.9 — 2026-07-01
 
 - **All saved passwords now sync + no per-server Keychain prompts.** Passwords were split between the synced vault and legacy per-server Keychain entries (from an older build) — so only servers you'd already connected synced, and each new connection prompted "gmacFTP wants to use confidential data / enter keychain password". On launch (one-time, when sync is on) the app now folds ALL legacy Keychain passwords into the vault in a SINGLE Keychain authorization (one prompt, not one-per-server). After that the vault holds every password → no Keychain prompts + every server syncs + decrypts on the other Mac.

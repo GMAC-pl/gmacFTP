@@ -122,9 +122,10 @@ mod imp {
 
             #[unsafe(method(sendToICloud:))]
             fn send_to_icloud(&self, _sender: Option<&AnyObject>) {
-                let msg = cloud::send_now();
-                tracing::info!(target: "gmacftp::menu", "manual iCloud send");
-                on_ui(move |ui| ui.set_status(msg.into()));
+                tracing::info!(target: "gmacftp::menu", "manual iCloud send (migrate all + sync)");
+                // Migrate every saved password into the vault (one-time per Keychain-legacy
+                // server), then push the complete vault + connections to iCloud.
+                on_ui(|ui| ui.invoke_request_send_sync());
             }
 
             #[unsafe(method(pullFromICloud:))]

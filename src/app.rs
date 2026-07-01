@@ -742,6 +742,7 @@ pub fn run() {
     wire_keyboard(&ui, &handle, store.clone(), panes.clone(), engine.clone(), jobs_index.clone());
     wire_misc_ui(&ui);
     wire_passphrase(&ui, store.clone(), conns.clone());
+    wire_send_sync(&ui, store.clone(), conns.clone());
     wire_overwrite(&ui, &handle, store.clone(), panes.clone(), engine.clone(), jobs_index.clone());
     wire_session_controls(&ui, &handle, store.clone(), sessions.clone(), panes.clone(), engine.clone());
     // Re-assert keyboard focus on every pane/row click — Slint delivers key-pressed only to the
@@ -2658,6 +2659,32 @@ fn wire_passphrase(ui: &App, store: Arc<dyn CredentialStore>, conns: ConnList) {
             ui.set_error("Wrong passphrase.".into());
             ui.set_passphrase_mode("enter".into());
             ui.set_passphrase_open(true); // let the user retry
+        }
+    });
+}
+
+/// Fold EVERY saved password into the vault: for each connection, `store.get` migrates any
+/// legacy per-server Keychain entry into the vault (vault hits are silent; Keychain-legacy
+/// ones prompt once). Returns the count found. This is the "sync does the whole job" step.
+fn migrate_all_passwords(store: &Arc<dyn CredentialStore>, conns: &ConnList) -> usize {
+    let list = conns.lock().ok().map(|c| c.clone()).unwrap_or_default();
+    list.iter().filter(|spec| store.get(&spec.host, &spec.user).is_ok()).count()
+}
+
+/// Wire "Send Servers to iCloud": migrate all passwords into the vault (one-time per
+/// Keychain-legacy server), then push the now-complete vault + connections.
+fn wire_send_sync(ui: &App, store: Arc<dyn CredentialStore>, conns: ConnList) {
+    let (st, cn, uw) = (store.clone(), conns.clone(), ui.as_weak());
+    ui.on_request_send_sync(move || {
+        let migrated = migrate_all_passwords(&st, &cn);
+        let msg = store::cloud::send_now();
+        if let Some(ui) = uw.upgrade() {
+            let extra = if migrated > 0 {
+                format!(" (migrated {migrated} passwords into the vault — one-time)")
+            } else {
+                String::new()
+            };
+            ui.set_status(format!("{msg}{extra}").into());
         }
     });
 }

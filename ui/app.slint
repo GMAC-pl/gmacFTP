@@ -928,6 +928,7 @@ export component App inherits Window {
     callback toggle-sort-dir();           // toggle the sort-pane's asc/desc + re-apply
     callback resolve-overwrite(int);      // overwrite dialog: 0=cancel, 1=overwrite, 2=save-as-new
     callback resolve-passphrase(string, string); // passphrase dialog: (value, confirm); empty value = cancel
+    callback request-send-sync();             // menu "Send Servers to iCloud" → migrate all passwords into the vault, then sync
     callback request-delete(string, string, bool); // intend-to-delete (pane, name, is_dir) → opens dialog or deletes if "don't ask" is on
     callback confirm-delete();             // delete-dialog "Delete" button → honour checkbox, delete, close
     callback activate-pane(string);        // "local" | "remote"
