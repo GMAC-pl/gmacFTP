@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-test:
+    runs-on: macos-latest
+    env:
+      # The crate's env! macros need these at compile time (scripts/build-app.sh sets the same).
+      MACKFTP_BUNDLE_ID: app.mackftp.client
+      MACKFTP_CONFIG_QUALIFIER: app
+      MACKFTP_CONFIG_ORGANIZATION: mackftp
+      MACKFTP_CONFIG_APPLICATION: client
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # Clippy runs WITHOUT -D warnings: a few known lints (large AppCtx argument lists, complex
+      # types) are intentional and tracked separately. New lints still surface in the log.
+      # No untrusted github.event.* input is used in any run: step (no injection surface).
+      - run: cargo clippy --all-targets
+      - run: cargo test --lib
+      - run: cargo build --release
