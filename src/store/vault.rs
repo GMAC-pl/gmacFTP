@@ -159,9 +159,10 @@ impl FileVault {
     pub fn migrate_from_keychain(&self) -> usize {
         #[cfg(target_os = "macos")]
         {
-            use crate::store::creds::SERVICE_PREFIX;
             use security_framework::item::{ItemClass, ItemSearchOptions, Limit};
-            let prefix = format!("{SERVICE_PREFIX}/");
+            // ONE Keychain operation reads EVERY generic-password item (one authorization, not
+            // one-per-server). The host is the segment after the last '/' in the service, so
+            // legacy items saved under ANY service prefix (old bundle id, old app name) match.
             let results = match ItemSearchOptions::new()
                 .class(ItemClass::generic_password())
                 .limit(Limit::All)
@@ -180,7 +181,7 @@ impl FileVault {
                 for r in results {
                     let Some(dict) = r.simplify_dict() else { continue };
                     let Some(svc) = dict.get("svce") else { continue };
-                    let Some(host) = svc.strip_prefix(&prefix) else { continue };
+                    let Some((_prefix, host)) = svc.rsplit_once('/') else { continue };
                     let user = dict.get("acct").cloned().unwrap_or_default();
                     let secret = dict
                         .get("v_Data")

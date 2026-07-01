@@ -626,10 +626,10 @@ pub fn run() {
     // Keychain authorization (so the vault holds EVERY password → no per-server Keychain
     // prompts + everything syncs). Gated on sync + a one-shot flag. An empty search (e.g. the
     // 2nd Mac, whose passwords arrived via the synced vault) authorizes nothing → no prompt.
-    if store::cloud::enabled() && !store::settings::load().keychain_migrated {
+    if store::cloud::enabled() && !store::settings::load().keychain_migrated_v2 {
         let n = store.migrate_from_keychain();
         let mut s = store::settings::load();
-        s.keychain_migrated = true;
+        s.keychain_migrated_v2 = true;
         store::settings::save(&s);
         if n > 0 {
             ui.set_status(
@@ -2663,12 +2663,17 @@ fn wire_passphrase(ui: &App, store: Arc<dyn CredentialStore>, conns: ConnList) {
     });
 }
 
-/// Fold EVERY saved password into the vault: for each connection, `store.get` migrates any
-/// legacy per-server Keychain entry into the vault (vault hits are silent; Keychain-legacy
-/// ones prompt once). Returns the count found. This is the "sync does the whole job" step.
-fn migrate_all_passwords(store: &Arc<dyn CredentialStore>, conns: &ConnList) -> usize {
-    let list = conns.lock().ok().map(|c| c.clone()).unwrap_or_default();
-    list.iter().filter(|spec| store.get(&spec.host, &spec.user).is_ok()).count()
+/// Fold EVERY saved password into the vault in a SINGLE Keychain authorization (one login
+/// password, not one-per-server), then it's complete for sync. No-op if already migrated.
+fn migrate_all_passwords(store: &Arc<dyn CredentialStore>, _conns: &ConnList) -> usize {
+    if store::settings::load().keychain_migrated_v2 {
+        return 0;
+    }
+    let n = store.migrate_from_keychain();
+    let mut s = store::settings::load();
+    s.keychain_migrated_v2 = true;
+    store::settings::save(&s);
+    n
 }
 
 /// Wire "Send Servers to iCloud": migrate all passwords into the vault (one-time per

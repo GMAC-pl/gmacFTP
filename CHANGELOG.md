@@ -4,6 +4,10 @@
 
 _(Nothing yet.)_
 
+## 0.0.11 — 2026-07-01
+
+- **One Keychain authorization migrates ALL passwords (was one-per-server).** 0.10's migration iterated servers and prompted for each. Now a single Keychain enumeration (one `SecItemCopyMatching`) reads every saved password in ONE authorization — enter your Mac login password ONCE. Also fixed: legacy items saved under any old service prefix (older bundle id / app name) now match (host taken after the last `/`), and the one-shot flag was reset so this re-runs correctly.
+
 ## 0.0.10 — 2026-07-01
 
 - **"Send Servers to iCloud" now migrates ALL passwords first, then syncs — one action does the whole job.** The 0.0.9 startup migration could miss some Keychain entries, so connecting a never-before-used server still prompted for the Keychain. Now the menu action folds EVERY saved password into the vault (iterating your servers — guaranteed to find them, same access as connecting) before pushing. You get one Keychain prompt per not-yet-migrated server (click "Always Allow" + your Mac login password — one-time), then everything is in the vault → no more prompts + every server syncs + decrypts on the other Mac.
