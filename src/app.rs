@@ -622,6 +622,22 @@ pub fn run() {
         ui.set_passphrase_open(true);
     }
 
+    // One-time: fold any legacy per-server Keychain passwords into the vault in a SINGLE
+    // Keychain authorization (so the vault holds EVERY password → no per-server Keychain
+    // prompts + everything syncs). Gated on sync + a one-shot flag. An empty search (e.g. the
+    // 2nd Mac, whose passwords arrived via the synced vault) authorizes nothing → no prompt.
+    if store::cloud::enabled() && !store::settings::load().keychain_migrated {
+        let n = store.migrate_from_keychain();
+        let mut s = store::settings::load();
+        s.keychain_migrated = true;
+        store::settings::save(&s);
+        if n > 0 {
+            ui.set_status(
+                format!("Migrated {n} saved passwords into the encrypted vault (one-time).").into(),
+            );
+        }
+    }
+
     let connections = if use_design_demo_connections() {
         design_demo_connections()
     } else {

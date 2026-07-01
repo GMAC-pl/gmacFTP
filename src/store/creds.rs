@@ -35,4 +35,10 @@ pub trait CredentialStore: Send + Sync {
     fn unlock(&self, _passphrase: &str) -> bool {
         false
     }
+    /// One-shot: migrate any legacy per-server Keychain entries into the vault (so the vault
+    /// holds every password → no Keychain fallback prompts + everything syncs). Returns the
+    /// count migrated. Default: 0 (non-vault stores have nothing to migrate).
+    fn migrate_from_keychain(&self) -> usize {
+        0
+    }
 }

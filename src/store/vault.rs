@@ -150,6 +150,58 @@ impl FileVault {
         tracing::info!(target: "gmacftp::vault", "vault unlocked + adopted synced state");
         true
     }
+
+    /// One-shot migration: enumerate the legacy per-server Keychain entries (service
+    /// `{SERVICE_PREFIX}/host`, account = user) and fold them into this vault in a single
+    /// batched persist. ONE Keychain authorization covers all of them (vs N per-server prompts).
+    /// After this the vault holds every password → no Keychain fallback prompts + everything
+    /// syncs. Returns how many were migrated.
+    pub fn migrate_from_keychain(&self) -> usize {
+        #[cfg(target_os = "macos")]
+        {
+            use crate::store::creds::SERVICE_PREFIX;
+            use security_framework::item::{ItemClass, ItemSearchOptions, Limit};
+            let prefix = format!("{SERVICE_PREFIX}/");
+            let results = match ItemSearchOptions::new()
+                .class(ItemClass::generic_password())
+                .limit(Limit::All)
+                .load_attributes(true)
+                .load_data(true)
+                .search()
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(error = %e, "keychain enumerate failed");
+                    return 0;
+                }
+            };
+            let mut n = 0;
+            if let Ok(mut map) = self.map.lock() {
+                for r in results {
+                    let Some(dict) = r.simplify_dict() else { continue };
+                    let Some(svc) = dict.get("svce") else { continue };
+                    let Some(host) = svc.strip_prefix(&prefix) else { continue };
+                    let user = dict.get("acct").cloned().unwrap_or_default();
+                    let secret = dict
+                        .get("v_Data")
+                        .or_else(|| dict.get("data"))
+                        .cloned()
+                        .unwrap_or_default();
+                    if !host.is_empty() && !user.is_empty() && !secret.is_empty() {
+                        map.insert(pack_key(host, &user), B64.encode(secret.as_bytes()));
+                        n += 1;
+                    }
+                }
+            }
+            if n > 0 {
+                tracing::info!("migrated {n} keychain credentials into the vault");
+                self.persist(); // one batched write + sync
+            }
+            n
+        }
+        #[cfg(not(target_os = "macos"))]
+        0
+    }
 }
 
 impl CredentialStore for FileVault {
@@ -233,6 +285,10 @@ impl CredentialStore for MigratingStore {
 
     fn unlock(&self, passphrase: &str) -> bool {
         self.vault.unlock(passphrase)
+    }
+
+    fn migrate_from_keychain(&self) -> usize {
+        self.vault.migrate_from_keychain()
     }
 }
 

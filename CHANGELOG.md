@@ -4,6 +4,10 @@
 
 _(Nothing yet.)_
 
+## 0.0.9 — 2026-07-01
+
+- **All saved passwords now sync + no per-server Keychain prompts.** Passwords were split between the synced vault and legacy per-server Keychain entries (from an older build) — so only servers you'd already connected synced, and each new connection prompted "gmacFTP wants to use confidential data / enter keychain password". On launch (one-time, when sync is on) the app now folds ALL legacy Keychain passwords into the vault in a SINGLE Keychain authorization (one prompt, not one-per-server). After that the vault holds every password → no Keychain prompts + every server syncs + decrypts on the other Mac.
+
 ## 0.0.8 — 2026-07-01
 
 - **Fix: the wrapped master key (`gmacftp.key.wrap`) now actually gets created + survives a sync off→on toggle.** 0.0.6/0.0.7 could leave the sync folder with connections + vault but NO wrapped key (a purge on sync-off deleted it, and re-enabling only re-pushed connections/vault) → the other Mac had nothing to unlock. Now: turning sync on re-pushes the wrapped key, and launch auto-heals a missing wrapped key from the cached passphrase (or re-prompts to set one if the passphrase was lost).

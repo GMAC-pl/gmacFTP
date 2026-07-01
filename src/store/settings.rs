@@ -43,6 +43,10 @@ pub struct Settings {
     /// memory.
     #[serde(default)]
     pub sync_passphrase_set: bool,
+    /// True once the legacy per-server Keychain passwords have been folded into the vault
+    /// (one-time migration, so it doesn't re-prompt every launch).
+    #[serde(default)]
+    pub keychain_migrated: bool,
 }
 
 fn default_accept_any_cert() -> bool {
@@ -68,6 +72,7 @@ impl Default for Settings {
             sync_via_icloud: false,
             sync_folder: None,
             sync_passphrase_set: false,
+            keychain_migrated: false,
         }
     }
 }
