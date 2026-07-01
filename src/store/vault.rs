@@ -51,7 +51,7 @@ fn pack_key(host: &str, user: &str) -> String {
 /// Encrypted at-rest credential store (in-memory decrypted map mirrored to vault.bin).
 pub struct FileVault {
     map: Mutex<HashMap<String, String>>, // "host\x00user" -> base64(secret)
-    key: [u8; 32], // resolved once at open: Keychain > migrated-from-file > generated
+    key: Mutex<[u8; 32]>, // resolved at open; replaced in place on passphrase unlock
     vault_path: PathBuf,
 }
 
@@ -83,7 +83,7 @@ impl FileVault {
             },
             _ => HashMap::new(),
         };
-        Self { map: Mutex::new(map), key, vault_path }
+        Self { map: Mutex::new(map), key: Mutex::new(key), vault_path }
     }
 
     fn persist(&self) {
@@ -100,7 +100,8 @@ impl FileVault {
         };
         // Reuse the in-memory key (Keychain-resolved at open) — do NOT re-hit the Keychain
         // or the master.key file on every write.
-        match encrypt(&self.key, &plaintext) {
+        let key = *self.key.lock().unwrap_or_else(|e| e.into_inner());
+        match encrypt(&key, &plaintext) {
             Ok(blob) => {
                 if let Err(e) = atomic_write(&self.vault_path, &blob) {
                     tracing::warn!(error = %e, "vault write failed");
@@ -110,6 +111,41 @@ impl FileVault {
         }
         // Mirror the updated vault.bin (and connections.json) to iCloud if sync is on.
         crate::store::cloud::push_state();
+    }
+
+    /// True when the vault came up empty (undecryptable with the locally-available key) AND a
+    /// wrapped key exists in the sync folder — i.e. we need the user's passphrase to unlock.
+    /// (A genuinely-empty vault has no wrapped key, so it correctly reads as not-locked.)
+    pub fn is_locked(&self) -> bool {
+        let empty = self.map.lock().map(|m| m.is_empty()).unwrap_or(true);
+        empty && crate::store::cloud::read_key().is_some()
+    }
+
+    /// Unlock with a passphrase: unwrap the master key from the synced wrapped key, re-read +
+    /// decrypt vault.bin with it, swap the key + map in place. Returns true on success. Caches
+    /// the master key + passphrase in the Keychain so the next launch auto-unlocks.
+    pub fn unlock(&self, passphrase: &str) -> bool {
+        let Some((_, wrapped)) = crate::store::cloud::read_key() else { return false };
+        let Some(key) = unwrap_master_key(&wrapped, passphrase) else { return false };
+        let Ok(blob) = std::fs::read(&self.vault_path) else { return false };
+        let Ok(plaintext) = decrypt(&key, &blob) else { return false };
+        let Ok(loaded) = serde_json::from_slice::<HashMap<String, String>>(&plaintext) else {
+            return false;
+        };
+        if let Ok(mut k) = self.key.lock() {
+            *k = key;
+        }
+        if let Ok(mut m) = self.map.lock() {
+            *m = loaded;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let sync = crate::store::settings::load().sync_via_icloud;
+            let _ = keychain_master_key::store(&key, sync);
+            let _ = keychain_passphrase::store(passphrase, true);
+        }
+        tracing::info!(target: "gmacftp::vault", "vault unlocked with sync passphrase");
+        true
     }
 }
 
@@ -187,6 +223,14 @@ impl CredentialStore for MigratingStore {
         }
         Ok(())
     }
+
+    fn is_locked(&self) -> bool {
+        self.vault.is_locked()
+    }
+
+    fn unlock(&self, passphrase: &str) -> bool {
+        self.vault.unlock(passphrase)
+    }
 }
 
 // ── master-key resolution: Keychain (primary) > legacy file (migrate) > generate ──
@@ -205,6 +249,17 @@ fn resolve_master_key(key_path: &Path) -> [u8; 32] {
     {
         if let Some(k) = keychain_master_key::load() {
             return k; // already in the Keychain
+        }
+        // Auto-unlock: a wrapped key in the sync folder + the passphrase in the Keychain (synced,
+        // fixed cross-bundle service) → unwrap the real master key + cache it locally. This is the cross-device path that does NOT depend on the bundle-specific master-key item (so it survives a bundle mismatch).
+        if let Some((_, wrapped)) = crate::store::cloud::read_key() {
+            if let Some(pp) = keychain_passphrase::load() {
+                if let Some(k) = unwrap_master_key(&wrapped, &pp) {
+                    let _ = keychain_master_key::store(&k, sync);
+                    tracing::info!("unlocked vault master key from synced wrapped key");
+                    return k;
+                }
+            }
         }
     }
 
@@ -329,6 +384,45 @@ mod keychain_master_key {
     }
 }
 
+// ── macOS Keychain backing for the SYNC PASSPHRASE (FIXED cross-bundle service) ──
+// FIXED service (NOT bundle-id derived) so the personal + public bundles SHARE this passphrase
+// item — the cross-bundle, cross-device secret that unlocks the synced wrapped master key.
+// This is what fixes the bundle-mismatch "missing credential": the master key is bundle-local,
+// but the passphrase (which unlocks the synced wrapped key) is shared across bundles.
+
+#[cfg(target_os = "macos")]
+mod keychain_passphrase {
+    use security_framework::passwords::{
+        delete_generic_password_options, generic_password, set_generic_password_options,
+    };
+    use security_framework::passwords_options::PasswordOptions;
+
+    const SERVICE: &str = "gmacFTP.sync-passphrase";
+    const ACCOUNT: &str = "default";
+
+    fn opts_any() -> PasswordOptions {
+        let mut o = PasswordOptions::new_generic_password(SERVICE, ACCOUNT);
+        o.set_access_synchronized(None); // match both stores on read/delete
+        o
+    }
+
+    pub fn store(pp: &str, sync: bool) -> Result<(), String> {
+        let mut o = PasswordOptions::new_generic_password(SERVICE, ACCOUNT);
+        o.set_access_synchronized(Some(sync)); // iCloud Keychain when sync=true
+        set_generic_password_options(pp.as_bytes(), o).map_err(|e| e.to_string())
+    }
+
+    pub fn load() -> Option<String> {
+        let bytes = generic_password(opts_any()).ok()?;
+        String::from_utf8(bytes).ok()
+    }
+
+    #[allow(dead_code)]
+    pub fn delete() {
+        let _ = delete_generic_password_options(opts_any());
+    }
+}
+
 /// Public entry: move the master key to/from the iCloud-syncing Keychain store.
 #[cfg(target_os = "macos")]
 pub fn set_master_key_syncable(sync: bool) {
@@ -336,6 +430,23 @@ pub fn set_master_key_syncable(sync: bool) {
 }
 #[cfg(not(target_os = "macos"))]
 pub fn set_master_key_syncable(_sync: bool) {}
+
+/// Enable sync with a passphrase: wrap the current master key, push the wrapped key to the
+/// sync folder, cache the passphrase in the Keychain (fixed cross-bundle service), and mark
+/// the passphrase as set. Called from the "set passphrase" dialog when first enabling sync.
+pub fn enable_sync_passphrase(passphrase: &str) -> Result<(), String> {
+    let dir = config_dir().unwrap_or_else(|| PathBuf::from("."));
+    let key = resolve_master_key(&dir.join("master.key"));
+    let wrapped = wrap_master_key(&key, passphrase)?;
+    crate::store::cloud::push_key(&wrapped);
+    #[cfg(target_os = "macos")]
+    keychain_passphrase::store(passphrase, true)
+        .map_err(|e| format!("passphrase keychain store failed: {e}"))?;
+    let mut s = crate::store::settings::load();
+    s.sync_passphrase_set = true;
+    crate::store::settings::save(&s);
+    Ok(())
+}
 
 // ── crypto + io helpers ──
 
@@ -370,6 +481,46 @@ fn decrypt(key: &[u8; 32], blob: &[u8]) -> Result<Vec<u8>, String> {
     let cipher = Aes256Gcm::new_from_slice(&key[..]).map_err(|e| e.to_string())?;
     let nonce = Nonce::from_slice(&blob[..12]);
     cipher.decrypt(nonce, &blob[12..]).map_err(|e| e.to_string())
+}
+
+/// Derive a 32-byte key-encryption-key from the passphrase + salt via Argon2id (library
+/// defaults: ~19 MiB / 2 iters / 1 lane — strong against offline brute force on the wrapped
+/// key, which only ever protects the password vault).
+fn derive_kek(passphrase: &str, salt: &[u8]) -> Result<[u8; 32], String> {
+    let argon2 = argon2::Argon2::default();
+    let mut kek = [0u8; 32];
+    argon2
+        .hash_password_into(passphrase.as_bytes(), salt, kek.as_mut_slice())
+        .map_err(|e| e.to_string())?;
+    Ok(kek)
+}
+
+/// Wrap the 32-byte master key: `salt(16) ‖ nonce(12) ‖ AES-256-GCM(master_key)`, where the
+/// AES key is `Argon2id(passphrase, salt)`.
+fn wrap_master_key(master_key: &[u8; 32], passphrase: &str) -> Result<Vec<u8>, String> {
+    let mut salt = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut salt);
+    let kek = derive_kek(passphrase, &salt)?;
+    let ct = encrypt(&kek, master_key)?; // nonce(12) ‖ ct
+    let mut out = Vec::with_capacity(16 + ct.len());
+    out.extend_from_slice(&salt);
+    out.extend_from_slice(&ct);
+    Ok(out)
+}
+
+/// Unwrap the master key. `None` on a wrong passphrase or a corrupt blob (AES-GCM tag fails).
+fn unwrap_master_key(blob: &[u8], passphrase: &str) -> Option<[u8; 32]> {
+    if blob.len() < 16 + 12 + 32 {
+        return None;
+    }
+    let (salt, rest) = blob.split_at(16);
+    let kek = derive_kek(passphrase, salt).ok()?;
+    let plain = decrypt(&kek, rest).ok()?;
+    (plain.len() == 32).then(|| {
+        let mut k = [0u8; 32];
+        k.copy_from_slice(&plain);
+        k
+    })
 }
 
 fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
@@ -448,5 +599,26 @@ mod tests {
         let mut bad = blob.clone();
         bad[20] ^= 0xff;
         assert!(decrypt(&key, &bad).is_err());
+    }
+
+    #[test]
+    fn passphrase_wrap_roundtrip() {
+        let mk = {
+            let mut k = [0u8; 32];
+            rand::rngs::OsRng.fill_bytes(&mut k);
+            k
+        };
+        let wrapped = wrap_master_key(&mk, "correct horse battery").unwrap();
+        // correct passphrase → unwraps to the same key
+        assert_eq!(unwrap_master_key(&wrapped, "correct horse battery"), Some(mk));
+        // wrong passphrase → None (AES-GCM tag fails)
+        assert_eq!(unwrap_master_key(&wrapped, "wrong"), None);
+        // tamper with the ciphertext → None
+        let mut tampered = wrapped.clone();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 0xff;
+        assert_eq!(unwrap_master_key(&tampered, "correct horse battery"), None);
+        // too-short blob → None
+        assert_eq!(unwrap_master_key(&[0u8; 10], "x"), None);
     }
 }

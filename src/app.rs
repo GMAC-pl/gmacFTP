@@ -585,7 +585,6 @@ pub fn run() {
         .build()
         .expect("failed to build Tokio runtime");
     let handle = runtime.handle().clone();
-    let store: Arc<dyn CredentialStore> = Arc::new(store::default_store());
 
     // Settings → TLS policy + locale + theme.
     let settings = store::settings::load();
@@ -606,6 +605,15 @@ pub fn run() {
     // still empty but this Mac already has servers, seed it from them (migration). No-op if
     // sync disabled. Local files are never deleted, so existing servers are always kept.
     let _ = store::cloud::bootstrap();
+    // Create the store AFTER the pull so FileVault::open loads the just-pulled vault (and so
+    // is_locked() reflects the post-pull state).
+    let store: Arc<dyn CredentialStore> = Arc::new(store::default_store());
+    // If the pulled vault is undecryptable (master key absent locally) but a wrapped key exists
+    // in the sync folder, prompt for the sync passphrase to unlock it.
+    if store.is_locked() {
+        ui.set_passphrase_mode("enter".into());
+        ui.set_passphrase_open(true);
+    }
 
     let connections = if use_design_demo_connections() {
         design_demo_connections()
@@ -710,6 +718,7 @@ pub fn run() {
     wire_confirm_delete(&ui, &handle, store.clone(), panes.clone());
     wire_keyboard(&ui, &handle, store.clone(), panes.clone(), engine.clone(), jobs_index.clone());
     wire_misc_ui(&ui);
+    wire_passphrase(&ui, store.clone(), conns.clone());
     wire_overwrite(&ui, &handle, store.clone(), panes.clone(), engine.clone(), jobs_index.clone());
     wire_session_controls(&ui, &handle, store.clone(), sessions.clone(), panes.clone(), engine.clone());
     // Re-assert keyboard focus on every pane/row click — Slint delivers key-pressed only to the
@@ -2574,6 +2583,59 @@ fn wire_overwrite(ui: &App, handle: &Handle, store: Arc<dyn CredentialStore>, pa
     let (h, st, pn, en, ix, uw) = (handle.clone(), store.clone(), panes.clone(), engine.clone(), idx.clone(), ui.as_weak());
     ui.on_resolve_overwrite(move |decision| {
         resolve_overwrite(&h, st.clone(), pn.clone(), en.clone(), ix.clone(), uw.clone(), decision);
+    });
+}
+
+/// Wire the sync-passphrase dialog: "set" (first time enabling sync) wraps the master key +
+/// enables sync; "enter" (a pulled vault that's locked here) unlocks it with the passphrase.
+fn wire_passphrase(ui: &App, store: Arc<dyn CredentialStore>, conns: ConnList) {
+    let (st, cn, uw) = (store.clone(), conns.clone(), ui.as_weak());
+    ui.on_resolve_passphrase(move |value: slint::SharedString, confirm: slint::SharedString| {
+        let value = value.to_string();
+        let confirm = confirm.to_string();
+        let mode = uw.upgrade().map(|u| u.get_passphrase_mode().to_string()).unwrap_or_default();
+        // Clear the inputs + close (re-opened below on a wrong passphrase).
+        if let Some(ui) = uw.upgrade() {
+            ui.set_passphrase_value("".into());
+            ui.set_passphrase_confirm("".into());
+            ui.set_passphrase_open(false);
+        }
+        if value.is_empty() {
+            return; // Cancel
+        }
+        if mode == "set" {
+            if value != confirm {
+                if let Some(ui) = uw.upgrade() {
+                    ui.set_error("Passphrases don't match.".into());
+                }
+                return;
+            }
+            match store::vault::enable_sync_passphrase(&value) {
+                Ok(()) => {
+                    store::cloud::set_sync_enabled(true);
+                    crate::macos_menu::refresh_sync_title();
+                    if let Some(ui) = uw.upgrade() {
+                        ui.set_status(
+                            "Sync enabled — servers + the encrypted vault will sync to your other Macs.".into(),
+                        );
+                    }
+                }
+                Err(e) => {
+                    if let Some(ui) = uw.upgrade() {
+                        ui.set_error(format!("Failed to set passphrase: {e}").into());
+                    }
+                }
+            }
+        } else if st.unlock(&value) {
+            if let Some(ui) = uw.upgrade() {
+                refresh_connections_model(&ui, &cn);
+                ui.set_status("Vault unlocked — passwords are available.".into());
+            }
+        } else if let Some(ui) = uw.upgrade() {
+            ui.set_error("Wrong passphrase.".into());
+            ui.set_passphrase_mode("enter".into());
+            ui.set_passphrase_open(true); // let the user retry
+        }
     });
 }
 

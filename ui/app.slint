@@ -89,6 +89,14 @@ export global I18n {
     out property <string> overwrite-msg: locale == "pl" ? "Plik o tej nazwie już istnieje w miejscu docelowym. Co chcesz zrobić?" : "A file with this name already exists at the destination. What do you want to do?";
     out property <string> overwrite-cap: locale == "pl" ? "Nadpisz" : "Overwrite";
     out property <string> save-new-cap: locale == "pl" ? "Zapisz jako nowy" : "Save as new";
+    out property <string> passphrase-set-title: locale == "pl" ? "Ustaw hasło synchronizacji" : "Set sync passphrase";
+    out property <string> passphrase-enter-title: locale == "pl" ? "Odblokuj serwery" : "Unlock servers";
+    out property <string> passphrase-set-msg: locale == "pl" ? "To hasło odblokowuje Twoje serwery na innych Macach. Zapamiętaj je (lub zapisz) — bez niego nie odzyskasz haseł." : "This passphrase unlocks your servers on your other Macs. Remember it (or save it) — without it, your passwords can't be recovered.";
+    out property <string> passphrase-enter-msg: locale == "pl" ? "Wpisz hasło synchronizacji, aby odblokować zapisane hasła." : "Enter your sync passphrase to unlock your saved passwords.";
+    out property <string> passphrase-label: locale == "pl" ? "HASŁO" : "PASSPHRASE";
+    out property <string> passphrase-confirm-label: locale == "pl" ? "POWTÓRZ HASŁO" : "CONFIRM";
+    out property <string> passphrase-ok-cap: locale == "pl" ? "Ustaw" : "Set";
+    out property <string> passphrase-unlock-cap: locale == "pl" ? "Odblokuj" : "Unlock";
     out property <string> import-cap: locale == "pl" ? "Import z ForkLift" : "Import from ForkLift";
     out property <string> not-connected: locale == "pl" ? "brak połączenia" : "not connected";
     out property <string> connecting: locale == "pl" ? "łączenie…" : "connecting…";
@@ -802,6 +810,10 @@ export component App inherits Window {
     in-out property <string> selected-path: "";      // full path of the active pane's selected entry (bottom bar, copyable)
     in-out property <bool> overwrite-open: false;    // overwrite-conflict dialog open?
     in-out property <string> overwrite-name: "";     // name of the clashing file (shown in the dialog)
+    in-out property <bool> passphrase-open: false;   // sync-passphrase dialog open?
+    in-out property <string> passphrase-mode: "set"; // "set" (first enable) | "enter" (unlock a pulled vault)
+    in-out property <string> passphrase-value: "";
+    in-out property <string> passphrase-confirm: "";
     in-out property <bool> sort-open: false;          // sort popover open?
     in-out property <string> sort-pane: "local";      // which pane the sort popover targets
     in-out property <int> local-count: 0;
@@ -915,6 +927,7 @@ export component App inherits Window {
     callback apply-sort-field(string);    // set the sort-pane's sort key + re-apply the view
     callback toggle-sort-dir();           // toggle the sort-pane's asc/desc + re-apply
     callback resolve-overwrite(int);      // overwrite dialog: 0=cancel, 1=overwrite, 2=save-as-new
+    callback resolve-passphrase(string, string); // passphrase dialog: (value, confirm); empty value = cancel
     callback request-delete(string, string, bool); // intend-to-delete (pane, name, is_dir) → opens dialog or deletes if "don't ask" is on
     callback confirm-delete();             // delete-dialog "Delete" button → honour checkbox, delete, close
     callback activate-pane(string);        // "local" | "remote"
@@ -1761,6 +1774,50 @@ export component App inherits Window {
                         GhostButton { text: I18n.cancel-cap; clicked => { root.resolve-overwrite(0); } }
                         GhostButton { text: I18n.save-new-cap; clicked => { root.resolve-overwrite(2); } }
                         PrimaryButton { text: I18n.overwrite-cap; clicked => { root.resolve-overwrite(1); } }
+                    }
+                }
+            }
+        }
+
+        // ── sync passphrase dialog (set on first enable / enter to unlock a pulled vault) ──
+        if root.passphrase-open : Rectangle {
+            background: Tokens.scrim;
+            TouchArea { clicked => { } } // modal — force a choice
+            Rectangle {
+                x: (root.width - self.width) / 2;
+                y: (root.height - self.height) / 2;
+                width: 420px; height: root.passphrase-mode == "set" ? 300px : 240px;
+                background: Tokens.surface-raised;
+                border-radius: 14px; border-width: 1px; border-color: Tokens.border-strong;
+                drop-shadow-blur: 60px; drop-shadow-offset-y: 24px; drop-shadow-color: #00000066;
+                TouchArea { clicked => { } }
+                VerticalLayout { padding: 22px; spacing: 12px;
+                    Text {
+                        text: root.passphrase-mode == "set" ? I18n.passphrase-set-title : I18n.passphrase-enter-title;
+                        color: Tokens.text; font-size: 15px; font-weight: 700;
+                    }
+                    Text {
+                        text: root.passphrase-mode == "set" ? I18n.passphrase-set-msg : I18n.passphrase-enter-msg;
+                        color: Tokens.text-sec; font-size: 12px; wrap: word-wrap;
+                    }
+                    VerticalLayout { spacing: 6px;
+                        Text { text: I18n.passphrase-label; color: Tokens.text-ter; font-size: 9px; font-weight: 700; letter-spacing: 1px; }
+                        Field { text <=> root.passphrase-value; placeholder: "passphrase"; input-type: password; }
+                    }
+                    if root.passphrase-mode == "set" : VerticalLayout { spacing: 6px;
+                        Text { text: I18n.passphrase-confirm-label; color: Tokens.text-ter; font-size: 9px; font-weight: 700; letter-spacing: 1px; }
+                        Field { text <=> root.passphrase-confirm; placeholder: "passphrase"; input-type: password; }
+                    }
+                    Rectangle { vertical-stretch: 1; }
+                    HorizontalLayout { spacing: 10px; alignment: end;
+                        GhostButton {
+                            text: I18n.cancel-cap;
+                            clicked => { root.passphrase-value = ""; root.passphrase-confirm = ""; root.resolve-passphrase("", ""); }
+                        }
+                        PrimaryButton {
+                            text: root.passphrase-mode == "set" ? I18n.passphrase-ok-cap : I18n.passphrase-unlock-cap;
+                            clicked => { root.resolve-passphrase(root.passphrase-value, root.passphrase-confirm); }
+                        }
                     }
                 }
             }

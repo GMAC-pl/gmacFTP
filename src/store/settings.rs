@@ -32,11 +32,17 @@ pub struct Settings {
     pub sync_folder: Option<String>,
     /// Enable cross-device sync of the connection list + encrypted vault. Sync mirrors
     /// `connections.json` + `vault.bin` as plain files in a synced folder (default the user's
-    /// iCloud Drive). When on, the vault master key is ALSO stored as an iCloud-Keychain-
-    /// syncing item (requires iCloud Keychain in System Settings) so the synced vault decrypts
-    /// on the other Mac. Default OFF.
+    /// iCloud Drive). When on, the vault master key is wrapped with the sync passphrase and
+    /// the wrapped key travels in the sync folder; the passphrase itself is cached in the
+    /// Keychain (FIXED cross-bundle service) so the synced vault decrypts on the other Mac.
+    /// Default OFF.
     #[serde(default)]
     pub sync_via_icloud: bool,
+    /// True once the user has set a sync passphrase (so enabling sync prompts for one only the
+    /// first time). The passphrase itself is NEVER stored here — only in the Keychain / user
+    /// memory.
+    #[serde(default)]
+    pub sync_passphrase_set: bool,
 }
 
 fn default_accept_any_cert() -> bool {
@@ -61,6 +67,7 @@ impl Default for Settings {
             local_favorites_customized: false,
             sync_via_icloud: false,
             sync_folder: None,
+            sync_passphrase_set: false,
         }
     }
 }

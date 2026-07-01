@@ -81,6 +81,7 @@ mod imp {
         match kind {
             "connections" => "gmacftp.connections.json",
             "vault" => "gmacftp.vault.bin",
+            "key" => "gmacftp.key.wrap",
             _ => "gmacftp.unknown",
         }
     }
@@ -175,10 +176,26 @@ pub fn push_state() {
     }
 }
 
-/// Remove both iCloud items (used when the user turns sync OFF, to stop sharing). Best-effort.
+/// Push the wrapped master key (`gmacftp.key.wrap`) to the sync folder. No-op if sync off.
+pub fn push_key(wrapped: &[u8]) {
+    if !enabled() {
+        return;
+    }
+    if let Err(e) = imp::write_item("key", wrapped) {
+        tracing::warn!(target: "gmacftp::cloud", error = %e, "wrapped-key push failed");
+    }
+}
+
+/// Read the wrapped master key from the sync folder (mtime + bytes), or None.
+pub fn read_key() -> Option<(u64, Vec<u8>)> {
+    imp::read_item("key")
+}
+
+/// Remove the synced items (used when the user turns sync OFF, to stop sharing). Best-effort.
 pub fn purge() {
     imp::delete_item("connections");
     imp::delete_item("vault");
+    imp::delete_item("key");
 }
 
 /// Toggle iCloud sync on/off (the menu action calls this). Persists the setting, moves the

@@ -4,6 +4,10 @@
 
 _(Nothing yet.)_
 
+## 0.0.6 — 2026-07-01
+
+- **Cross-device passwords: passphrase-protected master key (1Password-style).** v0.0.5 synced the connection list + vault, but the master key stayed bundle-local in the Keychain → passwords failed on the other Mac ("missing credential"). The master key is now wrapped with a user-chosen sync passphrase (Argon2id → AES-256-GCM); the wrapped key travels in the sync folder (iCloud Drive), and the passphrase is cached in the Keychain under a FIXED cross-bundle service (iCloud Keychain sync). Result: the synced vault decrypts on any of your Macs — automatically when the passphrase is in iCloud Keychain, or with a one-time manual entry otherwise. The first time you enable sync you set a passphrase; remember/save it (it's the recovery path if iCloud Keychain isn't available). No passwords are recoverable from the synced files without it.
+
 ## 0.0.5 — 2026-06-30
 
 - **iCloud sync switched to a plain synced folder — now works for direct (Developer ID) distribution.** 0.0.4 used `NSUbiquitousKeyValueStore`, which Apple restricts to App Store / Mac App Store distribution; for a Developer-ID build it silently never synced (writes stayed local-only, nothing reached the 2nd Mac). gmacFTP now mirrors `connections.json` + the encrypted vault as **ordinary files** in a folder the OS already syncs — by default your iCloud Drive (`~/Library/Mobile Documents/com~apple~CloudDocs/gmacFTP/`), or any synced folder you choose (Dropbox, Google Drive, Syncthing…). No iCloud/CloudKit API, no App-Store-only entitlement. iCloud Drive is just a folder; a non-sandboxed app writes to it with normal file I/O and macOS syncs it. The vault master key stays in the Keychain (iCloud Keychain sync) so the synced vault decrypts on the other Mac.

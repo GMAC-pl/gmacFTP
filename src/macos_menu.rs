@@ -61,7 +61,7 @@ mod imp {
         }
     }
 
-    fn refresh_sync_title() {
+    pub fn refresh_sync_title() {
         let ptr_item = SYNC_ITEM_PTR.load(Ordering::SeqCst);
         if !ptr_item.is_null() {
             // SAFETY: the pointer is valid for the app lifetime (set in install_once, only
@@ -80,7 +80,20 @@ mod imp {
         impl GmacMenuTarget {
             #[unsafe(method(toggleSync:))]
             fn toggle_sync(&self, _sender: Option<&AnyObject>) {
-                cloud::set_sync_enabled(!cloud::enabled());
+                let enabling = !cloud::enabled();
+                // First-time enable: prompt for a sync passphrase before enabling (the
+                // passphrase wraps the master key so the synced vault decrypts cross-device).
+                // Re-enabling / disabling toggles directly.
+                if enabling && !gmacftp::store::settings::load().sync_passphrase_set {
+                    on_ui(|ui| {
+                        ui.set_passphrase_mode("set".into());
+                        ui.set_passphrase_value("".into());
+                        ui.set_passphrase_confirm("".into());
+                        ui.set_passphrase_open(true);
+                    });
+                    return;
+                }
+                cloud::set_sync_enabled(enabling);
                 refresh_sync_title();
                 tracing::info!(target: "gmacftp::menu", "iCloud sync toggled from menu bar");
             }
@@ -380,3 +393,12 @@ pub fn reassert(ui: slint::Weak<crate::App>) {
 
 #[cfg(not(target_os = "macos"))]
 pub fn reassert(_ui: slint::Weak<crate::App>) {}
+
+/// Re-read cloud::enabled() and update the menu item's ON/OFF title. Called after the sync
+/// state changes from outside the menu (e.g. the set-passphrase dialog enabling sync).
+#[cfg(target_os = "macos")]
+pub fn refresh_sync_title() {
+    imp::refresh_sync_title();
+}
+#[cfg(not(target_os = "macos"))]
+pub fn refresh_sync_title() {}

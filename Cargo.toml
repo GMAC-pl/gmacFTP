@@ -1,6 +1,6 @@
 [package]
 name = "gmacftp"
-version = "0.0.5"
+version = "0.0.6"
 edition = "2021"
 rust-version = "1.88"
 description = "gmacFTP — native, lightweight FTP/FTPS/SFTP client for macOS"
@@ -47,6 +47,7 @@ keyring = { version = "4", features = ["apple-native-keyring-store"] }
 aes-gcm = "0.10"
 rand = "0.8"
 base64 = "0.22"
+argon2 = "0.5"   # derive the master-key-wrapping key from the user's sync passphrase
 
 # --- Ergonomics / safety / observability ---
 anyhow = "1"
