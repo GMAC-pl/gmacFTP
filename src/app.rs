@@ -614,9 +614,11 @@ pub fn run() {
         ui.set_passphrase_mode("enter".into());
         ui.set_passphrase_open(true);
     } else if store::cloud::enabled() && !settings.sync_passphrase_set {
-        // Migration: sync was enabled in a pre-passphrase build (≤0.0.5) but no passphrase is
-        // set yet → prompt to set one so the vault syncs decryptable across Macs.
-        ui.set_passphrase_mode("set".into());
+        // Sync is on but no passphrase set here yet. If a wrapped key already exists in the
+        // sync folder, ANOTHER Mac already set up sync → JOIN it (enter that passphrase).
+        // Otherwise this is the first Mac → SET a new one.
+        let mode = if store::cloud::read_key().is_some() { "enter" } else { "set" };
+        ui.set_passphrase_mode(mode.into());
         ui.set_passphrase_open(true);
     }
 

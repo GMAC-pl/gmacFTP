@@ -4,6 +4,11 @@
 
 _(Nothing yet.)_
 
+## 0.0.7 — 2026-07-01
+
+- **Fix: 2nd Mac now JOINS an existing sync instead of creating its own.** 0.0.6 asked every Mac to SET a new passphrase, so the 2nd Mac started fresh (its own keys/servers) instead of unlocking the main Mac's vault. Now: if a wrapped key already exists in the sync folder (another Mac set up sync), the Mac ENTERS that passphrase to join; only the first Mac SETs one.
+- **Fix: unlock adopts the synced vault.** `unlock` reads the SYNCED vault (the main Mac's) and writes it locally, instead of the 2nd Mac's own (undecryptable) local vault. This also stops the per-server Keychain prompts: once the vault is unlocked, every server's password comes from the vault (no Keychain fallback → no prompts).
+
 ## 0.0.6 — 2026-07-01
 
 - **Cross-device passwords: passphrase-protected master key (1Password-style).** v0.0.5 synced the connection list + vault, but the master key stayed bundle-local in the Keychain → passwords failed on the other Mac ("missing credential"). The master key is now wrapped with a user-chosen sync passphrase (Argon2id → AES-256-GCM); the wrapped key travels in the sync folder (iCloud Drive), and the passphrase is cached in the Keychain under a FIXED cross-bundle service (iCloud Keychain sync). Result: the synced vault decrypts on any of your Macs — automatically when the passphrase is in iCloud Keychain, or with a one-time manual entry otherwise. The first time you enable sync you set a passphrase; remember/save it (it's the recovery path if iCloud Keychain isn't available). No passwords are recoverable from the synced files without it.

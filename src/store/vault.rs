@@ -127,7 +127,9 @@ impl FileVault {
     pub fn unlock(&self, passphrase: &str) -> bool {
         let Some((_, wrapped)) = crate::store::cloud::read_key() else { return false };
         let Some(key) = unwrap_master_key(&wrapped, passphrase) else { return false };
-        let Ok(blob) = std::fs::read(&self.vault_path) else { return false };
+        // Read the SYNCED vault (the local vault.bin may be this Mac's own, undecryptable with
+        // the synced key). Adopt it: decrypt + load, then write it locally so future opens match.
+        let Some((_, blob)) = crate::store::cloud::read_vault() else { return false };
         let Ok(plaintext) = decrypt(&key, &blob) else { return false };
         let Ok(loaded) = serde_json::from_slice::<HashMap<String, String>>(&plaintext) else {
             return false;
@@ -138,13 +140,14 @@ impl FileVault {
         if let Ok(mut m) = self.map.lock() {
             *m = loaded;
         }
+        let _ = atomic_write(&self.vault_path, &blob); // local vault ← synced vault
         #[cfg(target_os = "macos")]
         {
             let sync = crate::store::settings::load().sync_via_icloud;
             let _ = keychain_master_key::store(&key, sync);
             let _ = keychain_passphrase::store(passphrase, true);
         }
-        tracing::info!(target: "gmacftp::vault", "vault unlocked with sync passphrase");
+        tracing::info!(target: "gmacftp::vault", "vault unlocked + adopted synced state");
         true
     }
 }

@@ -191,6 +191,12 @@ pub fn read_key() -> Option<(u64, Vec<u8>)> {
     imp::read_item("key")
 }
 
+/// Read the synced vault bytes from the sync folder (used by vault::unlock to ADOPT the other
+/// Mac's vault — the local vault.bin may be this Mac's own, undecryptable with the synced key).
+pub fn read_vault() -> Option<(u64, Vec<u8>)> {
+    imp::read_item("vault")
+}
+
 /// Remove the synced items (used when the user turns sync OFF, to stop sharing). Best-effort.
 pub fn purge() {
     imp::delete_item("connections");
