@@ -14,7 +14,7 @@ For the macOS app bundle:
 
 ```sh
 bash scripts/build-app.sh
-open target/release/gmacFTP-Public.app
+open target/release/gmacFTP.app
 ```
 
 ## Before Opening A Pull Request

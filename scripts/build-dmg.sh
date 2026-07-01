@@ -7,7 +7,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-APP="${1:-target/release/gmacFTP-Public.app}"
+APP="${1:-target/release/gmacFTP.app}"
 VERSION="${2:-$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\([^"]*\)".*/\1/')}"
 VOL="gmacFTP"
 OUT="target/release/gmacFTP-${VERSION}.dmg"

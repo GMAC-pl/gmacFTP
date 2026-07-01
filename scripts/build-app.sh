@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Assemble two macOS bundles:
-#   - target/release/gmacFTP.app        personal/local build (uses .env.personal when present)
-#   - target/release/gmacFTP-Public.app public/open-source build (sample/empty app identity)
+#   - target/release/gmacFTP.app          public/open-source build (the one that ships: DMG + Homebrew cask)
+#   - target/release/gmacFTP-Personal.app personal/local build (uses .env.personal when present)
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
@@ -129,8 +129,9 @@ CREDITS
   echo "==> Built $app"
 }
 
-# Public defaults: safe identity for GitHub/demo use.
-PUBLIC_DISPLAY_NAME="${MACKFTP_PUBLIC_DISPLAY_NAME:-gmacFTP Public}"
+# Public defaults: the bundle that ships (DMG + Homebrew cask). Display name is "gmacFTP"
+# (no "Public" suffix) so the menu bar, Applications, DMG, and cask all show one name.
+PUBLIC_DISPLAY_NAME="${MACKFTP_PUBLIC_DISPLAY_NAME:-gmacFTP}"
 PUBLIC_BUNDLE_ID="${MACKFTP_PUBLIC_BUNDLE_ID:-app.mackftp.client}"
 PUBLIC_CONFIG_QUALIFIER="${MACKFTP_PUBLIC_CONFIG_QUALIFIER:-app}"
 PUBLIC_CONFIG_ORGANIZATION="${MACKFTP_PUBLIC_CONFIG_ORGANIZATION:-mackftp}"
@@ -138,7 +139,7 @@ PUBLIC_CONFIG_APPLICATION="${MACKFTP_PUBLIC_CONFIG_APPLICATION:-client}"
 
 build_bundle \
   "public" \
-  "target/release/gmacFTP-Public.app" \
+  "target/release/gmacFTP.app" \
   "$PUBLIC_DISPLAY_NAME" \
   "$PUBLIC_BUNDLE_ID" \
   "$PUBLIC_CONFIG_QUALIFIER" \
@@ -158,7 +159,7 @@ if [ -f .env.personal ]; then
 
   build_bundle \
     "personal" \
-    "target/release/gmacFTP.app" \
+    "target/release/gmacFTP-Personal.app" \
     "$PERSONAL_DISPLAY_NAME" \
     "$PERSONAL_BUNDLE_ID" \
     "$PERSONAL_CONFIG_QUALIFIER" \
@@ -166,9 +167,9 @@ if [ -f .env.personal ]; then
     "$PERSONAL_CONFIG_APPLICATION"
 else
   echo "==> .env.personal not found — skipped personal bundle"
-  echo "    Public bundle is ready at: target/release/gmacFTP-Public.app"
+  echo "    Public bundle is ready at: target/release/gmacFTP.app"
 fi
 
 echo
-echo "Launch personal: open target/release/gmacFTP.app"
-echo "Launch public:   open target/release/gmacFTP-Public.app"
+echo "Launch personal: open target/release/gmacFTP-Personal.app"
+echo "Launch public:   open target/release/gmacFTP.app"

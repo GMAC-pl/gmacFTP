@@ -16,7 +16,7 @@ files — quickly and safely.
 
 ## ⬇️ Download & install
 
-**[↓ Download gmacFTP for Mac — gmacFTP-0.0.13.dmg](https://github.com/GMAC-pl/gmacftp/releases/download/v0.0.13/gmacFTP-0.0.13.dmg)** · macOS 11+, Apple Silicon (M-series)
+**[↓ Download gmacFTP for Mac — gmacFTP-0.0.14.dmg](https://github.com/GMAC-pl/gmacftp/releases/download/v0.0.14/gmacFTP-0.0.14.dmg)** · macOS 11+, Apple Silicon (M-series)
 
 1. Download the `.dmg`.
 2. Open it and **drag gmacFTP into the Applications folder** (a shortcut is inside).
@@ -46,7 +46,7 @@ Signed with an **Apple Developer ID** and **notarized by Apple** — opens clean
 
 ### Download
 
-**[⬇ gmacFTP-0.0.13.dmg](https://github.com/GMAC-pl/gmacftp/releases/download/v0.0.13/gmacFTP-0.0.13.dmg)** — install steps are at the top of this page.
+**[⬇ gmacFTP-0.0.14.dmg](https://github.com/GMAC-pl/gmacftp/releases/download/v0.0.14/gmacFTP-0.0.14.dmg)** — install steps are at the top of this page.
 
 Prefer to build it yourself? See [Build](#build).
 
@@ -98,7 +98,7 @@ Build the native `.app` bundle:
 
 ```sh
 bash scripts/build-app.sh
-open target/release/gmacFTP-Public.app
+open target/release/gmacFTP.app
 ```
 
 Both panes start as your local filesystem, so you can try navigation, selection, sorting, the
@@ -170,7 +170,7 @@ która po prostu przenosi Twoje pliki — szybko i bezpiecznie.
 
 ### Pobranie i instalacja
 
-**[⬇ Pobierz gmacFTP dla Maca — gmacFTP-0.0.13.dmg](https://github.com/GMAC-pl/gmacftp/releases/download/v0.0.13/gmacFTP-0.0.13.dmg)** · macOS 11+, Apple Silicon (M-series)
+**[⬇ Pobierz gmacFTP dla Maca — gmacFTP-0.0.14.dmg](https://github.com/GMAC-pl/gmacftp/releases/download/v0.0.14/gmacFTP-0.0.14.dmg)** · macOS 11+, Apple Silicon (M-series)
 
 1. Pobierz plik `.dmg`.
 2. Otwórz go i **przeciągnij gmacFTP do folderu Aplikacje** (skrót jest w środku).
@@ -222,7 +222,7 @@ Wymagania: macOS 11+, Rust 1.88+, Xcode Command Line Tools.
 cargo run --release
 # bundle .app:
 bash scripts/build-app.sh
-open target/release/gmacFTP-Public.app
+open target/release/gmacFTP.app
 ```
 
 Oba panele startują jako Twój lokalny filesystem, więc możesz wypróbować nawigację, zaznaczanie,

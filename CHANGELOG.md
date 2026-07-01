@@ -4,6 +4,11 @@
 
 _(Nothing yet.)_
 
+## 0.0.14 — 2026-07-01
+
+- **Renamed the public app bundle to "gmacFTP".** The app you install is now `gmacFTP.app` with the display name **gmacFTP** (was "gmacFTP Public") — so the menu bar, Applications folder, GitHub DMG, and Homebrew install all show one consistent name. The local personal build is now `gmacFTP-Personal.app` (local-only; avoids a filename clash). Purely cosmetic — no behavior change.
+- **Homebrew install.** gmacFTP is now installable via Homebrew: `brew install --cask gmac-pl/gmacftp/gmacftp` (the project tap, installs the same signed + Apple-notarized app as the DMG). Also submitted to Homebrew's official cask tap so the bare `brew install --cask gmacftp` will work once it's reviewed.
+
 ## 0.0.13 — 2026-07-01
 
 A hardening + privacy pass following a full code audit. No customer/personal data was ever leaked; this closes the remaining hygiene and correctness gaps.
