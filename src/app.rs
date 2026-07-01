@@ -613,6 +613,11 @@ pub fn run() {
     if store.is_locked() {
         ui.set_passphrase_mode("enter".into());
         ui.set_passphrase_open(true);
+    } else if store::cloud::enabled() && !settings.sync_passphrase_set {
+        // Migration: sync was enabled in a pre-passphrase build (≤0.0.5) but no passphrase is
+        // set yet → prompt to set one so the vault syncs decryptable across Macs.
+        ui.set_passphrase_mode("set".into());
+        ui.set_passphrase_open(true);
     }
 
     let connections = if use_design_demo_connections() {
