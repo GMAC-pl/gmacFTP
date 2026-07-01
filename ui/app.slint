@@ -1110,7 +1110,21 @@ export component App inherits Window {
                                             Text { text: s.sub; color: Tokens.text-sec; font-family: "JetBrains Mono"; font-size: 9px; overflow: elide; }
                                         }
                                         ProtocolBadge { protocol: s.protocol; compact: true; }
-                                        IconButton { icon: "log-out"; fg: Tokens.text-ter; clicked => { root.disconnect-session(s.id); } }
+                                        Rectangle {
+                                            width: 30px; height: 30px;
+                                            border-radius: 6px;
+                                            background: disconnect_touch.has-hover ? Tokens.danger-soft : transparent;
+                                            Icon {
+                                                kind: "eject";
+                                                fg: disconnect_touch.has-hover ? Tokens.danger : Tokens.text-ter;
+                                                x: (parent.width - self.width) / 2;
+                                                y: (parent.height - self.height) / 2;
+                                            }
+                                            disconnect_touch := TouchArea {
+                                                mouse-cursor: pointer;
+                                                clicked => { root.disconnect-session(s.id); }
+                                            }
+                                        }
                                     }
                                 }
                                 if root.server-filter == "" : Rectangle {
@@ -1270,9 +1284,9 @@ export component App inherits Window {
                                             Rectangle {
                                                 x: parent.width - 30px; y: 1px; width: 28px; height: 30px;
                                                 border-radius: 6px;
-                                                background: login_touch.has-hover ? Tokens.row-hover : transparent;
+                                                background: login_touch.has-hover ? Tokens.primary-fill : Tokens.accent-soft;
                                                 Icon {
-                                                    kind: "log-in"; fg: login_touch.has-hover ? Tokens.text : Tokens.text-ter;
+                                                    kind: "plug-zap"; fg: login_touch.has-hover ? #FFFFFF : Tokens.accent-text;
                                                     x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
                                                 }
                                                 login_touch := TouchArea {

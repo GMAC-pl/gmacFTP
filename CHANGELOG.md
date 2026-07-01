@@ -4,6 +4,10 @@
 
 _(Nothing yet.)_
 
+## 0.0.12 — 2026-07-01
+
+- **Clearer connect / disconnect icons in the sidebar (Apple HIG).** The per-server row buttons now use unambiguous, familiar symbols instead of generic arrows: **Connect** is a blue plug with a filled background, and **Disconnect** is an eject mark that turns red only when you hover it. Different actions now read as different symbols at a glance, per Apple's Human Interface Guidelines. This is a pure visual change — every callback and the drag-and-drop behaviour are unchanged.
+
 ## 0.0.11 — 2026-07-01
 
 - **One Keychain authorization migrates ALL passwords (was one-per-server).** 0.10's migration iterated servers and prompted for each. Now a single Keychain enumeration (one `SecItemCopyMatching`) reads every saved password in ONE authorization — enter your Mac login password ONCE. Also fixed: legacy items saved under any old service prefix (older bundle id / app name) now match (host taken after the last `/`), and the one-shot flag was reset so this re-runs correctly.
