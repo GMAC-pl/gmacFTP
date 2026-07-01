@@ -451,6 +451,25 @@ pub fn enable_sync_passphrase(passphrase: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Re-create + re-push the wrapped key from the passphrase cached in the Keychain (used to
+/// auto-heal when the wrapped key is missing from the sync folder — e.g. after a sync off→on
+/// toggle purged it). Errors if no passphrase is cached (caller then prompts to set one).
+pub fn repush_sync_key() -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let pp = keychain_passphrase::load()
+            .ok_or_else(|| "no sync passphrase in Keychain".to_string())?;
+        let dir = config_dir().unwrap_or_else(|| PathBuf::from("."));
+        let key = resolve_master_key(&dir.join("master.key"));
+        let wrapped = wrap_master_key(&key, &pp)?;
+        crate::store::cloud::push_key(&wrapped);
+        tracing::info!("re-pushed wrapped master key to the sync folder");
+        return Ok(());
+    }
+    #[cfg(not(target_os = "macos"))]
+    Err("sync not supported on this platform".into())
+}
+
 // ── crypto + io helpers ──
 
 /// Stash the unreadable vault aside so the user can recover/re-import before a later `set()`

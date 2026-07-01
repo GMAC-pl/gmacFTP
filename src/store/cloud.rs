@@ -220,6 +220,12 @@ pub fn set_sync_enabled(enabled: bool) {
     crate::store::vault::set_master_key_syncable(enabled);
     if enabled {
         push_state();
+        // Re-push the wrapped key too — a prior off→on toggle purged it, and push_state only
+        // covers connections/vault. No-op if no passphrase is set yet (the SET dialog handles
+        // the first-time case).
+        if crate::store::settings::load().sync_passphrase_set {
+            let _ = crate::store::vault::repush_sync_key();
+        }
     } else {
         purge();
     }
@@ -278,6 +284,18 @@ pub fn bootstrap() {
     }
     pull_and_apply();
     seed_if_empty();
+    // Auto-heal: a passphrase was set but the wrapped key is missing from the sync folder
+    // (e.g. purged by a sync off→on toggle, which only re-pushes connections/vault) →
+    // re-create it from the cached passphrase. If the passphrase isn't cached either, clear
+    // the flag so the SET dialog shows again on this Mac.
+    if crate::store::settings::load().sync_passphrase_set && read_key().is_none() {
+        if crate::store::vault::repush_sync_key().is_err() {
+            let mut s = crate::store::settings::load();
+            s.sync_passphrase_set = false;
+            crate::store::settings::save(&s);
+            tracing::warn!(target: "gmacftp::cloud", "sync passphrase not in Keychain — will prompt to set one");
+        }
+    }
 }
 
 /// Migration / first-run: if iCloud has no `connections` entry yet but a local

@@ -4,6 +4,10 @@
 
 _(Nothing yet.)_
 
+## 0.0.8 — 2026-07-01
+
+- **Fix: the wrapped master key (`gmacftp.key.wrap`) now actually gets created + survives a sync off→on toggle.** 0.0.6/0.0.7 could leave the sync folder with connections + vault but NO wrapped key (a purge on sync-off deleted it, and re-enabling only re-pushed connections/vault) → the other Mac had nothing to unlock. Now: turning sync on re-pushes the wrapped key, and launch auto-heals a missing wrapped key from the cached passphrase (or re-prompts to set one if the passphrase was lost).
+
 ## 0.0.7 — 2026-07-01
 
 - **Fix: 2nd Mac now JOINS an existing sync instead of creating its own.** 0.0.6 asked every Mac to SET a new passphrase, so the 2nd Mac started fresh (its own keys/servers) instead of unlocking the main Mac's vault. Now: if a wrapped key already exists in the sync folder (another Mac set up sync), the Mac ENTERS that passphrase to join; only the first Mac SETs one.
