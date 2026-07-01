@@ -22,6 +22,14 @@ files — quickly and safely.
 2. Open it and **drag gmacFTP into the Applications folder** (a shortcut is inside).
 3. Open gmacFTP from **Applications**. On the first Keychain prompt, click **Always Allow**.
 
+**Prefer Homebrew?**
+
+```bash
+brew install --cask gmac-pl/gmacftp/gmacftp
+```
+
+The same signed + Apple-notarized app as the DMG. (The bare `brew install --cask gmacftp` will work once [the official cask PR](https://github.com/Homebrew/homebrew-cask/pull/272665) is merged.)
+
 Signed with an **Apple Developer ID** and **notarized by Apple** — opens cleanly with no warnings.
 
 > 🧪 **Development preview (pre-1.0).** gmacFTP is early, but solid for everyday FTP / FTPS / SFTP
@@ -175,6 +183,14 @@ która po prostu przenosi Twoje pliki — szybko i bezpiecznie.
 1. Pobierz plik `.dmg`.
 2. Otwórz go i **przeciągnij gmacFTP do folderu Aplikacje** (skrót jest w środku).
 3. Uruchom gmacFTP z **Aplikacji**. Przy pierwszym monicie Keychaina kliknij **Zawsze pozwalaj**.
+
+**Wolisz Homebrew?**
+
+```bash
+brew install --cask gmac-pl/gmacftp/gmacftp
+```
+
+Ta sama, podpisana i zanotaryzowana przez Apple apka co DMG. (Gołe `brew install --cask gmacftp` zadziała po [scaleniu oficjalnego PR-a caska](https://github.com/Homebrew/homebrew-cask/pull/272665).)
 
 Podpisana **Apple Developer ID** i **zanotaryzowana przez Apple** — uruchamia się czysto, bez ostrzeżeń.
 
