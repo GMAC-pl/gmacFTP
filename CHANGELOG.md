@@ -4,6 +4,17 @@
 
 _(Nothing yet.)_
 
+## 0.0.16 — 2026-07-05
+
+A code-quality cleanup pass after the v0.0.15 audit. **No user-facing behavior change; no new features.** Everything works exactly as before — this release removes duplication and tightens a few internals the v0.0.15 audit introduced.
+
+- **FTP connection internals simplified.** The plaintext-fallback flag is now a method on the connection type itself (`FtpConn::is_plaintext()`) instead of a positional `bool` threaded out of `connect()`. The same "Connected via plaintext FTP" warning surfaces in exactly the same situations.
+- **Disconnect is one atomic step.** Ending a session now drops it from the pool and evicts its cached password in a single critical section (was two separate locks). No observable difference — just removes a tiny window where the pool and the password cache could disagree if a panic hit between them.
+- **Updater download path: one source of truth.** The destination DMG filename is now computed once instead of three times, so the file Finder is told to open can never diverge from the one actually written.
+- **Docs clarified:** the SFTP host-key re-verification after the v0.0.15 `host:port` keying change is now documented as a silent re-TOFU (it never prompted the user), and the updater's URL allowlist scope (initial URL only, not the redirect target) is spelled out.
+
+Verified: release build + 20 unit tests + clippy + `cargo audit` all green; the signed app was built, notarized, and manually launched to check the GUI.
+
 ## 0.0.15 — 2026-07-05
 
 A second hardening pass from a line-by-line code audit. No customer/personal data was ever at risk; these close defense-in-depth and correctness gaps the audit surfaced.
