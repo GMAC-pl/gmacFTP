@@ -16,6 +16,13 @@ pub const CURRENT: &str = env!("CARGO_PKG_VERSION");
 /// The host a GitHub release asset URL must resolve to. The Releases API only ever returns
 /// `github.com` `browser_download_url` values (which 302 to `objects.githubusercontent.com`);
 /// anything else indicates a hijacked release / compromised account / MITM and is refused.
+///
+/// Scope note: [`validate_asset_url`] checks the URL the API hands us (the `github.com`
+/// `browser_download_url`). `ureq` then follows the 302 to `objects.githubusercontent.com` —
+/// the allowlist does NOT constrain the redirect target, only the initial URL. For a legitimate
+/// GitHub release that's exactly the expected chain; the check is defense-in-depth against a
+/// non-`github.com` URL a compromised release/account could inject, not a full redirect-pin
+/// defense (which Gatekeeper + the HTTPS transport already cover).
 const GH_ASSET_HOST: &str = "github.com";
 /// Cap a downloaded DMG at 300 MiB so a hostile or compromised endpoint can't OOM the app with
 /// an unbounded stream. A real gmacFTP DMG is ~10–50 MiB.
@@ -136,8 +143,11 @@ pub fn download(url: &str, version: &str) -> Result<PathBuf, String> {
     let dir = directories::UserDirs::new()
         .and_then(|d| d.download_dir()?.canonicalize().ok())
         .unwrap_or_else(|| PathBuf::from("."));
-    let path = dir.join(format!("gmacFTP-{safe_version}.dmg"));
-    let mut part = path.into_os_string();
+    // Single source of truth for the destination name: `part` is derived from it, the rename
+    // target is it, and it's what we return — so the three can never diverge (a release-tool
+    // bug where Finder is told to open a different name than the one written would be silent).
+    let final_path = dir.join(format!("gmacFTP-{safe_version}.dmg"));
+    let mut part = final_path.clone().into_os_string();
     part.push(".part");
     let part = PathBuf::from(part);
 
@@ -171,9 +181,7 @@ pub fn download(url: &str, version: &str) -> Result<PathBuf, String> {
             .map_err(|e| format!("write failed: {e}"))?;
     }
     file.sync_all().map_err(|e| format!("sync failed: {e}"))?;
-    std::fs::rename(&part, dir.join(format!("gmacFTP-{safe_version}.dmg")))
-        .map_err(|e| format!("rename failed: {e}"))?;
-    let final_path = dir.join(format!("gmacFTP-{safe_version}.dmg"));
+    std::fs::rename(&part, &final_path).map_err(|e| format!("rename failed: {e}"))?;
     tracing::info!(
         target: "gmacftp::updater",
         bytes = done,

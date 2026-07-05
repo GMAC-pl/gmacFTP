@@ -2665,13 +2665,19 @@ fn disconnect_session(
     // here bounds how long a cleartext password lives after the user ends the session — it does
     // not sit in heap until process exit. (disconnect_pane does NOT evict: the session may still
     // be alive in the background pool / another pane.)
-    let evicted: Vec<(String, String)> = sessions
-        .lock()
-        .expect("sessions")
-        .iter()
-        .filter(|s| s.conn.id.0 as i32 == conn_id)
-        .map(|s| (s.conn.host.clone(), s.conn.user.clone()))
-        .collect();
+    // Capture (host, user) of every ejected session AND drop them from the pool in ONE critical
+    // section, so the filter and its exact inverse `retain` stay in lockstep. (Two separate locks
+    // risked leaving the password cache out of sync with the pool if a panic hit between them.)
+    let evicted: Vec<(String, String)> = {
+        let mut g = sessions.lock().expect("sessions");
+        let evicted: Vec<_> = g
+            .iter()
+            .filter(|s| s.conn.id.0 as i32 == conn_id)
+            .map(|s| (s.conn.host.clone(), s.conn.user.clone()))
+            .collect();
+        g.retain(|s| s.conn.id.0 as i32 != conn_id);
+        evicted
+    };
     if !evicted.is_empty() {
         if let Ok(mut c) = PASSWORD_CACHE.lock() {
             for k in &evicted {
@@ -2679,12 +2685,6 @@ fn disconnect_session(
             }
         }
     }
-    // Note: per-pane delete-confirm re-arm happens via the set_pane_local() calls below for any
-    // pane that was showing the ejected session; untouched panes keep their own setting.
-    sessions
-        .lock()
-        .expect("sessions")
-        .retain(|s| s.conn.id.0 as i32 != conn_id);
     for pane in 0..2 {
         let shown = panes.lock().expect("panes")[pane]
             .conn

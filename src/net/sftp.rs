@@ -57,9 +57,12 @@ fn known_hosts_path() -> Option<PathBuf> {
 /// Returns Ok(true) to accept (new or matching key), Ok(false) to reject (mismatch).
 ///
 /// `host_key` is the composite `host:port` trust key (see [`Handler`]). Existing pre-0.0.15
-/// entries were written as bare `host` and will no longer match — the user re-confirms each
-/// host's key once on first connect after the upgrade (acceptable for a v0.0.x app, and the
-/// safer default than silently treating a bare-host entry as trusted for every port).
+/// entries were written as bare `host` and will no longer match, so the first connect to each
+/// host after the upgrade silently re-runs TOFU in brand-new-host mode: it does NOT prompt the
+/// user — the new `host:port` + key pair is persisted and accepted as-is. Caveat: an active MITM
+/// present on that exact first-connect-after-upgrade would be accepted with no indication, the
+/// same UX as connecting to a genuinely new host. Accepted for a v0.0.x app, and safer than
+/// silently treating a bare-host entry as trusted for every port.
 fn tofu_verify(
     path: &std::path::Path,
     host_key: &str,
