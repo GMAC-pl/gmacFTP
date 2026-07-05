@@ -18,11 +18,35 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
+          components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
+      # Formatting gate: the tree must stay rustfmt-clean (cargo fmt is part of the build contract).
+      - run: cargo fmt --all -- --check
       # Clippy runs WITHOUT -D warnings: a few known lints (large AppCtx argument lists, complex
       # types) are intentional and tracked separately. New lints still surface in the log.
       # No untrusted github.event.* input is used in any run: step (no injection surface).
       - run: cargo clippy --all-targets
+      # `cargo test --lib` runs the unit tests (vault crypto roundtrip, path sanitization, FileZilla
+      # import). Integration tests in tests/relay.rs need live FTP servers (tests/run-test-servers.sh)
+      # and are not wired into CI yet.
       - run: cargo test --lib
       - run: cargo build --release
+
+  # Dependency vulnerability gate. cargo-audit has no per-target filtering, so it flags
+  # advisories that don't actually affect the macOS-only shipped binary. We ignore three that are
+  # documented + accepted in SECURITY.md:
+  #   RUSTSEC-2023-0071 — rsa "Marvin Attack" (transitive via russh). No upstream fix; macOS-runtime
+  #                       but low exploitability for a GUI client. Prefer ed25519 host keys.
+  #   RUSTSEC-2026-0194 — quick-xml duplicated-attribute quadratic (HIGH). Linux-only: pulled by
+  #                       Slint's winit wayland-scanner, NOT compiled into the macOS binary
+  #                       (cargo tree -i quick-xml --target aarch64-apple-darwin => nothing).
+  #   RUSTSEC-2026-0195 — quick-xml memory-exhaustion DoS (HIGH). Same Linux-only path as above.
+  # Every other advisory fails the gate.
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          ignore: RUSTSEC-2023-0071, RUSTSEC-2026-0194, RUSTSEC-2026-0195

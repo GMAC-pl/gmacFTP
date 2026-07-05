@@ -6,13 +6,37 @@
 //! "update directly from the app" without embedding/signing a 3rd-party framework. Pure Rust
 //! (`ureq`) + the system `open` command to mount the DMG.
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 /// The GitHub repo that hosts releases (also where the app pulls its source + updates from).
 const REPO: &str = "GMAC-pl/gmacftp";
 /// The running build's version (e.g. "0.0.2"), baked in at compile time.
 pub const CURRENT: &str = env!("CARGO_PKG_VERSION");
+/// The host a GitHub release asset URL must resolve to. The Releases API only ever returns
+/// `github.com` `browser_download_url` values (which 302 to `objects.githubusercontent.com`);
+/// anything else indicates a hijacked release / compromised account / MITM and is refused.
+const GH_ASSET_HOST: &str = "github.com";
+/// Cap a downloaded DMG at 300 MiB so a hostile or compromised endpoint can't OOM the app with
+/// an unbounded stream. A real gmacFTP DMG is ~10–50 MiB.
+const MAX_DMG_BYTES: u64 = 300 * 1024 * 1024;
+
+/// Defense-in-depth on top of the (already HTTPS) API call and macOS Gatekeeper: refuse any
+/// release asset URL that isn't `https://` on the expected GitHub host. Catches `file://`,
+/// `http://`, and off-host URLs a compromised release/account could otherwise inject.
+fn validate_asset_url(url: &str) -> Result<(), String> {
+    let after = url
+        .strip_prefix("https://")
+        .ok_or_else(|| format!("refusing non-HTTPS asset URL: {url}"))?;
+    let host = after.split(['/', '?', '#']).next().unwrap_or("");
+    if host.eq_ignore_ascii_case(GH_ASSET_HOST) {
+        Ok(())
+    } else {
+        Err(format!(
+            "refusing off-host asset URL (expected {GH_ASSET_HOST}): {url}"
+        ))
+    }
+}
 
 /// A newer release found on GitHub (None if the running build is current or newer).
 #[derive(Debug, Clone)]
@@ -60,7 +84,11 @@ pub fn check() -> Result<Option<LatestUpdate>, String> {
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    Ok(Some(LatestUpdate { version, dmg_url, notes }))
+    Ok(Some(LatestUpdate {
+        version,
+        dmg_url,
+        notes,
+    }))
 }
 
 /// True iff `latest` (e.g. "0.0.3") is strictly newer than `current` (e.g. "0.0.2").
@@ -77,26 +105,82 @@ fn parse_semver(v: &str) -> (u32, u32, u32) {
             digits.parse::<u32>().unwrap_or(0)
         })
         .collect();
-    (*nums.first().unwrap_or(&0), *nums.get(1).unwrap_or(&0), *nums.get(2).unwrap_or(&0))
+    (
+        *nums.first().unwrap_or(&0),
+        *nums.get(1).unwrap_or(&0),
+        *nums.get(2).unwrap_or(&0),
+    )
 }
 
 /// Download `dmg_url` into ~/Downloads/gmacFTP-<version>.dmg. Returns the local path.
+///
+/// Hardened update path (the v0.0.14 audit found the prior version unbounded + non-atomic +
+/// unchecked): (1) refuse any URL that isn't HTTPS on `github.com`; (2) sanitize the version
+/// before it flows into the destination path (a git tag may contain `/`); (3) stream to a
+/// `.part` temp via an exclusive (O_EXCL + 0600) open — defeating a pre-planted symlink — with
+/// a 300 MiB cap against an unbounded/OOM stream; (4) fsync + atomic rename to the final `.dmg`
+/// so a crash never leaves a half-written DMG that Finder would try to mount.
 pub fn download(url: &str, version: &str) -> Result<PathBuf, String> {
+    validate_asset_url(url)?;
+    // Sanitize the version: a git tag is attacker-controllable and may contain '/', so an
+    // unfiltered `version` could traverse out of ~/Downloads (`0.0.99/../../../tmp/evil`).
+    // Keep only alphanumerics, '.', '-', '_'.
+    let safe_version: String = version
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+        .collect();
+    if safe_version.is_empty() {
+        return Err(format!("invalid release version: {version:?}"));
+    }
+
     let dir = directories::UserDirs::new()
         .and_then(|d| d.download_dir()?.canonicalize().ok())
         .unwrap_or_else(|| PathBuf::from("."));
-    let path = dir.join(format!("gmacFTP-{version}.dmg"));
+    let path = dir.join(format!("gmacFTP-{safe_version}.dmg"));
+    let mut part = path.into_os_string();
+    part.push(".part");
+    let part = PathBuf::from(part);
+
     let resp = ureq::get(url)
         .set("User-Agent", "gmacFTP-updater")
         .call()
         .map_err(|e| format!("download failed: {e}"))?;
     let mut reader = resp.into_reader();
-    let mut bytes = Vec::new();
-    reader
-        .read_to_end(&mut bytes)
-        .map_err(|e| format!("read failed: {e}"))?;
-    std::fs::write(&path, &bytes).map_err(|e| format!("write failed: {e}"))?;
-    Ok(path)
+
+    // Stream with a hard size cap (replaces the unbounded read_to_end into a Vec). The exclusive
+    // open reuses vault's CRYP-3 hardening (O_EXCL + 0600 + symlink-safe).
+    let mut file = crate::store::vault::create_exclusive(&part)
+        .map_err(|e| format!("could not create {}: {e}", part.display()))?;
+    let mut buf = [0u8; 64 * 1024];
+    let mut done: u64 = 0;
+    loop {
+        let n = reader
+            .read(&mut buf)
+            .map_err(|e| format!("read failed: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        done = done.saturating_add(n as u64);
+        if done > MAX_DMG_BYTES {
+            let _ = std::fs::remove_file(&part);
+            return Err(format!(
+                "release too large (>{MAX_DMG_BYTES} bytes) — refusing"
+            ));
+        }
+        file.write_all(&buf[..n])
+            .map_err(|e| format!("write failed: {e}"))?;
+    }
+    file.sync_all().map_err(|e| format!("sync failed: {e}"))?;
+    std::fs::rename(&part, dir.join(format!("gmacFTP-{safe_version}.dmg")))
+        .map_err(|e| format!("rename failed: {e}"))?;
+    let final_path = dir.join(format!("gmacFTP-{safe_version}.dmg"));
+    tracing::info!(
+        target: "gmacftp::updater",
+        bytes = done,
+        path = %final_path.display(),
+        "update DMG downloaded (transport-verified: HTTPS + github.com host + size cap + exclusive write). Content integrity + identity are confirmed by macOS Gatekeeper when the DMG is mounted."
+    );
+    Ok(final_path)
 }
 
 /// Open `path` with the default handler (Finder mounts a .dmg → shows the install window).
@@ -121,5 +205,22 @@ mod tests {
     fn non_numeric_segments_are_zero() {
         assert!(is_newer("0.0.3-beta", "0.0.2"));
         assert!(!is_newer("x.y.z", "0.0.0"));
+    }
+
+    #[test]
+    fn asset_url_accepts_github_https() {
+        assert!(validate_asset_url(
+            "https://github.com/GMAC-pl/gmacftp/releases/download/v0.0.15/gmacFTP-0.0.15.dmg"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn asset_url_rejects_non_https_and_off_host() {
+        assert!(validate_asset_url("http://github.com/x").is_err()); // not HTTPS
+        assert!(validate_asset_url("file:///etc/passwd").is_err()); // not HTTPS
+        assert!(validate_asset_url("https://evil.com/x").is_err()); // off-host
+        assert!(validate_asset_url("https://github.com.evil.com/x").is_err()); // host spoof
+        assert!(validate_asset_url("https://GITHUB.COM/x").is_ok()); // case-insensitive host
     }
 }

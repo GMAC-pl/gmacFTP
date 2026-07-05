@@ -29,10 +29,30 @@ mod tests {
     #[test]
     fn dirs_first_then_alpha() {
         let mut e = vec![
-            RemoteEntry { name: "zfile".into(), is_dir: false, size: 1, mtime: None },
-            RemoteEntry { name: "adir".into(), is_dir: true, size: 0, mtime: None },
-            RemoteEntry { name: "Bdir".into(), is_dir: true, size: 0, mtime: None },
-            RemoteEntry { name: "afile".into(), is_dir: false, size: 1, mtime: None },
+            RemoteEntry {
+                name: "zfile".into(),
+                is_dir: false,
+                size: 1,
+                mtime: None,
+            },
+            RemoteEntry {
+                name: "adir".into(),
+                is_dir: true,
+                size: 0,
+                mtime: None,
+            },
+            RemoteEntry {
+                name: "Bdir".into(),
+                is_dir: true,
+                size: 0,
+                mtime: None,
+            },
+            RemoteEntry {
+                name: "afile".into(),
+                is_dir: false,
+                size: 1,
+                mtime: None,
+            },
         ];
         sort_entries(&mut e);
         let names: Vec<_> = e.iter().map(|x| x.name.as_str()).collect();

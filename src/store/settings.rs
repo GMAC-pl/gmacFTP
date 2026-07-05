@@ -104,10 +104,10 @@ pub fn save(s: &Settings) {
     let Some(p) = path() else {
         return;
     };
-    if let Some(parent) = p.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
+    // Reuse the hardened atomic_write (O_EXCL + 0600 + fsync + rename) so a crash/power loss
+    // mid-save can't truncate settings.json — fulfills the v0.0.13 "atomic writes everywhere
+    // user data lives" contract (connections.json + vault already use this same helper).
     if let Ok(json) = serde_json::to_string_pretty(s) {
-        let _ = fs::write(&p, json);
+        let _ = crate::store::vault::atomic_write(&p, json.as_bytes());
     }
 }

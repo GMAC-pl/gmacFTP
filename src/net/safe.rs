@@ -121,6 +121,9 @@ mod tests {
         assert!(sanitize_local_rel("ok\revil").is_err());
         let long = "a".repeat(256);
         assert!(sanitize_local_rel(&long).is_err());
-        assert_eq!(sanitize_local_rel(&"a".repeat(255)).unwrap(), "a".repeat(255));
+        assert_eq!(
+            sanitize_local_rel(&"a".repeat(255)).unwrap(),
+            "a".repeat(255)
+        );
     }
 }

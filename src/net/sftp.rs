@@ -21,7 +21,10 @@ use crate::net::error::NetError;
 use crate::net::RemoteTreeStats;
 
 struct Handler {
-    host: String,
+    /// Composite `host:port` key used for known_hosts lookups, so two SFTP servers on different
+    /// ports of the same host get distinct trust entries (instead of colliding on the bare
+    /// hostname, which caused false MITM rejections or cross-port key pinning).
+    host_key: String,
     known_hosts: PathBuf,
 }
 
@@ -32,10 +35,10 @@ impl russh::client::Handler for Handler {
         &mut self,
         key: &russh::keys::ssh_key::PublicKey,
     ) -> Result<bool, Self::Error> {
-        match tofu_verify(&self.known_hosts, &self.host, key) {
+        match tofu_verify(&self.known_hosts, &self.host_key, key) {
             Ok(accept) => Ok(accept),
             Err(e) => {
-                tracing::warn!(host = %self.host, error = %e, "known_hosts check failed; rejecting");
+                tracing::warn!(host_key = %self.host_key, error = %e, "known_hosts check failed; rejecting");
                 Ok(false) // fail closed
             }
         }
@@ -52,12 +55,19 @@ fn known_hosts_path() -> Option<PathBuf> {
 }
 
 /// Returns Ok(true) to accept (new or matching key), Ok(false) to reject (mismatch).
+///
+/// `host_key` is the composite `host:port` trust key (see [`Handler`]). Existing pre-0.0.15
+/// entries were written as bare `host` and will no longer match — the user re-confirms each
+/// host's key once on first connect after the upgrade (acceptable for a v0.0.x app, and the
+/// safer default than silently treating a bare-host entry as trusted for every port).
 fn tofu_verify(
     path: &std::path::Path,
-    host: &str,
+    host_key: &str,
     key: &russh::keys::ssh_key::PublicKey,
 ) -> Result<bool, String> {
-    let fp = key.fingerprint(russh::keys::ssh_key::HashAlg::Sha256).to_string();
+    let fp = key
+        .fingerprint(russh::keys::ssh_key::HashAlg::Sha256)
+        .to_string();
     let existing = match std::fs::read_to_string(path) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -65,27 +75,21 @@ fn tofu_verify(
     };
     for line in existing.lines() {
         if let Some((h, f)) = line.split_once(char::is_whitespace) {
-            if h.trim() == host {
+            if h.trim() == host_key {
                 return Ok(f.trim() == fp.trim());
             }
         }
     }
-    // Unknown host — TOFU: persist and accept.
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
+    // Unknown host — TOFU: persist and accept. Atomic write (O_EXCL + 0600 + fsync + rename) so
+    // a crash mid-write can't truncate known_hosts — a truncated trust anchor would silently
+    // re-open every previously-verified host to MITM on the next connection. Mode 0600 is
+    // applied by atomic_write at creation (known_hosts reveals which hosts you connect to).
     let mut content = existing;
     if !content.is_empty() && !content.ends_with('\n') {
         content.push('\n');
     }
-    content.push_str(&format!("{host} {fp}\n"));
-    std::fs::write(path, content).map_err(|e| e.to_string())?;
-    // Restrictive mode: known_hosts reveals which hosts you connect to — owner-only.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-    }
+    content.push_str(&format!("{host_key} {fp}\n"));
+    crate::store::vault::atomic_write(path, content.as_bytes()).map_err(|e| e.to_string())?;
     Ok(true)
 }
 
@@ -103,17 +107,14 @@ async fn open_session(
         known_hosts_path().ok_or_else(|| NetError::Ssh("no config directory available".into()))?;
     let config = Arc::new(russh::client::Config::default());
     let handler = Handler {
-        host: spec.host.clone(),
+        host_key: format!("{}:{}", spec.host, spec.effective_port()),
         known_hosts,
     };
 
-    let mut handle = russh::client::connect(
-        config,
-        (spec.host.as_str(), spec.effective_port()),
-        handler,
-    )
-    .await
-    .map_err(map_ssh)?;
+    let mut handle =
+        russh::client::connect(config, (spec.host.as_str(), spec.effective_port()), handler)
+            .await
+            .map_err(map_ssh)?;
 
     let auth = handle
         .authenticate_password(spec.user.clone(), password.to_string())
@@ -121,7 +122,9 @@ async fn open_session(
         .map_err(map_ssh)?;
     if !auth.success() {
         // Best-effort disconnect before returning the auth error (don't leak the session).
-        let _ = handle.disconnect(russh::Disconnect::ByApplication, "auth-failed", "en").await;
+        let _ = handle
+            .disconnect(russh::Disconnect::ByApplication, "auth-failed", "en")
+            .await;
         return Err(NetError::AuthFailed(spec.user.clone()));
     }
 
@@ -129,18 +132,24 @@ async fn open_session(
     let channel = match handle.channel_open_session().await {
         Ok(c) => c,
         Err(e) => {
-            let _ = handle.disconnect(russh::Disconnect::ByApplication, "chan-open-failed", "en").await;
+            let _ = handle
+                .disconnect(russh::Disconnect::ByApplication, "chan-open-failed", "en")
+                .await;
             return Err(map_ssh(e));
         }
     };
     if let Err(e) = channel.request_subsystem(true, "sftp").await {
-        let _ = handle.disconnect(russh::Disconnect::ByApplication, "subsystem-failed", "en").await;
+        let _ = handle
+            .disconnect(russh::Disconnect::ByApplication, "subsystem-failed", "en")
+            .await;
         return Err(map_ssh(e));
     }
     let sftp = match SftpSession::new(channel.into_stream()).await {
         Ok(s) => s,
         Err(e) => {
-            let _ = handle.disconnect(russh::Disconnect::ByApplication, "sftp-init-failed", "en").await;
+            let _ = handle
+                .disconnect(russh::Disconnect::ByApplication, "sftp-init-failed", "en")
+                .await;
             return Err(map_ssh(e));
         }
     };
@@ -214,18 +223,30 @@ pub async fn connect_and_list(
         Ok(out)
     }
     .await;
-    let _ = handle.disconnect(russh::Disconnect::ByApplication, "bye", "en").await; // MEMO-2/CONC-4
+    let _ = handle
+        .disconnect(russh::Disconnect::ByApplication, "bye", "en")
+        .await; // MEMO-2/CONC-4
     result
 }
 
 /// Recursively collect every FILE under `root_dir` as `(absolute_remote_path, size)`.
 /// Used for folder downloads.
-pub async fn walk(spec: &ConnectionSpec, password: &str, root_dir: &str) -> Result<Vec<(String, u64)>, NetError> {
+pub async fn walk(
+    spec: &ConnectionSpec,
+    password: &str,
+    root_dir: &str,
+) -> Result<Vec<(String, u64)>, NetError> {
     let (handle, sftp) = open_session(spec, password).await?;
-    let root = if root_dir.trim().is_empty() { ".".to_string() } else { root_dir.to_string() };
+    let root = if root_dir.trim().is_empty() {
+        ".".to_string()
+    } else {
+        root_dir.to_string()
+    };
     let mut out = Vec::new();
     let result = walk_sftp(&sftp, &root, &mut out).await;
-    let _ = handle.disconnect(russh::Disconnect::ByApplication, "bye", "en").await; // MEMO-2/CONC-4
+    let _ = handle
+        .disconnect(russh::Disconnect::ByApplication, "bye", "en")
+        .await; // MEMO-2/CONC-4
     result?;
     Ok(out)
 }
@@ -237,10 +258,16 @@ pub async fn tree_stats(
     max_files: usize,
 ) -> Result<RemoteTreeStats, NetError> {
     let (handle, sftp) = open_session(spec, password).await?;
-    let root = if root_dir.trim().is_empty() { ".".to_string() } else { root_dir.to_string() };
+    let root = if root_dir.trim().is_empty() {
+        ".".to_string()
+    } else {
+        root_dir.to_string()
+    };
     let mut stats = RemoteTreeStats::default();
     let result = tree_stats_sftp(&sftp, &root, &mut stats, max_files).await;
-    let _ = handle.disconnect(russh::Disconnect::ByApplication, "bye", "en").await; // MEMO-2/CONC-4
+    let _ = handle
+        .disconnect(russh::Disconnect::ByApplication, "bye", "en")
+        .await; // MEMO-2/CONC-4
     result?;
     Ok(stats)
 }
@@ -328,7 +355,9 @@ pub async fn download(
 ) -> Result<u64, NetError> {
     let (handle, sftp) = open_session(spec, password).await?;
     let result = download_with_session(&sftp, remote_path, local_path, progress, cancel).await;
-    let _ = handle.disconnect(russh::Disconnect::ByApplication, "bye", "en").await; // MEMO-2/CONC-4
+    let _ = handle
+        .disconnect(russh::Disconnect::ByApplication, "bye", "en")
+        .await; // MEMO-2/CONC-4
     result
 }
 
@@ -344,7 +373,9 @@ async fn download_with_session(
     }
     let mut remote = sftp.open(remote_path).await.map_err(map_ssh)?;
     let part = part_path(local_path);
-    let mut file = tokio::fs::File::create(&part).await?;
+    // Exclusive (O_EXCL + 0600) open via the vault helper: defeats a pre-planted `<dest>.part`
+    // symlink that would otherwise redirect the downloaded bytes onto the symlink's target.
+    let mut file = tokio::fs::File::from_std(crate::store::vault::create_exclusive(&part)?);
     let result: Result<u64, NetError> = async {
         let mut buf = vec![0u8; 64 * 1024];
         let mut done: u64 = 0;
@@ -421,7 +452,9 @@ pub async fn upload(
         Ok(done)
     }
     .await;
-    let _ = handle.disconnect(russh::Disconnect::ByApplication, "bye", "en").await; // MEMO-2/CONC-4
+    let _ = handle
+        .disconnect(russh::Disconnect::ByApplication, "bye", "en")
+        .await; // MEMO-2/CONC-4
     result
 }
 
@@ -442,6 +475,8 @@ pub async fn delete(
         Ok(())
     }
     .await;
-    let _ = handle.disconnect(russh::Disconnect::ByApplication, "bye", "en").await; // MEMO-2/CONC-4
+    let _ = handle
+        .disconnect(russh::Disconnect::ByApplication, "bye", "en")
+        .await; // MEMO-2/CONC-4
     result
 }

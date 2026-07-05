@@ -21,10 +21,12 @@ pub struct RemoteTreeStats {
 }
 
 /// Connect + list the (initial) directory. Dispatches by protocol.
+/// Returns `(entries, plaintext_fallback)`: `true` when an FTP session fell back to plaintext
+/// (password sent unencrypted) so the UI can warn. SFTP is always encrypted → `false`.
 pub async fn connect_and_list(
     spec: &ConnectionSpec,
     password: &str,
-) -> Result<Vec<RemoteEntry>, NetError> {
+) -> Result<(Vec<RemoteEntry>, bool), NetError> {
     match spec.protocol {
         Protocol::Ftp => {
             let spec = spec.clone();
@@ -33,7 +35,9 @@ pub async fn connect_and_list(
                 .await
                 .map_err(|e| NetError::Join(e.to_string()))?
         }
-        Protocol::Sftp => sftp::connect_and_list(spec, password).await,
+        Protocol::Sftp => sftp::connect_and_list(spec, password)
+            .await
+            .map(|e| (e, false)),
     }
 }
 
@@ -88,11 +92,23 @@ pub async fn download_file(
     match spec.protocol {
         Protocol::Ftp => {
             let (s, p, r) = (spec.clone(), password.to_string(), remote_path.to_string());
-            tokio::task::spawn_blocking(move || ftp::download(&s, &p, &r, local_path.as_path(), |_| {}, None))
-                .await
-                .map_err(|e| NetError::Join(e.to_string()))?
+            tokio::task::spawn_blocking(move || {
+                ftp::download(&s, &p, &r, local_path.as_path(), |_| {}, None)
+            })
+            .await
+            .map_err(|e| NetError::Join(e.to_string()))?
         }
-        Protocol::Sftp => sftp::download(spec, password, remote_path, local_path.as_path(), |_| {}, None).await,
+        Protocol::Sftp => {
+            sftp::download(
+                spec,
+                password,
+                remote_path,
+                local_path.as_path(),
+                |_| {},
+                None,
+            )
+            .await
+        }
     }
 }
 
@@ -108,7 +124,7 @@ pub async fn remote_exists(
 ) -> Result<bool, NetError> {
     let mut s = spec.clone();
     s.initial_path = dir.to_string();
-    let entries = connect_and_list(&s, password).await?;
+    let (entries, _plaintext) = connect_and_list(&s, password).await?;
     Ok(entries.iter().any(|e| e.name == name))
 }
 

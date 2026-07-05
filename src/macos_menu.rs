@@ -23,13 +23,15 @@ mod imp {
     use objc2::rc::Retained;
     use objc2::runtime::{AnyObject, NSObject, Sel};
     use objc2::{define_class, msg_send, sel, ClassType, MainThreadMarker};
-    use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy, NSEventModifierFlags, NSMenu, NSMenuItem};
+    use objc2_app_kit::{
+        NSApplication, NSApplicationActivationPolicy, NSEventModifierFlags, NSMenu, NSMenuItem,
+    };
     use objc2_foundation::NSString;
 
     use slint::Weak;
 
-    use gmacftp::store::cloud;
     use crate::App;
+    use gmacftp::store::cloud;
 
     // The Slint UI handle. The sync menu item + the target object are held by raw pointers
     // (NSMenuItem / NSObject aren't `Send`, so they can't live behind a `static` `Mutex`); they
@@ -191,10 +193,12 @@ mod imp {
         }
         let cls = GmacMenuTarget::class();
         let target_typed: Retained<GmacMenuTarget> = unsafe { msg_send![cls, new] };
-        let target: Retained<AnyObject> = unsafe { Retained::cast_unchecked::<AnyObject>(target_typed) };
+        let target: Retained<AnyObject> =
+            unsafe { Retained::cast_unchecked::<AnyObject>(target_typed) };
         let raw = Retained::into_raw(target); // leak
-        // First writer wins; a late loser leaks a second tiny object (harmless, once).
-        let _ = TARGET_PTR.compare_exchange(ptr::null_mut(), raw, Ordering::SeqCst, Ordering::SeqCst);
+                                              // First writer wins; a late loser leaks a second tiny object (harmless, once).
+        let _ =
+            TARGET_PTR.compare_exchange(ptr::null_mut(), raw, Ordering::SeqCst, Ordering::SeqCst);
         // SAFETY: non-null after the exchange above.
         unsafe { &*TARGET_PTR.load(Ordering::SeqCst) }
     }
@@ -206,7 +210,12 @@ mod imp {
     }
 
     /// Standard menu item: nil target + system selector (responder chain handles it).
-    fn sys_item(mtm: MainThreadMarker, title: &str, action: Option<Sel>, key: &str) -> Retained<NSMenuItem> {
+    fn sys_item(
+        mtm: MainThreadMarker,
+        title: &str,
+        action: Option<Sel>,
+        key: &str,
+    ) -> Retained<NSMenuItem> {
         let item = NSMenuItem::new(mtm);
         item.setTitle(&s(title));
         if let Some(sel) = action {
@@ -224,7 +233,9 @@ mod imp {
     }
     impl WithMask for Retained<NSMenuItem> {
         fn shift_cmd(self) -> Self {
-            self.setKeyEquivalentModifierMask(NSEventModifierFlags::Shift | NSEventModifierFlags::Command);
+            self.setKeyEquivalentModifierMask(
+                NSEventModifierFlags::Shift | NSEventModifierFlags::Command,
+            );
             self
         }
     }
@@ -250,7 +261,11 @@ mod imp {
         item
     }
 
-    fn submenu(mtm: MainThreadMarker, title: &str, items: Vec<Retained<NSMenuItem>>) -> Retained<NSMenuItem> {
+    fn submenu(
+        mtm: MainThreadMarker,
+        title: &str,
+        items: Vec<Retained<NSMenuItem>>,
+    ) -> Retained<NSMenuItem> {
         let menu = NSMenu::new(mtm);
         menu.setTitle(&s(title));
         for it in items {
@@ -292,12 +307,35 @@ mod imp {
         SYNC_ITEM_PTR.store(Retained::into_raw(sync_item.clone()), Ordering::SeqCst);
 
         let app_items = vec![
-            sys_item(mtm, "About gmacFTP", Some(sel!(orderFrontStandardAboutPanel:)), ""),
-            custom_item(mtm, "Check for Updates…", target_ref, sel!(checkUpdates:), ""),
+            sys_item(
+                mtm,
+                "About gmacFTP",
+                Some(sel!(orderFrontStandardAboutPanel:)),
+                "",
+            ),
+            custom_item(
+                mtm,
+                "Check for Updates…",
+                target_ref,
+                sel!(checkUpdates:),
+                "",
+            ),
             sep(),
             sync_item,
-            custom_item(mtm, "Send Servers to iCloud", target_ref, sel!(sendToICloud:), ""),
-            custom_item(mtm, "Pull Servers from iCloud", target_ref, sel!(pullFromICloud:), ""),
+            custom_item(
+                mtm,
+                "Send Servers to iCloud",
+                target_ref,
+                sel!(sendToICloud:),
+                "",
+            ),
+            custom_item(
+                mtm,
+                "Pull Servers from iCloud",
+                target_ref,
+                sel!(pullFromICloud:),
+                "",
+            ),
             sep(),
             sys_item(mtm, "Hide gmacFTP", Some(sel!(hide:)), "h"),
             sys_item(mtm, "Hide Others", Some(sel!(hideOtherApplications:)), "h").shift_cmd(),
@@ -310,7 +348,13 @@ mod imp {
         // ── File menu ──
         let file_items = vec![
             custom_item(mtm, "New Connection", target_ref, sel!(newConnection:), "n"),
-            custom_item(mtm, "Open Connection Manager…", target_ref, sel!(openManager:), "l"),
+            custom_item(
+                mtm,
+                "Open Connection Manager…",
+                target_ref,
+                sel!(openManager:),
+                "l",
+            ),
             sep(),
             sys_item(mtm, "Close Window", Some(sel!(performClose:)), "w"),
         ];
@@ -330,7 +374,10 @@ mod imp {
 
         // ── View menu ──
         let view_items =
-            vec![custom_item(mtm, "Command Palette…", target_ref, sel!(openPalette:), "p").shift_cmd()];
+            vec![
+                custom_item(mtm, "Command Palette…", target_ref, sel!(openPalette:), "p")
+                    .shift_cmd(),
+            ];
         let view_header = submenu(mtm, "View", view_items);
 
         // ── Window menu ──
@@ -343,11 +390,24 @@ mod imp {
         let window_header = submenu(mtm, "Window", window_items);
 
         // ── Help menu ──
-        let help_items = vec![custom_item(mtm, "gmacFTP on GitHub", target_ref, sel!(openHelp:), "")];
+        let help_items = vec![custom_item(
+            mtm,
+            "gmacFTP on GitHub",
+            target_ref,
+            sel!(openHelp:),
+            "",
+        )];
         let help_header = submenu(mtm, "Help", help_items);
 
         let main_menu = NSMenu::new(mtm);
-        for header in [app_header, file_header, edit_header, view_header, window_header, help_header] {
+        for header in [
+            app_header,
+            file_header,
+            edit_header,
+            view_header,
+            window_header,
+            help_header,
+        ] {
             main_menu.addItem(&header);
         }
         let shared = NSApplication::sharedApplication(mtm);
