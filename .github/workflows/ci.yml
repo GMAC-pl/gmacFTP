@@ -32,9 +32,13 @@ jobs:
       - run: cargo test --lib
       - run: cargo build --release
 
-  # Dependency vulnerability gate. cargo-audit has no per-target filtering, so it flags
-  # advisories that don't actually affect the macOS-only shipped binary. We ignore three that are
-  # documented + accepted in SECURITY.md:
+  # Dependency vulnerability gate. We run `cargo audit` directly (NOT the rustsec/audit-check
+  # action — it has no way to disable failing on unmaintained/unsound *warnings*, of which there
+  # are ~16 mostly-Linux-only transitive deps via Slint's winit backends). cargo-audit's own
+  # exit code drives pass/fail: non-zero ONLY on real vulnerabilities (after the ignores), zero
+  # on informational warnings. See SECURITY.md for the full classification.
+  #
+  # Three advisories are ignored (documented + accepted):
   #   RUSTSEC-2023-0071 — rsa "Marvin Attack" (transitive via russh). No upstream fix; macOS-runtime
   #                       but low exploitability for a GUI client. Prefer ed25519 host keys.
   #   RUSTSEC-2026-0194 — quick-xml duplicated-attribute quadratic (HIGH). Linux-only: pulled by
@@ -46,7 +50,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: rustsec/audit-check@v2.0.0
+      - uses: taiki-e/install-action@v2
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          ignore: RUSTSEC-2023-0071, RUSTSEC-2026-0194, RUSTSEC-2026-0195
+          tool: cargo-audit
+      - run: cargo audit --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195
+
