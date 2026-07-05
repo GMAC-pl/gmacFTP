@@ -25,7 +25,10 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use aes_gcm::{aead::{Aead, KeyInit}, Aes256Gcm, Nonce};
+use aes_gcm::{
+    aead::{Aead, KeyInit},
+    Aes256Gcm, Nonce,
+};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use rand::RngCore;
 use zeroize::Zeroizing;
@@ -51,7 +54,7 @@ fn pack_key(host: &str, user: &str) -> String {
 /// Encrypted at-rest credential store (in-memory decrypted map mirrored to vault.bin).
 pub struct FileVault {
     map: Mutex<HashMap<String, String>>, // "host\x00user" -> base64(secret)
-    key: Mutex<[u8; 32]>, // resolved at open; replaced in place on passphrase unlock
+    key: Mutex<[u8; 32]>,                // resolved at open; replaced in place on passphrase unlock
     vault_path: PathBuf,
 }
 
@@ -67,14 +70,16 @@ impl FileVault {
         let key = resolve_master_key(&key_path);
         let map = match std::fs::read(&vault_path) {
             Ok(blob) if blob.len() > 12 => match decrypt(&key, &blob) {
-                Ok(plaintext) => match serde_json::from_slice::<HashMap<String, String>>(&plaintext) {
-                    Ok(m) => m,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "vault parse failed; starting empty");
-                        preserve_unreadable(&vault_path);
-                        HashMap::new()
+                Ok(plaintext) => {
+                    match serde_json::from_slice::<HashMap<String, String>>(&plaintext) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "vault parse failed; starting empty");
+                            preserve_unreadable(&vault_path);
+                            HashMap::new()
+                        }
                     }
-                },
+                }
                 Err(e) => {
                     tracing::warn!(error = %e, "vault decrypt failed; starting empty");
                     preserve_unreadable(&vault_path);
@@ -83,7 +88,11 @@ impl FileVault {
             },
             _ => HashMap::new(),
         };
-        Self { map: Mutex::new(map), key: Mutex::new(key), vault_path }
+        Self {
+            map: Mutex::new(map),
+            key: Mutex::new(key),
+            vault_path,
+        }
     }
 
     fn persist(&self) -> Result<(), CredentialError> {
@@ -120,12 +129,20 @@ impl FileVault {
     /// decrypt vault.bin with it, swap the key + map in place. Returns true on success. Caches
     /// the master key + passphrase in the Keychain so the next launch auto-unlocks.
     pub fn unlock(&self, passphrase: &str) -> bool {
-        let Some((_, wrapped)) = crate::store::cloud::read_key() else { return false };
-        let Some(key) = unwrap_master_key(&wrapped, passphrase) else { return false };
+        let Some((_, wrapped)) = crate::store::cloud::read_key() else {
+            return false;
+        };
+        let Some(key) = unwrap_master_key(&wrapped, passphrase) else {
+            return false;
+        };
         // Read the SYNCED vault (the local vault.bin may be this Mac's own, undecryptable with
         // the synced key). Adopt it: decrypt + load, then write it locally so future opens match.
-        let Some((_, blob)) = crate::store::cloud::read_vault() else { return false };
-        let Ok(plaintext) = decrypt(&key, &blob) else { return false };
+        let Some((_, blob)) = crate::store::cloud::read_vault() else {
+            return false;
+        };
+        let Ok(plaintext) = decrypt(&key, &blob) else {
+            return false;
+        };
         let Ok(loaded) = serde_json::from_slice::<HashMap<String, String>>(&plaintext) else {
             return false;
         };
@@ -174,9 +191,15 @@ impl FileVault {
             let mut n = 0;
             if let Ok(mut map) = self.map.lock() {
                 for r in results {
-                    let Some(dict) = r.simplify_dict() else { continue };
-                    let Some(svc) = dict.get("svce") else { continue };
-                    let Some((_prefix, host)) = svc.rsplit_once('/') else { continue };
+                    let Some(dict) = r.simplify_dict() else {
+                        continue;
+                    };
+                    let Some(svc) = dict.get("svce") else {
+                        continue;
+                    };
+                    let Some((_prefix, host)) = svc.rsplit_once('/') else {
+                        continue;
+                    };
                     let user = dict.get("acct").cloned().unwrap_or_default();
                     let secret = dict
                         .get("v_Data")
@@ -204,7 +227,9 @@ impl CredentialStore for FileVault {
     fn get(&self, host: &str, user: &str) -> Result<Vec<u8>, CredentialError> {
         let key = pack_key(host, user);
         match self.map.lock().expect("vault").get(&key) {
-            Some(b64) => B64.decode(b64).map_err(|e| CredentialError::Other(e.to_string())),
+            Some(b64) => B64
+                .decode(b64)
+                .map_err(|e| CredentialError::Other(e.to_string())),
             None => Err(CredentialError::NotFound),
         }
     }
@@ -219,7 +244,10 @@ impl CredentialStore for FileVault {
     }
 
     fn delete(&self, host: &str, user: &str) -> Result<(), CredentialError> {
-        self.map.lock().expect("vault").remove(&pack_key(host, user));
+        self.map
+            .lock()
+            .expect("vault")
+            .remove(&pack_key(host, user));
         self.persist()
     }
 }
@@ -235,11 +263,16 @@ pub struct MigratingStore {
 impl MigratingStore {
     #[cfg(target_os = "macos")]
     pub fn new() -> Self {
-        Self { vault: FileVault::open(), keychain: MacCredentialStore::new() }
+        Self {
+            vault: FileVault::open(),
+            keychain: MacCredentialStore::new(),
+        }
     }
     #[cfg(not(target_os = "macos"))]
     pub fn new() -> Self {
-        Self { vault: FileVault::open() }
+        Self {
+            vault: FileVault::open(),
+        }
     }
 }
 
@@ -525,7 +558,9 @@ pub fn repush_sync_key() -> Result<(), String> {
 /// overwrites it. Without this, a corrupt/undecryptable vault silently becomes empty and the
 /// next persist destroys the original. Best-effort (read-only fs just loses the convenience).
 fn preserve_unreadable(vault_path: &Path) {
-    let Some(stem) = vault_path.file_name().and_then(|s| s.to_str()) else { return };
+    let Some(stem) = vault_path.file_name().and_then(|s| s.to_str()) else {
+        return;
+    };
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -541,7 +576,9 @@ fn encrypt(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, String> {
     let mut nonce_bytes = [0u8; 12];
     rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
     let nonce = Nonce::from_slice(&nonce_bytes);
-    let ct = cipher.encrypt(nonce, plaintext).map_err(|e| e.to_string())?;
+    let ct = cipher
+        .encrypt(nonce, plaintext)
+        .map_err(|e| e.to_string())?;
     let mut out = Vec::with_capacity(12 + ct.len());
     out.extend_from_slice(&nonce_bytes);
     out.extend_from_slice(&ct);
@@ -551,7 +588,9 @@ fn encrypt(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, String> {
 fn decrypt(key: &[u8; 32], blob: &[u8]) -> Result<Vec<u8>, String> {
     let cipher = Aes256Gcm::new_from_slice(&key[..]).map_err(|e| e.to_string())?;
     let nonce = Nonce::from_slice(&blob[..12]);
-    cipher.decrypt(nonce, &blob[12..]).map_err(|e| e.to_string())
+    cipher
+        .decrypt(nonce, &blob[12..])
+        .map_err(|e| e.to_string())
 }
 
 /// Derive a 32-byte key-encryption-key from the passphrase + salt via Argon2id (library
@@ -640,6 +679,38 @@ pub(crate) fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Open `path` for writing exclusively (O_EXCL `create_new`) with mode 0600 on Unix, defeating a
+/// pre-planted same-name symlink: if the path already exists (a stale `.part` from a crashed
+/// prior run, or a maliciously planted symlink), `remove_file` it first — unlinking a symlink
+/// removes the link itself, never its target — then retry the exclusive create.
+///
+/// Use this for streaming-download temp files (FTP/SFTP `.part`, updater `.dmg`) that are too
+/// large to buffer in memory for [`atomic_write`]. After streaming bytes in, the caller does
+/// `sync_all` + `rename` to the final path (rename overwrites the destination atomically and
+/// replaces any symlink there with the regular file — also safe).
+pub(crate) fn create_exclusive(path: &Path) -> std::io::Result<std::fs::File> {
+    fn open_new(path: &Path) -> std::io::Result<std::fs::File> {
+        let mut o = std::fs::OpenOptions::new();
+        o.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            o.mode(0o600);
+        }
+        o.open(path)
+    }
+    match open_new(path) {
+        Ok(f) => Ok(f),
+        // A stale temp (or a pre-planted symlink). remove_file on a symlink unlinks the link,
+        // NOT its target — same symlink-safety contract as atomic_write (CRYP-3).
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let _ = std::fs::remove_file(path);
+            open_new(path)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 #[cfg(unix)]
 fn set_mode_0600(path: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
@@ -681,7 +752,10 @@ mod tests {
         };
         let wrapped = wrap_master_key(&mk, "correct horse battery").unwrap();
         // correct passphrase → unwraps to the same key
-        assert_eq!(unwrap_master_key(&wrapped, "correct horse battery"), Some(mk));
+        assert_eq!(
+            unwrap_master_key(&wrapped, "correct horse battery"),
+            Some(mk)
+        );
         // wrong passphrase → None (AES-GCM tag fails)
         assert_eq!(unwrap_master_key(&wrapped, "wrong"), None);
         // tamper with the ciphertext → None
@@ -691,5 +765,46 @@ mod tests {
         assert_eq!(unwrap_master_key(&tampered, "correct horse battery"), None);
         // too-short blob → None
         assert_eq!(unwrap_master_key(&[0u8; 10], "x"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_exclusive_defeats_planted_symlink() {
+        // NEW-1 regression guard: a pre-planted `<dest>.part` symlink must NOT be followed —
+        // create_exclusive unlinks the symlink and creates a regular file, leaving the
+        // symlink's target untouched.
+        use rand::RngCore;
+        use std::os::unix::fs::symlink;
+        let nonce = {
+            let mut b = [0u8; 8];
+            rand::rngs::OsRng.fill_bytes(&mut b);
+            u64::from_le_bytes(b)
+        };
+        let dir = std::env::temp_dir();
+        let target = dir.join(format!("gmacftp_test_target_{nonce}"));
+        let link = dir.join(format!("gmacftp_test_link_{nonce}.part"));
+        std::fs::write(&target, b"precious").unwrap();
+        symlink(&target, &link).unwrap();
+
+        let f = create_exclusive(&link).expect("exclusive open must succeed despite the symlink");
+        drop(f);
+
+        // The path is now a regular file, not a symlink.
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_file(),
+            "create_exclusive must replace the symlink with a regular file"
+        );
+        // The symlink's target was NOT touched.
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "precious",
+            "create_exclusive must never write through the planted symlink"
+        );
+
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_file(&target);
     }
 }

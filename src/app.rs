@@ -3,24 +3,23 @@
 //! `slint::invoke_from_event_loop`. All Slint callbacks are wired here, including the
 //! connection manager (add / edit / delete / import from a third-party file manager).
 
-use std::path::{Path, PathBuf};
-use std::rc::Rc;
 #[cfg(target_os = "macos")]
 use std::cell::Cell;
-use std::time::Instant;
-use std::sync::{Arc, LazyLock, Mutex};
-use std::collections::{HashMap, HashSet, VecDeque};
 use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::Instant;
 
 use futures::{stream, StreamExt};
-use slint::{ComponentHandle, Global, Model, ModelRc, VecModel, Weak};
 use slint::winit_030::WinitWindowAccessor;
-use tokio::sync::mpsc;
+use slint::{ComponentHandle, Global, Model, ModelRc, VecModel, Weak};
 use tokio::runtime::Handle;
+use tokio::sync::mpsc;
 
 use gmacftp::model::{
-    ConnectionId, ConnectionSpec, Protocol, RemoteEntry, TransferDirection, TransferId,
-    TransferJob,
+    ConnectionId, ConnectionSpec, Protocol, RemoteEntry, TransferDirection, TransferId, TransferJob,
 };
 use gmacftp::net;
 use gmacftp::store::{self, CredentialStore};
@@ -36,7 +35,8 @@ type ConnList = Arc<Mutex<Vec<ConnectionSpec>>>;
 /// not on every folder-enter. (Without a paid Developer-ID signature, macOS can't bind
 /// "Always Allow" to an ad-hoc-signed app across launches, so this in-memory cache is
 /// the fix within a session.)
-static PASSWORD_CACHE: LazyLock<Mutex<HashMap<(String, String), String>>> =
+use zeroize::Zeroizing;
+static PASSWORD_CACHE: LazyLock<Mutex<HashMap<(String, String), Zeroizing<String>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 const MAX_LOCAL_FOLDER_STAT_FILES: usize = 3_000;
@@ -50,9 +50,9 @@ static PENDING_COPY: LazyLock<Mutex<Option<(usize, usize, String, bool, Option<u
 /// Finder→server uploads blocked on the overwrite-conflict dialog (the external-drag twin of
 /// PENDING_COPY). A FIFO queue: a multi-file drop may contain several conflicting names, confirmed
 /// one at a time. (spec, local source path, remote directory, name, byte size, is_dir).
-static PENDING_EXTERNAL_UPLOAD:
-    LazyLock<Mutex<VecDeque<(ConnectionSpec, PathBuf, String, String, Option<u64>, bool)>>> =
-    LazyLock::new(|| Mutex::new(VecDeque::new()));
+static PENDING_EXTERNAL_UPLOAD: LazyLock<
+    Mutex<VecDeque<(ConnectionSpec, PathBuf, String, String, Option<u64>, bool)>>,
+> = LazyLock::new(|| Mutex::new(VecDeque::new()));
 
 /// Per-pane "Don't ask again this session" for the delete-confirmation dialog, indexed by pane
 /// (0 = left, 1 = right). Keying per-pane (not one global flag) means ticking it while deleting on
@@ -61,10 +61,14 @@ static PENDING_EXTERNAL_UPLOAD:
 /// THAT pane's connection ends (connect / switch / Home / eject / disconnect on that pane), so the
 /// suppression is scoped to a single steady connection — closer to how a third-party file manager / Transmit gate
 /// "don't ask again", but session-local rather than app-persistent.
-static SKIP_DELETE_CONFIRM: LazyLock<Mutex<[bool; 2]>> = LazyLock::new(|| Mutex::new([false, false]));
+static SKIP_DELETE_CONFIRM: LazyLock<Mutex<[bool; 2]>> =
+    LazyLock::new(|| Mutex::new([false, false]));
 
 fn delete_confirm_skipped(pane: usize) -> bool {
-    SKIP_DELETE_CONFIRM.lock().map(|g| g.get(pane).copied().unwrap_or(false)).unwrap_or(false)
+    SKIP_DELETE_CONFIRM
+        .lock()
+        .map(|g| g.get(pane).copied().unwrap_or(false))
+        .unwrap_or(false)
 }
 
 fn set_skip_delete_confirm(pane: usize, v: bool) {
@@ -164,17 +168,33 @@ fn next_xfer_id() -> i32 {
 }
 
 /// Update an existing transfer row by id (UI thread).
-fn jobs_set(id: i32, idx: &Arc<Mutex<HashMap<i32, usize>>>, state: &str, done: i32, total: i32, msg: &str) {
+fn jobs_set(
+    id: i32,
+    idx: &Arc<Mutex<HashMap<i32, usize>>>,
+    state: &str,
+    done: i32,
+    total: i32,
+    msg: &str,
+) {
     TRANSFER_JOBS.with(|jm| {
         let b = jm.borrow();
         let Some(jobs) = b.as_ref() else { return };
-        let Some(i) = idx.lock().ok().and_then(|g| g.get(&id).copied()) else { return };
+        let Some(i) = idx.lock().ok().and_then(|g| g.get(&id).copied()) else {
+            return;
+        };
         if let Some(mut row) = jobs.row_data(i) {
             row.state = state.into();
             row.done = done;
             row.total = total;
-            row.fraction = if total > 0 { done as f32 / total as f32 } else if state == "done" { 1.0 } else { 0.0 };
-            row.progress_text = fmt_transfer_progress(done.max(0) as u64, total.max(0) as u64).into();
+            row.fraction = if total > 0 {
+                done as f32 / total as f32
+            } else if state == "done" {
+                1.0
+            } else {
+                0.0
+            };
+            row.progress_text =
+                fmt_transfer_progress(done.max(0) as u64, total.max(0) as u64).into();
             row.message = msg.into();
             jobs.set_row_data(i, row);
         }
@@ -326,7 +346,10 @@ fn fmt_transfer_progress(done: u64, total: u64) -> String {
 
 // ── pane model (Tier 2: each of the two panes is independently Local or Remote) ──
 #[derive(Clone)]
-enum PaneKind { Local, Remote }
+enum PaneKind {
+    Local,
+    Remote,
+}
 
 #[derive(Clone)]
 struct PaneState {
@@ -342,11 +365,19 @@ type Panes = Arc<Mutex<[PaneState; 2]>>; // pane 0 = left (local-* props), pane 
 /// the background) instead of replacing it; clicking a session swaps it into a pane; eject removes
 /// it. Each pane shows one session at a time, but many can be open concurrently.
 #[derive(Clone)]
-struct ActiveSession { conn: ConnectionSpec, cwd: String, nav: Nav }
+struct ActiveSession {
+    conn: ConnectionSpec,
+    cwd: String,
+    nav: Nav,
+}
 type Sessions = Arc<Mutex<Vec<ActiveSession>>>;
 
 fn active_pane_idx(ui: &App) -> usize {
-    if ui.get_active_pane().as_str() == "remote" { 1 } else { 0 }
+    if ui.get_active_pane().as_str() == "remote" {
+        1
+    } else {
+        0
+    }
 }
 
 /// Give the window keyboard focus to the root FocusScope. Slint delivers `key-pressed` ONLY to the
@@ -370,22 +401,40 @@ fn focus_root(ui: &App) {
 }
 
 fn pane_selected(ui: &App, pane: usize) -> i32 {
-    if pane == 0 { ui.get_local_selected() } else { ui.get_remote_selected() }
+    if pane == 0 {
+        ui.get_local_selected()
+    } else {
+        ui.get_remote_selected()
+    }
 }
 fn pane_entries(ui: &App, pane: usize) -> ModelRc<EntryRow> {
-    if pane == 0 { ui.get_local_entries() } else { ui.get_remote_entries() }
+    if pane == 0 {
+        ui.get_local_entries()
+    } else {
+        ui.get_remote_entries()
+    }
 }
 
 /// Apply the current view (hidden-files filter + sort) of a pane's FULL list to its UI model.
 fn apply_view_pane(ui: &App, pane: usize) {
     let show_hidden = ui.get_show_hidden();
     let (key, dir) = if pane == 0 {
-        (ui.get_local_sort_key().to_string(), ui.get_local_sort_dir().to_string())
+        (
+            ui.get_local_sort_key().to_string(),
+            ui.get_local_sort_dir().to_string(),
+        )
     } else {
-        (ui.get_remote_sort_key().to_string(), ui.get_remote_sort_dir().to_string())
+        (
+            ui.get_remote_sort_key().to_string(),
+            ui.get_remote_sort_dir().to_string(),
+        )
     };
     let desc = dir == "desc";
-    let full_model = if pane == 0 { ui.get_local_full() } else { ui.get_remote_full() };
+    let full_model = if pane == 0 {
+        ui.get_local_full()
+    } else {
+        ui.get_remote_full()
+    };
     let mut rows: Vec<EntryRow> = (0..full_model.row_count())
         .filter_map(|i| full_model.row_data(i))
         .filter(|e| show_hidden || !e.name.starts_with('.'))
@@ -396,14 +445,24 @@ fn apply_view_pane(ui: &App, pane: usize) {
     let true_sizes: HashMap<String, u64> = TRUE_SIZE
         .lock()
         .ok()
-        .map(|g| g.iter().filter(|((p, _), _)| *p == pane).map(|((_, n), s)| (n.clone(), *s)).collect())
+        .map(|g| {
+            g.iter()
+                .filter(|((p, _), _)| *p == pane)
+                .map(|((_, n), s)| (n.clone(), *s))
+                .collect()
+        })
         .unwrap_or_default();
     // Same trick for mtimes: EntryRow.mtime is i32 and wraps after 2038-01-19, so the date sort
     // would order future-dated files as pre-1970. Use the true i64 mtime when we have it.
     let true_mtimes: HashMap<String, i64> = TRUE_MTIME
         .lock()
         .ok()
-        .map(|g| g.iter().filter(|((p, _), _)| *p == pane).map(|((_, n), m)| (n.clone(), *m)).collect())
+        .map(|g| {
+            g.iter()
+                .filter(|((p, _), _)| *p == pane)
+                .map(|((_, n), m)| (n.clone(), *m))
+                .collect()
+        })
         .unwrap_or_default();
     rows.sort_by(|a, b| {
         let dirs = match (a.is_dir, b.is_dir) {
@@ -416,13 +475,25 @@ fn apply_view_pane(ui: &App, pane: usize) {
         }
         let mut ord = match key.as_str() {
             "size" => {
-                let sa = true_sizes.get(a.name.as_str()).map(|s| *s as i128).unwrap_or(a.size as i128);
-                let sb = true_sizes.get(b.name.as_str()).map(|s| *s as i128).unwrap_or(b.size as i128);
+                let sa = true_sizes
+                    .get(a.name.as_str())
+                    .map(|s| *s as i128)
+                    .unwrap_or(a.size as i128);
+                let sb = true_sizes
+                    .get(b.name.as_str())
+                    .map(|s| *s as i128)
+                    .unwrap_or(b.size as i128);
                 sa.cmp(&sb)
             }
             "date" => {
-                let ma = true_mtimes.get(a.name.as_str()).copied().unwrap_or(a.mtime as i64);
-                let mb = true_mtimes.get(b.name.as_str()).copied().unwrap_or(b.mtime as i64);
+                let ma = true_mtimes
+                    .get(a.name.as_str())
+                    .copied()
+                    .unwrap_or(a.mtime as i64);
+                let mb = true_mtimes
+                    .get(b.name.as_str())
+                    .copied()
+                    .unwrap_or(b.mtime as i64);
                 ma.cmp(&mb)
             }
             _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
@@ -482,7 +553,10 @@ fn set_pane_kind_label(ui: &App, pane: usize, p: &PaneState) {
         PaneKind::Remote => (
             "remote".to_string(),
             p.conn.as_ref().map(|c| c.host.clone()).unwrap_or_default(),
-            p.conn.as_ref().map(|c| c.protocol.to_string().to_uppercase()).unwrap_or_default(),
+            p.conn
+                .as_ref()
+                .map(|c| c.protocol.to_string().to_uppercase())
+                .unwrap_or_default(),
             p.conn.as_ref().map(|c| c.id.0 as i32).unwrap_or(-1),
         ),
     };
@@ -507,10 +581,16 @@ struct Nav {
 }
 impl Nav {
     fn at(path: String) -> Self {
-        Nav { history: vec![path], idx: 0 }
+        Nav {
+            history: vec![path],
+            idx: 0,
+        }
     }
     fn current(&self) -> String {
-        self.history.get(self.idx).cloned().unwrap_or_else(|| "/".to_string())
+        self.history
+            .get(self.idx)
+            .cloned()
+            .unwrap_or_else(|| "/".to_string())
     }
     fn go(&mut self, path: String) {
         if self.history.last().map(|s| s.as_str()) == Some(path.as_str()) {
@@ -582,8 +662,7 @@ pub fn run() {
         })
         .build()
         .expect("failed to build winit backend");
-    slint::platform::set_platform(Box::new(backend))
-        .expect("failed to set the slint platform");
+    slint::platform::set_platform(Box::new(backend)).expect("failed to set the slint platform");
 
     let ui = App::new().expect("failed to construct gmacFTP UI");
 
@@ -627,7 +706,11 @@ pub fn run() {
         // Sync is on but no passphrase set here yet. If a wrapped key already exists in the
         // sync folder, ANOTHER Mac already set up sync → JOIN it (enter that passphrase).
         // Otherwise this is the first Mac → SET a new one.
-        let mode = if store::cloud::read_key().is_some() { "enter" } else { "set" };
+        let mode = if store::cloud::read_key().is_some() {
+            "enter"
+        } else {
+            "set"
+        };
         ui.set_passphrase_mode(mode.into());
         ui.set_passphrase_open(true);
     }
@@ -659,8 +742,18 @@ pub fn run() {
     let home_s = home.to_string_lossy().to_string();
     // Tier 2: two independent panes; both start as the local filesystem.
     let panes: Panes = Arc::new(Mutex::new([
-        PaneState { kind: PaneKind::Local, conn: None, cwd: home_s.clone(), nav: Nav::at(home_s.clone()) },
-        PaneState { kind: PaneKind::Local, conn: None, cwd: home_s.clone(), nav: Nav::at(home_s.clone()) },
+        PaneState {
+            kind: PaneKind::Local,
+            conn: None,
+            cwd: home_s.clone(),
+            nav: Nav::at(home_s.clone()),
+        },
+        PaneState {
+            kind: PaneKind::Local,
+            conn: None,
+            cwd: home_s.clone(),
+            nav: Nav::at(home_s.clone()),
+        },
     ]));
     {
         let p = panes.lock().expect("panes");
@@ -679,18 +772,71 @@ pub fn run() {
     let engine = runtime.block_on(async { TransferEngine::start(store.clone(), upd_tx) });
     let jobs_model: Rc<VecModel<TransferRow>> = Rc::new(VecModel::default());
     let jobs_index: Arc<Mutex<HashMap<i32, usize>>> = Arc::new(Mutex::new(HashMap::new()));
-    let eta_samples: Arc<Mutex<HashMap<i32, (Instant, u64)>>> = Arc::new(Mutex::new(HashMap::new()));
+    let eta_samples: Arc<Mutex<HashMap<i32, (Instant, u64)>>> =
+        Arc::new(Mutex::new(HashMap::new()));
     ui.set_transfer_jobs(ModelRc::from(jobs_model.clone()));
     let demo_transfers = std::env::var_os("MACKFTP_DEMO_TRANSFERS").is_some();
     if demo_transfers {
         let demo = [
-            ("backup-06-19.sql.gz", "download", "ftp.example.com  ->  ~/Downloads", "92 / 184 MB", 92 * 1024 * 1024, 184 * 1024 * 1024, 0.50, "active", "2.1 MB/s · 44s left"),
-            ("photo-archive.zip", "upload", "~/Sites  ->  sftp.example.com", "47 / 58 MB", 47 * 1024 * 1024, 58 * 1024 * 1024, 0.82, "active", "3.4 MB/s · 3s left"),
-            ("report-Q3.pdf", "download", "ftp.example.com  ->  ~/Downloads", "2.4 MB", 24 * 1024 * 100, 0, 0.0, "queued", "Waiting"),
-            ("invoice-8871.pdf", "download", "ftp.example.com  ->  ~/Downloads", "412 KB", 412 * 1024, 412 * 1024, 1.0, "done", "Completed"),
-            ("deploy.sh", "upload", "~/Sites  ->  sftp.example.com", "5 / 22 MB", 5 * 1024 * 1024, 22 * 1024 * 1024, 0.25, "failed", "Permission denied"),
+            (
+                "backup-06-19.sql.gz",
+                "download",
+                "ftp.example.com  ->  ~/Downloads",
+                "92 / 184 MB",
+                92 * 1024 * 1024,
+                184 * 1024 * 1024,
+                0.50,
+                "active",
+                "2.1 MB/s · 44s left",
+            ),
+            (
+                "photo-archive.zip",
+                "upload",
+                "~/Sites  ->  sftp.example.com",
+                "47 / 58 MB",
+                47 * 1024 * 1024,
+                58 * 1024 * 1024,
+                0.82,
+                "active",
+                "3.4 MB/s · 3s left",
+            ),
+            (
+                "report-Q3.pdf",
+                "download",
+                "ftp.example.com  ->  ~/Downloads",
+                "2.4 MB",
+                24 * 1024 * 100,
+                0,
+                0.0,
+                "queued",
+                "Waiting",
+            ),
+            (
+                "invoice-8871.pdf",
+                "download",
+                "ftp.example.com  ->  ~/Downloads",
+                "412 KB",
+                412 * 1024,
+                412 * 1024,
+                1.0,
+                "done",
+                "Completed",
+            ),
+            (
+                "deploy.sh",
+                "upload",
+                "~/Sites  ->  sftp.example.com",
+                "5 / 22 MB",
+                5 * 1024 * 1024,
+                22 * 1024 * 1024,
+                0.25,
+                "failed",
+                "Permission denied",
+            ),
         ];
-        for (idx, (name, direction, route, progress_text, done, total, fraction, state, message)) in demo.into_iter().enumerate() {
+        for (idx, (name, direction, route, progress_text, done, total, fraction, state, message)) in
+            demo.into_iter().enumerate()
+        {
             jobs_model.push(TransferRow {
                 id: 10_000 + idx as i32,
                 name: name.into(),
@@ -713,15 +859,44 @@ pub fn run() {
         apply_design_demo_main(&ui, &panes, &sessions, &conns);
     }
     TRANSFER_JOBS.with(|j| *j.borrow_mut() = Some(jobs_model));
-    spawn_progress_forwarder(&handle, store.clone(), panes.clone(), upd_rx, ui.as_weak(), jobs_index.clone(), eta_samples.clone());
+    spawn_progress_forwarder(
+        &handle,
+        store.clone(),
+        panes.clone(),
+        upd_rx,
+        ui.as_weak(),
+        jobs_index.clone(),
+        eta_samples.clone(),
+    );
 
     // ── callbacks ──
-    wire_connect(&ui, &handle, store.clone(), conns.clone(), sessions.clone(), panes.clone());
+    wire_connect(
+        &ui,
+        &handle,
+        store.clone(),
+        conns.clone(),
+        sessions.clone(),
+        panes.clone(),
+    );
     wire_refresh(&ui, &handle, store.clone(), panes.clone());
     wire_nav_pane(&ui, &handle, store.clone(), panes.clone(), 0);
     wire_nav_pane(&ui, &handle, store.clone(), panes.clone(), 1);
-    wire_transfer_download(&ui, &handle, store.clone(), panes.clone(), engine.clone(), jobs_index.clone());
-    wire_transfer_upload(&ui, &handle, store.clone(), panes.clone(), engine.clone(), jobs_index.clone());
+    wire_transfer_download(
+        &ui,
+        &handle,
+        store.clone(),
+        panes.clone(),
+        engine.clone(),
+        jobs_index.clone(),
+    );
+    wire_transfer_upload(
+        &ui,
+        &handle,
+        store.clone(),
+        panes.clone(),
+        engine.clone(),
+        jobs_index.clone(),
+    );
     wire_toggle_locale(&ui);
     wire_toggle_tls(&ui);
     wire_toggle_theme(&ui);
@@ -736,7 +911,14 @@ pub fn run() {
     wire_delete(&ui, store.clone(), conns.clone());
     wire_save(&ui, store.clone(), conns.clone());
     wire_import(&ui, &handle, store.clone(), conns.clone());
-    wire_connect_selected(&ui, &handle, store.clone(), conns.clone(), sessions.clone(), panes.clone());
+    wire_connect_selected(
+        &ui,
+        &handle,
+        store.clone(),
+        conns.clone(),
+        sessions.clone(),
+        panes.clone(),
+    );
     wire_server_filter(&ui);
     wire_reorder_saved_connections(&ui, conns.clone());
     wire_palette_filter(&ui);
@@ -745,19 +927,55 @@ pub fn run() {
     wire_clear_finished(&ui, jobs_index.clone());
     wire_dismiss_transfer(&ui, jobs_index.clone());
     wire_set_transfers_paused(&ui, engine.clone());
-    wire_window_controls(&ui, &handle, store.clone(), panes.clone(), engine.clone(), jobs_index.clone());
+    wire_window_controls(
+        &ui,
+        &handle,
+        store.clone(),
+        panes.clone(),
+        engine.clone(),
+        jobs_index.clone(),
+    );
     wire_external_drag(&ui, &handle, store.clone(), panes.clone());
     wire_request_delete(&ui, &handle, store.clone(), panes.clone());
     wire_confirm_delete(&ui, &handle, store.clone(), panes.clone());
-    wire_keyboard(&ui, &handle, store.clone(), panes.clone(), engine.clone(), jobs_index.clone());
+    wire_keyboard(
+        &ui,
+        &handle,
+        store.clone(),
+        panes.clone(),
+        engine.clone(),
+        jobs_index.clone(),
+    );
     wire_misc_ui(&ui);
     wire_passphrase(&ui, store.clone(), conns.clone());
     wire_send_sync(&ui, store.clone(), conns.clone());
-    wire_overwrite(&ui, &handle, store.clone(), panes.clone(), engine.clone(), jobs_index.clone());
-    wire_session_controls(&ui, &handle, store.clone(), sessions.clone(), panes.clone(), engine.clone());
+    wire_overwrite(
+        &ui,
+        &handle,
+        store.clone(),
+        panes.clone(),
+        engine.clone(),
+        jobs_index.clone(),
+    );
+    wire_session_controls(
+        &ui,
+        &handle,
+        store.clone(),
+        sessions.clone(),
+        panes.clone(),
+        engine.clone(),
+    );
     // Re-assert keyboard focus on every pane/row click — Slint delivers key-pressed only to the
     // focused item, so we focus the root FocusScope whenever a pane becomes active.
-    { let uw = ui.as_weak(); ui.on_activate_pane(move |_| { if let Some(ui) = uw.upgrade() { focus_root(&ui); refresh_selected_path(&ui); } }); }
+    {
+        let uw = ui.as_weak();
+        ui.on_activate_pane(move |_| {
+            if let Some(ui) = uw.upgrade() {
+                focus_root(&ui);
+                refresh_selected_path(&ui);
+            }
+        });
+    }
 
     // Focus the root so keyboard control works immediately on launch (before any click).
     focus_root(&ui);
@@ -765,8 +983,14 @@ pub fn run() {
     // Test affordance: MACKFTP_AUTO_CONNECT=<id> auto-connects into the active pane.
     if let Ok(id) = std::env::var("MACKFTP_AUTO_CONNECT") {
         if let Ok(id) = id.trim().parse::<i32>() {
-            let (handle2, store2, conns2, sessions2, panes2, ui_weak2) =
-                (handle.clone(), store.clone(), conns.clone(), sessions.clone(), panes.clone(), ui.as_weak());
+            let (handle2, store2, conns2, sessions2, panes2, ui_weak2) = (
+                handle.clone(),
+                store.clone(),
+                conns.clone(),
+                sessions.clone(),
+                panes.clone(),
+                ui.as_weak(),
+            );
             std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_millis(1500));
                 let _ = slint::invoke_from_event_loop(move || {
@@ -836,7 +1060,9 @@ fn use_design_demo_connections() -> bool {
     if std::env::var_os("MACKFTP_DEMO_CONNECTIONS").is_some() {
         return true;
     }
-    let Ok(panel) = std::env::var("MACKFTP_OPEN_PANEL") else { return false };
+    let Ok(panel) = std::env::var("MACKFTP_OPEN_PANEL") else {
+        return false;
+    };
     matches!(
         panel.trim().to_lowercase().as_str(),
         "servers" | "connections" | "manager" | "palette" | "command-palette"
@@ -849,11 +1075,39 @@ fn use_design_demo_main() -> bool {
 
 fn design_demo_connections() -> Vec<ConnectionSpec> {
     [
-        (1, "Production", Protocol::Ftp, "ftp.example.com", 21, "deploy"),
-        (2, "Staging", Protocol::Sftp, "sftp.example.com", 22, "release"),
+        (
+            1,
+            "Production",
+            Protocol::Ftp,
+            "ftp.example.com",
+            21,
+            "deploy",
+        ),
+        (
+            2,
+            "Staging",
+            Protocol::Sftp,
+            "sftp.example.com",
+            22,
+            "release",
+        ),
         (3, "CDN Edge", Protocol::Ftp, "cdn.example.com", 21, "edge"),
-        (4, "Backups", Protocol::Sftp, "backup.example.com", 22, "backup"),
-        (5, "Analytics", Protocol::Ftp, "stats.example.com", 21, "reports"),
+        (
+            4,
+            "Backups",
+            Protocol::Sftp,
+            "backup.example.com",
+            22,
+            "backup",
+        ),
+        (
+            5,
+            "Analytics",
+            Protocol::Ftp,
+            "stats.example.com",
+            21,
+            "reports",
+        ),
     ]
     .into_iter()
     .map(|(id, name, protocol, host, port, user)| ConnectionSpec {
@@ -868,7 +1122,14 @@ fn design_demo_connections() -> Vec<ConnectionSpec> {
     .collect()
 }
 
-fn demo_entry(name: &str, is_dir: bool, date: &str, size_text: &str, size: i32, mtime: i32) -> EntryRow {
+fn demo_entry(
+    name: &str,
+    is_dir: bool,
+    date: &str,
+    size_text: &str,
+    size: i32,
+    mtime: i32,
+) -> EntryRow {
     EntryRow {
         name: name.into(),
         is_dir,
@@ -966,9 +1227,30 @@ fn apply_design_demo_main(ui: &App, panes: &Panes, sessions: &Sessions, conns: &
             demo_entry("Sites", true, "", "", 0, 0),
             demo_entry("Projects", true, "", "", 0, 0),
             demo_entry("Backups", true, "", "", 0, 0),
-            demo_entry("report-Q3.pdf", false, "Jun 12 14:22", "2.4 MB", 2_400_000, 1),
-            demo_entry("invoice-8871.pdf", false, "Jun 09 09:10", "412 KB", 412_000, 2),
-            demo_entry("photo-archive.zip", false, "May 28 18:44", "58 MB", 58_000_000, 3),
+            demo_entry(
+                "report-Q3.pdf",
+                false,
+                "Jun 12 14:22",
+                "2.4 MB",
+                2_400_000,
+                1,
+            ),
+            demo_entry(
+                "invoice-8871.pdf",
+                false,
+                "Jun 09 09:10",
+                "412 KB",
+                412_000,
+                2,
+            ),
+            demo_entry(
+                "photo-archive.zip",
+                false,
+                "May 28 18:44",
+                "58 MB",
+                58_000_000,
+                3,
+            ),
             demo_entry("deploy.sh", false, "Jun 18 11:02", "4 KB", 4_000, 4),
             demo_entry("README.md", false, "Jun 04 08:30", "6 KB", 6_000, 5),
         ],
@@ -984,7 +1266,14 @@ fn apply_design_demo_main(ui: &App, panes: &Panes, sessions: &Sessions, conns: &
             demo_entry("config", true, "", "", 0, 0),
             demo_entry("index.php", false, "Jun 19 10:15", "8 KB", 8_000, 1),
             demo_entry(".htaccess", false, "Jun 18 22:40", "2 KB", 2_000, 2),
-            demo_entry("backup-06-19.sql.gz", false, "Jun 19 03:00", "184 MB", 184_000_000, 3),
+            demo_entry(
+                "backup-06-19.sql.gz",
+                false,
+                "Jun 19 03:00",
+                "184 MB",
+                184_000_000,
+                3,
+            ),
             demo_entry("favicon.ico", false, "Jun 10 13:00", "8 KB", 8_000, 4),
             demo_entry("sitemap.xml", false, "Jun 09 09:05", "24 KB", 24_000, 5),
         ],
@@ -1122,56 +1411,84 @@ fn wire_window_controls(
         // first winit window event (which fires after the event loop has started), so our menu
         // wins over any default menu the winit backend installs during launch.
         let menu_reasserted = Rc::new(Cell::new(false));
-        let (uw, handle, store, panes, engine, idx) =
-            (ui.as_weak(), handle.clone(), store.clone(), panes.clone(), engine.clone(), idx.clone());
-        ui.window().on_winit_window_event(move |slint_window, event| {
-            if !menu_reasserted.replace(true) {
-                crate::macos_menu::reassert(uw.clone());
-            }
-            if !window_shape_configured.get()
-                && slint_window
-                    .with_winit_window(configure_macos_window_shape)
-                    .is_some()
-            {
-                window_shape_configured.set(true);
-            }
-            if let Some(ui) = uw.upgrade() {
-                match event {
-                    slint::winit_030::winit::event::WindowEvent::HoveredFile(_) => {
-                        let pane = slint_window
-                            .with_winit_window(cursor_x_in_window)
-                            .flatten()
-                            .map(|x| if x > 240.0 + ui.get_pane_split() as f64 + 24.0 { 1 } else { 0 })
-                            .unwrap_or_else(|| active_pane_idx(&ui));
-                        ui.set_external_drop_pane(pane as i32);
-                        ui.set_external_drop_active(true);
-                    }
-                    slint::winit_030::winit::event::WindowEvent::HoveredFileCancelled => {
-                        ui.set_external_drop_active(false);
-                        ui.set_external_drop_pane(-1);
-                    }
-                    slint::winit_030::winit::event::WindowEvent::DroppedFile(path) => {
-                        // Detect the drop target from the LIVE cursor position (where the file is
-                        // dropped), not the HoveredFile-set value. That value is reset after the
-                        // first file of a multi-file drop — so files 2..N would otherwise land in
-                        // pane 0 (local) and only the first file uploads — and it falls back to the
-                        // active pane when hover detection is unreliable, forcing the user to click
-                        // the target pane first. Reading the cursor here auto-detects the pane and
-                        // routes every file of a multi-file drop to the correct pane.
-                        let pane = slint_window
-                            .with_winit_window(cursor_x_in_window)
-                            .flatten()
-                            .map(|x| if x > 240.0 + ui.get_pane_split() as f64 + 24.0 { 1 } else { 0 })
-                            .unwrap_or_else(|| ui.get_external_drop_pane().max(0) as usize);
-                        ui.set_external_drop_active(false);
-                        ui.set_external_drop_pane(-1);
-                        receive_external_path(&handle, store.clone(), panes.clone(), engine.clone(), idx.clone(), ui.as_weak(), pane.min(1), path.clone());
-                    }
-                    _ => {}
+        let (uw, handle, store, panes, engine, idx) = (
+            ui.as_weak(),
+            handle.clone(),
+            store.clone(),
+            panes.clone(),
+            engine.clone(),
+            idx.clone(),
+        );
+        ui.window()
+            .on_winit_window_event(move |slint_window, event| {
+                if !menu_reasserted.replace(true) {
+                    crate::macos_menu::reassert(uw.clone());
                 }
-            }
-            slint::winit_030::EventResult::Propagate
-        });
+                if !window_shape_configured.get()
+                    && slint_window
+                        .with_winit_window(configure_macos_window_shape)
+                        .is_some()
+                {
+                    window_shape_configured.set(true);
+                }
+                if let Some(ui) = uw.upgrade() {
+                    match event {
+                        slint::winit_030::winit::event::WindowEvent::HoveredFile(_) => {
+                            let pane = slint_window
+                                .with_winit_window(cursor_x_in_window)
+                                .flatten()
+                                .map(|x| {
+                                    if x > 240.0 + ui.get_pane_split() as f64 + 24.0 {
+                                        1
+                                    } else {
+                                        0
+                                    }
+                                })
+                                .unwrap_or_else(|| active_pane_idx(&ui));
+                            ui.set_external_drop_pane(pane as i32);
+                            ui.set_external_drop_active(true);
+                        }
+                        slint::winit_030::winit::event::WindowEvent::HoveredFileCancelled => {
+                            ui.set_external_drop_active(false);
+                            ui.set_external_drop_pane(-1);
+                        }
+                        slint::winit_030::winit::event::WindowEvent::DroppedFile(path) => {
+                            // Detect the drop target from the LIVE cursor position (where the file is
+                            // dropped), not the HoveredFile-set value. That value is reset after the
+                            // first file of a multi-file drop — so files 2..N would otherwise land in
+                            // pane 0 (local) and only the first file uploads — and it falls back to the
+                            // active pane when hover detection is unreliable, forcing the user to click
+                            // the target pane first. Reading the cursor here auto-detects the pane and
+                            // routes every file of a multi-file drop to the correct pane.
+                            let pane = slint_window
+                                .with_winit_window(cursor_x_in_window)
+                                .flatten()
+                                .map(|x| {
+                                    if x > 240.0 + ui.get_pane_split() as f64 + 24.0 {
+                                        1
+                                    } else {
+                                        0
+                                    }
+                                })
+                                .unwrap_or_else(|| ui.get_external_drop_pane().max(0) as usize);
+                            ui.set_external_drop_active(false);
+                            ui.set_external_drop_pane(-1);
+                            receive_external_path(
+                                &handle,
+                                store.clone(),
+                                panes.clone(),
+                                engine.clone(),
+                                idx.clone(),
+                                ui.as_weak(),
+                                pane.min(1),
+                                path.clone(),
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+                slint::winit_030::EventResult::Propagate
+            });
     }
 
     let ui_weak = ui.as_weak();
@@ -1184,7 +1501,9 @@ fn wire_window_controls(
     let ui_weak = ui.as_weak();
     ui.on_minimize_window(move || {
         if let Some(ui) = ui_weak.upgrade() {
-            let _ = ui.window().with_winit_window(|window| window.set_minimized(true));
+            let _ = ui
+                .window()
+                .with_winit_window(|window| window.set_minimized(true));
         }
     });
 
@@ -1195,7 +1514,9 @@ fn wire_window_controls(
                 if window.fullscreen().is_some() {
                     window.set_fullscreen(None);
                 } else {
-                    window.set_fullscreen(Some(slint::winit_030::winit::window::Fullscreen::Borderless(None)));
+                    window.set_fullscreen(Some(
+                        slint::winit_030::winit::window::Fullscreen::Borderless(None),
+                    ));
                 }
             });
         }
@@ -1211,24 +1532,48 @@ fn wire_external_drag(ui: &App, handle: &Handle, store: Arc<dyn CredentialStore>
     ui.on_start_external_drag(move |pane_name, row| {
         let Some(ui) = uw.upgrade() else { return };
         let pane = if pane_name.as_str() == "remote" { 1 } else { 0 };
-        let entry = if pane == 0 { ui.get_local_entries().row_data(row as usize) } else { ui.get_remote_entries().row_data(row as usize) };
+        let entry = if pane == 0 {
+            ui.get_local_entries().row_data(row as usize)
+        } else {
+            ui.get_remote_entries().row_data(row as usize)
+        };
         let Some(entry) = entry else { return };
         let state = panes.lock().ok().map(|p| p[pane].clone());
         let Some(state) = state else { return };
         let mut path = PathBuf::from(&state.cwd).join(entry.name.as_str());
         if matches!(state.kind, PaneKind::Remote) {
             let Some(spec) = state.conn else { return };
-            let Some(password) = password_for(&store, &spec) else { return };
+            let Some(password) = password_for(&store, &spec) else {
+                return;
+            };
             let remote = join_remote(PathBuf::from(&state.cwd).join(entry.name.as_str()));
-            match materialize_remote_drag(&handle, &spec, &password, &remote, entry.name.as_str(), entry.is_dir) {
+            match materialize_remote_drag(
+                &handle,
+                &spec,
+                &password,
+                &remote,
+                entry.name.as_str(),
+                entry.is_dir,
+            ) {
                 Ok(p) => path = p,
-                Err(e) => { ui.set_error(format!("Could not prepare drag: {e}").into()); return; }
+                Err(e) => {
+                    ui.set_error(format!("Could not prepare drag: {e}").into());
+                    return;
+                }
             };
         }
-        let Ok(path) = std::fs::canonicalize(path) else { return };
+        let Ok(path) = std::fs::canonicalize(path) else {
+            return;
+        };
         let image = drag_preview_image().unwrap_or_else(|| drag::Image::File(path.clone()));
         let _ = ui.window().with_winit_window(|window| {
-            let _ = drag::start_drag(window, drag::DragItem::Files(vec![path]), image, |_, _| {}, Default::default());
+            let _ = drag::start_drag(
+                window,
+                drag::DragItem::Files(vec![path]),
+                image,
+                |_, _| {},
+                Default::default(),
+            );
         });
     });
 }
@@ -1243,23 +1588,45 @@ fn receive_external_path(
     pane: usize,
     source: PathBuf,
 ) {
-    let Some(name) = source.file_name().and_then(|n| n.to_str()).map(str::to_owned) else { return };
-    let Some(state) = panes.lock().ok().map(|p| p[pane].clone()) else { return };
+    let Some(name) = source
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(str::to_owned)
+    else {
+        return;
+    };
+    let Some(state) = panes.lock().ok().map(|p| p[pane].clone()) else {
+        return;
+    };
     let is_dir = source.is_dir();
     match state.kind {
         PaneKind::Local => {
             let destination = PathBuf::from(&state.cwd).join(&name);
-            if destination == source { return; }
+            if destination == source {
+                return;
+            }
             let (h, st, pn, uw) = (handle.clone(), store, panes, ui.clone());
-            if let Some(u) = ui.upgrade() { u.set_status(format!("Copying {name}...").into()); }
+            if let Some(u) = ui.upgrade() {
+                u.set_status(format!("Copying {name}...").into());
+            }
             handle.spawn(async move {
                 let result = tokio::task::spawn_blocking(move || {
-                    if is_dir { fs_copy_tree(&source, &destination); Ok(()) }
-                    else { std::fs::copy(&source, &destination).map(|_| ()).map_err(|_| ()) }
-                }).await;
+                    if is_dir {
+                        fs_copy_tree(&source, &destination);
+                        Ok(())
+                    } else {
+                        std::fs::copy(&source, &destination)
+                            .map(|_| ())
+                            .map_err(|_| ())
+                    }
+                })
+                .await;
                 let _ = slint::invoke_from_event_loop(move || {
                     if let Some(u) = uw.upgrade() {
-                        match result { Ok(Ok(())) => u.set_status(format!("Copied {name}").into()), _ => u.set_error(format!("Could not copy {name}").into()) }
+                        match result {
+                            Ok(Ok(())) => u.set_status(format!("Copied {name}").into()),
+                            _ => u.set_error(format!("Could not copy {name}").into()),
+                        }
                         refresh_both_panes(&h, st, pn, u.as_weak());
                     }
                 });
@@ -1272,10 +1639,19 @@ fn receive_external_path(
             // Check for a name conflict on the server before uploading — never silently overwrite
             // (Finder→server used to clobber an existing same-name file with no prompt). On conflict,
             // route through the same overwrite dialog as the in-app copy.
-            let Some(pw) = password_for(&store, &spec) else { set_err(&ui, "missing credential"); return };
+            let Some(pw) = password_for(&store, &spec) else {
+                set_err(&ui, "missing credential");
+                return;
+            };
             let (h, engine2, idx2, spec2, source2, name2, size2, ui2) = (
-                handle.clone(), engine.clone(), idx.clone(), spec.clone(), source.clone(),
-                name.clone(), size, ui.clone(),
+                handle.clone(),
+                engine.clone(),
+                idx.clone(),
+                spec.clone(),
+                source.clone(),
+                name.clone(),
+                size,
+                ui.clone(),
             );
             handle.spawn(async move {
                 let exists = match net::remote_exists(&spec2, &pw, &remote_dir, &name2).await {
@@ -1294,7 +1670,14 @@ fn receive_external_path(
                         let show_now = match PENDING_EXTERNAL_UPLOAD.lock() {
                             Ok(mut g) => {
                                 let show = g.is_empty();
-                                g.push_back((spec2, source2, remote_dir, name2.clone(), size2, is_dir));
+                                g.push_back((
+                                    spec2,
+                                    source2,
+                                    remote_dir,
+                                    name2.clone(),
+                                    size2,
+                                    is_dir,
+                                ));
                                 show
                             }
                             Err(_) => false,
@@ -1308,7 +1691,18 @@ fn receive_external_path(
                     } else {
                         let remote = join_remote(PathBuf::from(&remote_dir).join(&name2));
                         if let Some(u) = ui2.upgrade() {
-                            do_external_upload(&h, engine2, idx2, u.as_weak(), spec2, source2, remote, name2, size2, is_dir);
+                            do_external_upload(
+                                &h,
+                                engine2,
+                                idx2,
+                                u.as_weak(),
+                                spec2,
+                                source2,
+                                remote,
+                                name2,
+                                size2,
+                                is_dir,
+                            );
                         }
                     }
                 });
@@ -1325,20 +1719,33 @@ fn materialize_remote_drag(
     name: &str,
     is_dir: bool,
 ) -> Result<PathBuf, String> {
-    let root = std::env::temp_dir().join("gmacftp-drag").join(format!("{}", rand::random::<u64>()));
+    let root = std::env::temp_dir()
+        .join("gmacftp-drag")
+        .join(format!("{}", rand::random::<u64>()));
     let target = root.join(name);
     std::fs::create_dir_all(if is_dir { &target } else { &root }).map_err(|e| e.to_string())?;
     if !is_dir {
-        handle.block_on(net::download_file(spec, password, remote, target.clone())).map_err(|e| e.to_string())?;
+        handle
+            .block_on(net::download_file(spec, password, remote, target.clone()))
+            .map_err(|e| e.to_string())?;
         return Ok(target);
     }
-    let files = handle.block_on(net::walk_remote(spec, password, remote)).map_err(|e| e.to_string())?;
+    let files = handle
+        .block_on(net::walk_remote(spec, password, remote))
+        .map_err(|e| e.to_string())?;
     for (remote_file, _) in files {
-        let rel = remote_file.strip_prefix(remote).unwrap_or(&remote_file).trim_start_matches('/');
+        let rel = remote_file
+            .strip_prefix(remote)
+            .unwrap_or(&remote_file)
+            .trim_start_matches('/');
         let rel = net::sanitize_local_rel(rel).map_err(|e| e.to_string())?;
         let local = target.join(rel);
-        if let Some(parent) = local.parent() { std::fs::create_dir_all(parent).map_err(|e| e.to_string())?; }
-        handle.block_on(net::download_file(spec, password, &remote_file, local)).map_err(|e| e.to_string())?;
+        if let Some(parent) = local.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        handle
+            .block_on(net::download_file(spec, password, &remote_file, local))
+            .map_err(|e| e.to_string())?;
     }
     Ok(target)
 }
@@ -1348,7 +1755,11 @@ fn drag_preview_image() -> Option<drag::Image> {
     let bundled = exe.parent()?.parent()?.join("Resources/icon.icns");
     // Dev fallback only (the shipped .app always has the bundled icon). A RELATIVE path keeps the
     // developer's absolute CARGO_MANIFEST_DIR out of the compiled binary.
-    let path = if bundled.exists() { bundled } else { PathBuf::from("assets/icon-preview.png") };
+    let path = if bundled.exists() {
+        bundled
+    } else {
+        PathBuf::from("assets/icon-preview.png")
+    };
     path.exists().then_some(drag::Image::File(path))
 }
 
@@ -1357,7 +1768,9 @@ fn cursor_x_in_window(window: &slint::winit_030::winit::window::Window) -> Optio
     use objc2::{msg_send, runtime::AnyObject};
     use objc2_foundation::NSPoint;
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-    let RawWindowHandle::AppKit(appkit) = window.window_handle().ok()?.as_raw() else { return None };
+    let RawWindowHandle::AppKit(appkit) = window.window_handle().ok()?.as_raw() else {
+        return None;
+    };
     unsafe {
         let view = &*appkit.ns_view.as_ptr().cast::<AnyObject>();
         let ns_window: *mut AnyObject = msg_send![view, window];
@@ -1424,7 +1837,11 @@ fn reorder_saved_connection(ui: &App, conns: &ConnList, id: i32, drop_index: i32
             .iter()
             .rev()
             .find(|row| row.id != id)
-            .and_then(|row| g.iter().position(|c| c.id.0 as i32 == row.id).map(|pos| pos + 1))
+            .and_then(|row| {
+                g.iter()
+                    .position(|c| c.id.0 as i32 == row.id)
+                    .map(|pos| pos + 1)
+            })
             .unwrap_or(g.len())
     };
 
@@ -1456,7 +1873,9 @@ fn apply_palette_filter(ui: &App) {
         .into_iter()
         .filter(|row| {
             conn_row_matches(row, &query)
-                || (demo && row.label.to_string() == "Backups" && "production backups".contains(query.trim().to_lowercase().as_str()))
+                || (demo
+                    && row.label.to_string() == "Backups"
+                    && "production backups".contains(query.trim().to_lowercase().as_str()))
         })
         .map(|mut row| {
             if demo && row.label.to_string() == "Backups" {
@@ -1577,7 +1996,9 @@ fn local_folder_stats_inner(
             return;
         }
     }
-    let Ok(read) = std::fs::read_dir(dir) else { return };
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return;
+    };
     for entry in read.flatten() {
         if stats.truncated {
             break;
@@ -1592,7 +2013,8 @@ fn local_folder_stats_inner(
             if let Ok(modified) = md.modified() {
                 if let Ok(d) = modified.duration_since(std::time::UNIX_EPOCH) {
                     let mtime = d.as_secs() as i64;
-                    stats.newest_mtime = Some(stats.newest_mtime.map_or(mtime, |cur| cur.max(mtime)));
+                    stats.newest_mtime =
+                        Some(stats.newest_mtime.map_or(mtime, |cur| cur.max(mtime)));
                 }
             }
             if max_files > 0 && stats.files_scanned >= max_files {
@@ -1616,13 +2038,19 @@ fn list_local_pane(ui: &App, pane: usize, path: &Path, cwd: &str) {
                 let is_dir = md.is_dir();
                 let len = md.len();
                 let item_path = entry.path();
-                let folder_stats = is_dir.then(|| local_folder_stats(&item_path, MAX_LOCAL_FOLDER_STAT_FILES));
+                let folder_stats =
+                    is_dir.then(|| local_folder_stats(&item_path, MAX_LOCAL_FOLDER_STAT_FILES));
                 let display_size = folder_stats.map(|s| s.size).unwrap_or(len);
                 let partial = folder_stats.map(|s| s.truncated).unwrap_or(false);
-                let own_mtime = md.modified().ok()
+                let own_mtime = md
+                    .modified()
+                    .ok()
                     .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs() as i64).unwrap_or(0);
-                let mtime = folder_stats.and_then(|s| s.newest_mtime).unwrap_or(own_mtime);
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                let mtime = folder_stats
+                    .and_then(|s| s.newest_mtime)
+                    .unwrap_or(own_mtime);
                 rows.push(EntryRow {
                     name: name.clone().into(),
                     is_dir,
@@ -1649,24 +2077,30 @@ fn set_pane_entries(
     partials: &HashMap<String, bool>,
     metadata_states: &HashMap<String, &'static str>,
 ) {
-    let rows: Vec<EntryRow> = entries.iter().map(|e| {
-        let mtime = e.mtime.unwrap_or(0);
-        let partial = partials.get(&e.name).copied().unwrap_or(false);
-        EntryRow {
-            name: e.name.clone().into(),
-            is_dir: e.is_dir,
-            size: e.size as i32,
-            mtime: mtime as i32,
-            date: fmt_date(mtime).into(),
-            size_text: fmt_size_partial(e.size, partial).into(),
-            metadata_state: metadata_states
-                .get(&e.name)
-                .copied()
-                .unwrap_or("ready")
-                .into(),
-        }
-    }).collect();
-    let meta = entries.iter().map(|e| (e.name.clone(), e.size, e.mtime.unwrap_or(0))).collect::<Vec<_>>();
+    let rows: Vec<EntryRow> = entries
+        .iter()
+        .map(|e| {
+            let mtime = e.mtime.unwrap_or(0);
+            let partial = partials.get(&e.name).copied().unwrap_or(false);
+            EntryRow {
+                name: e.name.clone().into(),
+                is_dir: e.is_dir,
+                size: e.size as i32,
+                mtime: mtime as i32,
+                date: fmt_date(mtime).into(),
+                size_text: fmt_size_partial(e.size, partial).into(),
+                metadata_state: metadata_states
+                    .get(&e.name)
+                    .copied()
+                    .unwrap_or("ready")
+                    .into(),
+            }
+        })
+        .collect();
+    let meta = entries
+        .iter()
+        .map(|e| (e.name.clone(), e.size, e.mtime.unwrap_or(0)))
+        .collect::<Vec<_>>();
     set_true_meta(pane, &meta);
     set_pane_full(ui, pane, rows, cwd);
 }
@@ -1721,18 +2155,32 @@ fn remote_pane_request_is_current(
     connection_id: ConnectionId,
     cwd: &str,
 ) -> bool {
-    let Ok(panes) = panes.lock() else { return false };
-    let Some(state) = panes.get(pane) else { return false };
+    let Ok(panes) = panes.lock() else {
+        return false;
+    };
+    let Some(state) = panes.get(pane) else {
+        return false;
+    };
     matches!(state.kind, PaneKind::Remote)
         && state.conn.as_ref().map(|conn| conn.id) == Some(connection_id)
         && state.cwd == cwd
 }
 
 /// Re-list a pane at its current cwd (Local → fs read; Remote → connect + list, per-op).
-fn refresh_pane(handle: &Handle, store: Arc<dyn CredentialStore>, panes: Panes, ui: Weak<App>, pane: usize) {
+fn refresh_pane(
+    handle: &Handle,
+    store: Arc<dyn CredentialStore>,
+    panes: Panes,
+    ui: Weak<App>,
+    pane: usize,
+) {
     let (kind, conn, cwd) = {
         let p = panes.lock().expect("panes");
-        (p[pane].kind.clone(), p[pane].conn.clone(), p[pane].cwd.clone())
+        (
+            p[pane].kind.clone(),
+            p[pane].conn.clone(),
+            p[pane].cwd.clone(),
+        )
     };
     match kind {
         PaneKind::Local => {
@@ -1749,13 +2197,15 @@ fn refresh_pane(handle: &Handle, store: Arc<dyn CredentialStore>, panes: Panes, 
             });
             let Some(password) = password_for(&store, &spec) else {
                 let _ = ui.upgrade().map(|ui| set_pane_loading(&ui, pane, false));
-                set_err(&ui, "missing credential"); return;
+                set_err(&ui, "missing credential");
+                return;
             };
             handle.spawn(async move {
-                let mut s = spec.clone(); s.initial_path = cwd.clone();
+                let mut s = spec.clone();
+                s.initial_path = cwd.clone();
                 let started = Instant::now();
-                let entries = match net::connect_and_list(&s, &password).await {
-                    Ok(entries) => entries,
+                let (entries, plaintext) = match net::connect_and_list(&s, &password).await {
+                    Ok(t) => t,
                     Err(e) => {
                         let request_panes = panes.clone();
                         let request_ui = ui.clone();
@@ -1770,7 +2220,9 @@ fn refresh_pane(handle: &Handle, store: Arc<dyn CredentialStore>, panes: Panes, 
                             ) {
                                 return;
                             }
-                            let Some(ui) = request_ui.upgrade() else { return };
+                            let Some(ui) = request_ui.upgrade() else {
+                                return;
+                            };
                             set_pane_loading(&ui, pane, false);
                             ui.set_error(e.to_string().into());
                         });
@@ -1809,7 +2261,9 @@ fn refresh_pane(handle: &Handle, store: Arc<dyn CredentialStore>, panes: Panes, 
                     ) {
                         return;
                     }
-                    let Some(ui) = request_ui.upgrade() else { return };
+                    let Some(ui) = request_ui.upgrade() else {
+                        return;
+                    };
                     set_pane_loading(&ui, pane, false);
                     ui.set_error("".into());
                     set_pane_entries(
@@ -1820,6 +2274,18 @@ fn refresh_pane(handle: &Handle, store: Arc<dyn CredentialStore>, panes: Panes, 
                         &HashMap::new(),
                         &initial_states,
                     );
+                    // FTP STARTTLS downgrade warning: the server refused TLS (or an active MITM
+                    // forced it), so the password was sent in the clear. Surface it so the user
+                    // can tell an encrypted FTPS session from a downgraded plaintext one. On a
+                    // secure connection, clear any stale plaintext warning left by an earlier
+                    // connect (status is global, so the latest connect wins).
+                    if plaintext {
+                        ui.set_status(
+                            "Connected via plaintext FTP — password was sent unencrypted.".into(),
+                        );
+                    } else {
+                        ui.set_status("".into());
+                    }
                 });
 
                 let enrichment_started = Instant::now();
@@ -1885,7 +2351,9 @@ fn refresh_pane(handle: &Handle, store: Arc<dyn CredentialStore>, panes: Panes, 
                         }
                     };
 
-                    let Some(updated_entry) = entries.get(index).cloned() else { continue };
+                    let Some(updated_entry) = entries.get(index).cloned() else {
+                        continue;
+                    };
                     let request_panes = panes.clone();
                     let request_ui = ui.clone();
                     let request_cwd = cwd.clone();
@@ -1899,7 +2367,9 @@ fn refresh_pane(handle: &Handle, store: Arc<dyn CredentialStore>, panes: Panes, 
                         ) {
                             return;
                         }
-                        let Some(ui) = request_ui.upgrade() else { return };
+                        let Some(ui) = request_ui.upgrade() else {
+                            return;
+                        };
                         update_pane_entry_metadata(
                             &ui,
                             pane,
@@ -1916,7 +2386,6 @@ fn refresh_pane(handle: &Handle, store: Arc<dyn CredentialStore>, panes: Panes, 
                     elapsed_ms = enrichment_started.elapsed().as_millis(),
                     "folder metadata enriched"
                 );
-
             });
         }
     }
@@ -1924,7 +2393,12 @@ fn refresh_pane(handle: &Handle, store: Arc<dyn CredentialStore>, panes: Panes, 
 
 /// Re-list both panes at their current cwd (Local -> fs read; Remote -> connect + list). Called
 /// after a transfer or delete so the new/removed entry is visible immediately — no manual refresh.
-fn refresh_both_panes(handle: &Handle, store: Arc<dyn CredentialStore>, panes: Panes, ui: Weak<App>) {
+fn refresh_both_panes(
+    handle: &Handle,
+    store: Arc<dyn CredentialStore>,
+    panes: Panes,
+    ui: Weak<App>,
+) {
     refresh_pane(handle, store.clone(), panes.clone(), ui.clone(), 0);
     refresh_pane(handle, store, panes, ui, 1);
 }
@@ -1932,15 +2406,33 @@ fn refresh_both_panes(handle: &Handle, store: Arc<dyn CredentialStore>, panes: P
 /// Delete an entry from a pane (right-click → Delete). Local files go to the macOS Trash
 /// (reversible); remote files are deleted server-side (DELE/RMD or SFTP remove). The pane is
 /// re-listed afterward so the removal is reflected immediately.
-fn delete_entry(handle: &Handle, store: Arc<dyn CredentialStore>, panes: Panes, ui: Weak<App>, pane: usize, name: String, is_dir: bool) {
+fn delete_entry(
+    handle: &Handle,
+    store: Arc<dyn CredentialStore>,
+    panes: Panes,
+    ui: Weak<App>,
+    pane: usize,
+    name: String,
+    is_dir: bool,
+) {
     let (kind, conn, cwd) = {
         let p = panes.lock().expect("panes");
-        (p[pane].kind.clone(), p[pane].conn.clone(), p[pane].cwd.clone())
+        (
+            p[pane].kind.clone(),
+            p[pane].conn.clone(),
+            p[pane].cwd.clone(),
+        )
     };
     match kind {
         PaneKind::Local => {
             let path = PathBuf::from(&cwd).join(&name);
-            let (h, st, pn, uw, nm) = (handle.clone(), store.clone(), panes.clone(), ui.clone(), name.clone());
+            let (h, st, pn, uw, nm) = (
+                handle.clone(),
+                store.clone(),
+                panes.clone(),
+                ui.clone(),
+                name.clone(),
+            );
             handle.spawn(async move {
                 let res = tokio::task::spawn_blocking(move || trash::delete(&path))
                     .await
@@ -1949,7 +2441,10 @@ fn delete_entry(handle: &Handle, store: Arc<dyn CredentialStore>, panes: Panes, 
                 let _ = slint::invoke_from_event_loop(move || {
                     if let Some(ui) = uw.upgrade() {
                         match &res {
-                            Ok(()) => { ui.set_status(format!("moved {nm} to Trash").into()); ui.set_error("".into()); }
+                            Ok(()) => {
+                                ui.set_status(format!("moved {nm} to Trash").into());
+                                ui.set_error("".into());
+                            }
                             Err(e) => ui.set_error(format!("delete failed: {e}").into()),
                         }
                     }
@@ -1958,17 +2453,33 @@ fn delete_entry(handle: &Handle, store: Arc<dyn CredentialStore>, panes: Panes, 
             });
         }
         PaneKind::Remote => {
-            let Some(spec) = conn else { set_err(&ui, "not connected"); return };
-            let Some(password) = password_for(&store, &spec) else { set_err(&ui, "missing credential"); return };
+            let Some(spec) = conn else {
+                set_err(&ui, "not connected");
+                return;
+            };
+            let Some(password) = password_for(&store, &spec) else {
+                set_err(&ui, "missing credential");
+                return;
+            };
             let rp = join_remote(PathBuf::from(&cwd).join(&name));
-            let (h, st, pn, uw, nm) = (handle.clone(), store.clone(), panes.clone(), ui.clone(), name.clone());
+            let (h, st, pn, uw, nm) = (
+                handle.clone(),
+                store.clone(),
+                panes.clone(),
+                ui.clone(),
+                name.clone(),
+            );
             handle.spawn(async move {
-                let mut s = spec.clone(); s.initial_path = cwd.clone();
+                let mut s = spec.clone();
+                s.initial_path = cwd.clone();
                 let res = net::delete_remote(&s, &password, &rp, is_dir).await;
                 let _ = slint::invoke_from_event_loop(move || {
                     if let Some(ui) = uw.upgrade() {
                         match &res {
-                            Ok(()) => { ui.set_status(format!("deleted {nm}").into()); ui.set_error("".into()); }
+                            Ok(()) => {
+                                ui.set_status(format!("deleted {nm}").into());
+                                ui.set_error("".into());
+                            }
                             Err(e) => ui.set_error(format!("delete failed: {e}").into()),
                         }
                     }
@@ -1980,8 +2491,25 @@ fn delete_entry(handle: &Handle, store: Arc<dyn CredentialStore>, panes: Panes, 
 }
 
 /// Bind a pane to a saved server (Remote) and list its initial directory.
-fn connect_into_pane(handle: &Handle, store: Arc<dyn CredentialStore>, conns: ConnList, sessions: Sessions, panes: Panes, ui: Weak<App>, pane: usize, conn_id: i32) {
-    let Some(spec) = conns.lock().expect("connections lock").iter().find(|c| c.id.0 as i32 == conn_id).cloned() else { return };
+fn connect_into_pane(
+    handle: &Handle,
+    store: Arc<dyn CredentialStore>,
+    conns: ConnList,
+    sessions: Sessions,
+    panes: Panes,
+    ui: Weak<App>,
+    pane: usize,
+    conn_id: i32,
+) {
+    let Some(spec) = conns
+        .lock()
+        .expect("connections lock")
+        .iter()
+        .find(|c| c.id.0 as i32 == conn_id)
+        .cloned()
+    else {
+        return;
+    };
     // Connect ADDS a background session (the pane's previous session stays alive in the pool).
     show_session_in_pane(handle, store, sessions, panes, ui, pane, &spec, true);
 }
@@ -1989,7 +2517,16 @@ fn connect_into_pane(handle: &Handle, store: Arc<dyn CredentialStore>, conns: Co
 /// Show `spec`'s session in `pane`. With `create_if_missing` (Connect), a session is added to the
 /// pool if absent — so connecting never drops the pane's previous session. Without it (switch),
 /// only an existing pool session can be shown.
-fn show_session_in_pane(handle: &Handle, store: Arc<dyn CredentialStore>, sessions: Sessions, panes: Panes, ui: Weak<App>, pane: usize, spec: &ConnectionSpec, create_if_missing: bool) {
+fn show_session_in_pane(
+    handle: &Handle,
+    store: Arc<dyn CredentialStore>,
+    sessions: Sessions,
+    panes: Panes,
+    ui: Weak<App>,
+    pane: usize,
+    spec: &ConnectionSpec,
+    create_if_missing: bool,
+) {
     // A (different) connection is taking the pane → the "don't ask again" delete suppression
     // was scoped to the previous connection, so re-arm the confirmation for THIS pane.
     set_skip_delete_confirm(pane, false);
@@ -2001,9 +2538,17 @@ fn show_session_in_pane(handle: &Handle, store: Arc<dyn CredentialStore>, sessio
         if let Some(s) = g.iter().find(|s| s.conn.id.0 == spec.id.0) {
             (s.cwd.clone(), s.nav.clone())
         } else if create_if_missing {
-            let cwd = if spec.initial_path.trim().is_empty() { "/".to_string() } else { spec.initial_path.clone() };
+            let cwd = if spec.initial_path.trim().is_empty() {
+                "/".to_string()
+            } else {
+                spec.initial_path.clone()
+            };
             let nav = Nav::at(cwd.clone());
-            g.push(ActiveSession { conn: spec.clone(), cwd: cwd.clone(), nav: nav.clone() });
+            g.push(ActiveSession {
+                conn: spec.clone(),
+                cwd: cwd.clone(),
+                nav: nav.clone(),
+            });
             (cwd, nav)
         } else {
             return; // session no longer in the pool
@@ -2016,10 +2561,19 @@ fn show_session_in_pane(handle: &Handle, store: Arc<dyn CredentialStore>, sessio
         p[pane].cwd = cwd.clone();
         p[pane].nav = nav;
     }
-    let label = PaneState { kind: PaneKind::Remote, conn: Some(spec.clone()), cwd, nav: Nav::default() };
+    let label = PaneState {
+        kind: PaneKind::Remote,
+        conn: Some(spec.clone()),
+        cwd,
+        nav: Nav::default(),
+    };
     let _ = ui.upgrade().map(|ui| {
         set_pane_kind_label(&ui, pane, &label);
-        ui.set_active_pane(if pane == 0 { "local".into() } else { "remote".into() });
+        ui.set_active_pane(if pane == 0 {
+            "local".into()
+        } else {
+            "remote".into()
+        });
         refresh_sessions_model(&ui, &sessions);
     });
     refresh_pane(handle, store, panes, ui, pane);
@@ -2031,10 +2585,20 @@ fn save_pane_session(sessions: &Sessions, panes: &Panes, pane: usize) {
     let (id, cwd, nav, is_remote) = {
         let p = panes.lock().expect("panes");
         let s = &p[pane];
-        (s.conn.as_ref().map(|c| c.id), s.cwd.clone(), s.nav.clone(), matches!(s.kind, PaneKind::Remote))
+        (
+            s.conn.as_ref().map(|c| c.id),
+            s.cwd.clone(),
+            s.nav.clone(),
+            matches!(s.kind, PaneKind::Remote),
+        )
     };
     if let (true, Some(id)) = (is_remote, id) {
-        if let Some(s) = sessions.lock().expect("sessions").iter_mut().find(|s| s.conn.id == id) {
+        if let Some(s) = sessions
+            .lock()
+            .expect("sessions")
+            .iter_mut()
+            .find(|s| s.conn.id == id)
+        {
             s.cwd = cwd;
             s.nav = nav;
         }
@@ -2044,35 +2608,89 @@ fn save_pane_session(sessions: &Sessions, panes: &Panes, pane: usize) {
 /// Refresh the CONNECTED sidebar from the background session pool.
 fn refresh_sessions_model(ui: &App, sessions: &Sessions) {
     let demo = use_design_demo_connections();
-    let model: Vec<ConnRow> = sessions.lock().expect("sessions").iter().map(|s| ConnRow {
-        id: s.conn.id.0 as i32,
-        label: s.conn.name.clone().into(),
-        sub: if demo {
-            format!("{}:{}", s.conn.host, s.conn.port)
-        } else {
-            format!("{}@{}", s.conn.user, s.conn.host)
-        }.into(),
-        protocol: demo_protocol_label(&s.conn, demo).into(),
-        connected: true,
-    }).collect();
+    let model: Vec<ConnRow> = sessions
+        .lock()
+        .expect("sessions")
+        .iter()
+        .map(|s| ConnRow {
+            id: s.conn.id.0 as i32,
+            label: s.conn.name.clone().into(),
+            sub: if demo {
+                format!("{}:{}", s.conn.host, s.conn.port)
+            } else {
+                format!("{}@{}", s.conn.user, s.conn.host)
+            }
+            .into(),
+            protocol: demo_protocol_label(&s.conn, demo).into(),
+            connected: true,
+        })
+        .collect();
     ui.set_sessions(ModelRc::from(Rc::new(VecModel::from(model))));
     apply_server_filter(ui);
 }
 
 /// Click a CONNECTED session → swap it into the active pane (the previous session stays alive).
-fn switch_to_session(handle: &Handle, store: Arc<dyn CredentialStore>, sessions: Sessions, panes: Panes, ui: Weak<App>, pane: usize, conn_id: i32) {
-    let Some(spec) = sessions.lock().expect("sessions").iter().find(|s| s.conn.id.0 as i32 == conn_id).map(|s| s.conn.clone()) else { return };
+fn switch_to_session(
+    handle: &Handle,
+    store: Arc<dyn CredentialStore>,
+    sessions: Sessions,
+    panes: Panes,
+    ui: Weak<App>,
+    pane: usize,
+    conn_id: i32,
+) {
+    let Some(spec) = sessions
+        .lock()
+        .expect("sessions")
+        .iter()
+        .find(|s| s.conn.id.0 as i32 == conn_id)
+        .map(|s| s.conn.clone())
+    else {
+        return;
+    };
     show_session_in_pane(handle, store, sessions, panes, ui, pane, &spec, false);
 }
 
 /// Eject a session from the background pool entirely. Any pane currently showing it goes local.
-fn disconnect_session(engine: TransferEngine, sessions: Sessions, panes: Panes, ui: Weak<App>, conn_id: i32) {
+fn disconnect_session(
+    engine: TransferEngine,
+    sessions: Sessions,
+    panes: Panes,
+    ui: Weak<App>,
+    conn_id: i32,
+) {
     engine.abort(ConnectionId(conn_id as usize));
+    // Evict cached passwords for the ejected session(s): capture (host, user) BEFORE retain
+    // drops them. PASSWORD_CACHE values are Zeroizing<String> (wiped on drop), and evicting
+    // here bounds how long a cleartext password lives after the user ends the session — it does
+    // not sit in heap until process exit. (disconnect_pane does NOT evict: the session may still
+    // be alive in the background pool / another pane.)
+    let evicted: Vec<(String, String)> = sessions
+        .lock()
+        .expect("sessions")
+        .iter()
+        .filter(|s| s.conn.id.0 as i32 == conn_id)
+        .map(|s| (s.conn.host.clone(), s.conn.user.clone()))
+        .collect();
+    if !evicted.is_empty() {
+        if let Ok(mut c) = PASSWORD_CACHE.lock() {
+            for k in &evicted {
+                c.remove(k);
+            }
+        }
+    }
     // Note: per-pane delete-confirm re-arm happens via the set_pane_local() calls below for any
     // pane that was showing the ejected session; untouched panes keep their own setting.
-    sessions.lock().expect("sessions").retain(|s| s.conn.id.0 as i32 != conn_id);
+    sessions
+        .lock()
+        .expect("sessions")
+        .retain(|s| s.conn.id.0 as i32 != conn_id);
     for pane in 0..2 {
-        let shown = panes.lock().expect("panes")[pane].conn.as_ref().map(|c| c.id.0 as i32 == conn_id).unwrap_or(false);
+        let shown = panes.lock().expect("panes")[pane]
+            .conn
+            .as_ref()
+            .map(|c| c.id.0 as i32 == conn_id)
+            .unwrap_or(false);
         if shown {
             set_pane_local(panes.clone(), ui.clone(), pane);
         }
@@ -2096,7 +2714,12 @@ fn set_pane_local(panes: Panes, ui: Weak<App>, pane: usize) {
         p[pane].cwd = cwd.clone();
         p[pane].nav.reset(cwd.clone());
     }
-    let label = PaneState { kind: PaneKind::Local, conn: None, cwd: cwd.clone(), nav: Nav::default() };
+    let label = PaneState {
+        kind: PaneKind::Local,
+        conn: None,
+        cwd: cwd.clone(),
+        nav: Nav::default(),
+    };
     let _ = ui.upgrade().map(|ui| {
         set_pane_kind_label(&ui, pane, &label);
         list_local_pane(&ui, pane, &home, &cwd);
@@ -2133,7 +2756,12 @@ fn open_local_favorite(panes: Panes, ui: Weak<App>, path: String) {
         p[0].nav.reset(cwd.clone());
     }
 
-    let label = PaneState { kind: PaneKind::Local, conn: None, cwd: cwd.clone(), nav: Nav::default() };
+    let label = PaneState {
+        kind: PaneKind::Local,
+        conn: None,
+        cwd: cwd.clone(),
+        nav: Nav::default(),
+    };
     let _ = ui.upgrade().map(|ui| {
         ui.set_active_pane("local".into());
         set_pane_kind_label(&ui, 0, &label);
@@ -2221,12 +2849,17 @@ fn local_favorite_rows(settings: &store::settings::Settings) -> Vec<LocalFavorit
 
 fn refresh_local_favorites_model(ui: &App) {
     let settings = store::settings::load();
-    ui.set_local_favorites(ModelRc::from(Rc::new(VecModel::from(local_favorite_rows(&settings)))));
+    ui.set_local_favorites(ModelRc::from(Rc::new(VecModel::from(local_favorite_rows(
+        &settings,
+    )))));
 }
 
 fn add_local_favorite_from_pane(ui: &App, panes: Panes, source: String, index: i32) {
     let pane = if source == "remote" { 1 } else { 0 };
-    let Some(row) = (index >= 0).then(|| pane_entries(ui, pane).row_data(index as usize)).flatten() else {
+    let Some(row) = (index >= 0)
+        .then(|| pane_entries(ui, pane).row_data(index as usize))
+        .flatten()
+    else {
         return;
     };
     if !row.is_dir {
@@ -2255,7 +2888,10 @@ fn add_local_favorite_from_pane(ui: &App, panes: Panes, source: String, index: i
     let key = canonical_favorite_key(&path);
     let settings = store::settings::load();
     let mut paths = effective_local_favorite_paths(&settings);
-    let existing: HashSet<String> = paths.iter().map(|raw| canonical_favorite_key(&expand_local_favorite(raw))).collect();
+    let existing: HashSet<String> = paths
+        .iter()
+        .map(|raw| canonical_favorite_key(&expand_local_favorite(raw)))
+        .collect();
     if existing.contains(&key) {
         ui.set_error("".into());
         ui.set_status("Favorite already exists.".into());
@@ -2326,8 +2962,12 @@ fn transfer(
 ) {
     let Some(ui) = ui.upgrade() else { return };
     let sel = pane_selected(&ui, src_pane);
-    if sel < 0 { return; }
-    let Some(row) = pane_entries(&ui, src_pane).row_data(sel as usize) else { return };
+    if sel < 0 {
+        return;
+    }
+    let Some(row) = pane_entries(&ui, src_pane).row_data(sel as usize) else {
+        return;
+    };
     let name = row.name.to_string();
     let is_dir = row.is_dir;
     // Use the true u64 size from the sidecar (EntryRow.size is i32 and truncates >2 GiB);
@@ -2336,8 +2976,26 @@ fn transfer(
         .lock()
         .ok()
         .and_then(|g| g.get(&(src_pane, name.clone())).copied())
-        .or_else(|| if row.size > 0 { Some(row.size as u64) } else { None });
-    start_transfer(handle, store, panes, engine, idx, ui.as_weak(), src_pane, dst_pane, name, is_dir, total);
+        .or_else(|| {
+            if row.size > 0 {
+                Some(row.size as u64)
+            } else {
+                None
+            }
+        });
+    start_transfer(
+        handle,
+        store,
+        panes,
+        engine,
+        idx,
+        ui.as_weak(),
+        src_pane,
+        dst_pane,
+        name,
+        is_dir,
+        total,
+    );
 }
 
 /// Start a copy: for a single file, check the destination for a name clash and open the overwrite
@@ -2356,7 +3014,20 @@ fn start_transfer(
     total: Option<u64>,
 ) {
     if is_dir {
-        do_transfer(handle, store, panes, engine, idx, ui, src_pane, dst_pane, name.clone(), name, is_dir, total);
+        do_transfer(
+            handle,
+            store,
+            panes,
+            engine,
+            idx,
+            ui,
+            src_pane,
+            dst_pane,
+            name.clone(),
+            name,
+            is_dir,
+            total,
+        );
         return;
     }
     let (dst_kind, dst_conn, dst_cwd) = {
@@ -2385,9 +3056,15 @@ fn start_transfer(
                         Ok(b) => b,
                         // A connect/list failure must NOT read as "does not exist" — that would
                         // risk a silent overwrite. Surface the error and abort this copy.
-                        Err(e) => { set_err(&ui, &e.to_string()); return; }
+                        Err(e) => {
+                            set_err(&ui, &e.to_string());
+                            return;
+                        }
                     },
-                    None => { set_err(&ui, "missing credential"); return; }
+                    None => {
+                        set_err(&ui, "missing credential");
+                        return;
+                    }
                 },
                 None => false,
             },
@@ -2406,7 +3083,20 @@ fn start_transfer(
             });
         } else {
             let _ = slint::invoke_from_event_loop(move || {
-                do_transfer(&h, store2, panes, engine, idx, ui, src_pane, dst_pane, name.clone(), name, is_dir, total);
+                do_transfer(
+                    &h,
+                    store2,
+                    panes,
+                    engine,
+                    idx,
+                    ui,
+                    src_pane,
+                    dst_pane,
+                    name.clone(),
+                    name,
+                    is_dir,
+                    total,
+                );
             });
         }
     });
@@ -2435,8 +3125,16 @@ fn do_transfer(
     total: Option<u64>,
 ) {
     let Some(ui) = ui.upgrade() else { return };
-    let (src_kind, src_conn, src_cwd) = { let p = panes.lock().expect("panes"); let s = &p[src_pane]; (s.kind.clone(), s.conn.clone(), s.cwd.clone()) };
-    let (dst_kind, dst_conn, dst_cwd) = { let p = panes.lock().expect("panes"); let s = &p[dst_pane]; (s.kind.clone(), s.conn.clone(), s.cwd.clone()) };
+    let (src_kind, src_conn, src_cwd) = {
+        let p = panes.lock().expect("panes");
+        let s = &p[src_pane];
+        (s.kind.clone(), s.conn.clone(), s.cwd.clone())
+    };
+    let (dst_kind, dst_conn, dst_cwd) = {
+        let p = panes.lock().expect("panes");
+        let s = &p[dst_pane];
+        (s.kind.clone(), s.conn.clone(), s.cwd.clone())
+    };
     let src_local = PathBuf::from(&src_cwd).join(&src_name);
     let src_remote = join_remote(PathBuf::from(&src_cwd).join(&src_name));
     let dst_local = PathBuf::from(&dst_cwd).join(&dst_name);
@@ -2451,7 +3149,9 @@ fn do_transfer(
             let (h2, st2, pn2) = (handle.clone(), store.clone(), panes.clone());
             ui.set_status("copying…".into());
             handle.spawn(async move {
-                let n = tokio::task::spawn_blocking(move || fs_copy_tree(&src2, &dst2)).await.unwrap_or(0);
+                let n = tokio::task::spawn_blocking(move || fs_copy_tree(&src2, &dst2))
+                    .await
+                    .unwrap_or(0);
                 let _ = slint::invoke_from_event_loop(move || {
                     if let Some(ui) = ui_weak.upgrade() {
                         ui.set_status(format!("copied {n} files").into());
@@ -2466,7 +3166,17 @@ fn do_transfer(
         (PaneKind::Local, PaneKind::Remote) => {
             let Some(spec) = dst_conn else { return };
             if !is_dir {
-                enqueue(&engine, &ui, &idx, spec, TransferDirection::Upload, src_local, dst_remote, &dst_name, total);
+                enqueue(
+                    &engine,
+                    &ui,
+                    &idx,
+                    spec,
+                    TransferDirection::Upload,
+                    src_local,
+                    dst_remote,
+                    &dst_name,
+                    total,
+                );
             } else {
                 copy_local_to_remote(handle, engine, idx, ui_weak, spec, src_local, dst_remote);
             }
@@ -2474,15 +3184,43 @@ fn do_transfer(
         (PaneKind::Remote, PaneKind::Local) => {
             let Some(spec) = src_conn else { return };
             if !is_dir {
-                enqueue(&engine, &ui, &idx, spec, TransferDirection::Download, dst_local, src_remote, &dst_name, total);
+                enqueue(
+                    &engine,
+                    &ui,
+                    &idx,
+                    spec,
+                    TransferDirection::Download,
+                    dst_local,
+                    src_remote,
+                    &dst_name,
+                    total,
+                );
             } else {
-                copy_remote_to_local(handle, store, engine, idx, ui_weak, spec, src_remote, dst_local);
+                copy_remote_to_local(
+                    handle, store, engine, idx, ui_weak, spec, src_remote, dst_local,
+                );
             }
         }
         (PaneKind::Remote, PaneKind::Remote) => {
-            let (Some(src_spec), Some(dst_spec)) = (src_conn, dst_conn) else { return };
+            let (Some(src_spec), Some(dst_spec)) = (src_conn, dst_conn) else {
+                return;
+            };
             // relay through a temp dir: download from src, then upload to dst
-            copy_remote_to_remote(handle, store, engine, idx, ui_weak, panes.clone(), src_spec, dst_spec, src_remote, dst_remote, dst_name.clone(), is_dir, total.unwrap_or(0));
+            copy_remote_to_remote(
+                handle,
+                store,
+                engine,
+                idx,
+                ui_weak,
+                panes.clone(),
+                src_spec,
+                dst_spec,
+                src_remote,
+                dst_remote,
+                dst_name.clone(),
+                is_dir,
+                total.unwrap_or(0),
+            );
         }
     }
 }
@@ -2504,7 +3242,17 @@ fn do_external_upload(
     if is_dir {
         copy_local_to_remote(handle, engine, idx, ui, spec, source, remote);
     } else if let Some(u) = ui.upgrade() {
-        enqueue(&engine, &u, &idx, spec, TransferDirection::Upload, source, remote, &name, size);
+        enqueue(
+            &engine,
+            &u,
+            &idx,
+            spec,
+            TransferDirection::Upload,
+            source,
+            remote,
+            &name,
+            size,
+        );
     }
 }
 
@@ -2518,37 +3266,69 @@ fn resolve_overwrite(
     ui: Weak<App>,
     decision: i32,
 ) {
-    if let Some(ui) = ui.upgrade() { ui.set_overwrite_open(false); }
+    if let Some(ui) = ui.upgrade() {
+        ui.set_overwrite_open(false);
+    }
     // Finder→server uploads blocked on the dialog are a FIFO queue (a multi-file drop may contain
     // several conflicting names — confirmed one at a time). Pop the one currently shown; after
     // resolving it, show the next if any. Checked before the in-app copy pending.
-    let item = PENDING_EXTERNAL_UPLOAD.lock().ok().and_then(|mut g| g.pop_front());
+    let item = PENDING_EXTERNAL_UPLOAD
+        .lock()
+        .ok()
+        .and_then(|mut g| g.pop_front());
     if let Some((spec, source, remote_dir, name, size, is_dir)) = item {
         match decision {
             1 => {
                 // overwrite
                 let remote = join_remote(PathBuf::from(&remote_dir).join(&name));
-                do_external_upload(handle, engine, idx, ui.clone(), spec, source, remote, name, size, is_dir);
+                do_external_upload(
+                    handle,
+                    engine,
+                    idx,
+                    ui.clone(),
+                    spec,
+                    source,
+                    remote,
+                    name,
+                    size,
+                    is_dir,
+                );
             }
             2 => {
                 // save under a new (auto-suffixed) remote name
                 let (h, en, ix, uw, st, sp, rd, nm) = (
-                    handle.clone(), engine.clone(), idx.clone(), ui.clone(), store.clone(),
-                    spec.clone(), remote_dir.clone(), name.clone(),
+                    handle.clone(),
+                    engine.clone(),
+                    idx.clone(),
+                    ui.clone(),
+                    store.clone(),
+                    spec.clone(),
+                    remote_dir.clone(),
+                    name.clone(),
                 );
                 handle.spawn(async move {
                     let dst_kind = PaneKind::Remote;
                     let new_name = unique_dest_name(&nm, &dst_kind, Some(&sp), &rd, &st).await;
                     let remote = join_remote(PathBuf::from(&rd).join(&new_name));
                     let _ = slint::invoke_from_event_loop(move || {
-                        do_external_upload(&h, en, ix, uw, sp, source, remote, new_name, size, is_dir);
+                        do_external_upload(
+                            &h, en, ix, uw, sp, source, remote, new_name, size, is_dir,
+                        );
                     });
                 });
             }
-            _ => { if let Some(u) = ui.upgrade() { u.set_status("cancelled".into()); } } // 0 = cancel
+            _ => {
+                if let Some(u) = ui.upgrade() {
+                    u.set_status("cancelled".into());
+                }
+            } // 0 = cancel
         }
         // show the next queued conflict, if any (tuple field index 3 == name)
-        if let Some(next) = PENDING_EXTERNAL_UPLOAD.lock().ok().and_then(|g| g.front().cloned()) {
+        if let Some(next) = PENDING_EXTERNAL_UPLOAD
+            .lock()
+            .ok()
+            .and_then(|g| g.front().cloned())
+        {
             if let Some(u) = ui.upgrade() {
                 u.set_overwrite_name(next.3.into());
                 u.set_overwrite_open(true);
@@ -2558,9 +3338,24 @@ fn resolve_overwrite(
     }
     // in-app copy
     let pending = PENDING_COPY.lock().ok().and_then(|mut g| g.take());
-    let Some((src_pane, dst_pane, name, is_dir, total)) = pending else { return };
+    let Some((src_pane, dst_pane, name, is_dir, total)) = pending else {
+        return;
+    };
     match decision {
-        1 => do_transfer(handle, store, panes, engine, idx, ui, src_pane, dst_pane, name.clone(), name, is_dir, total),
+        1 => do_transfer(
+            handle,
+            store,
+            panes,
+            engine,
+            idx,
+            ui,
+            src_pane,
+            dst_pane,
+            name.clone(),
+            name,
+            is_dir,
+            total,
+        ),
         2 => {
             let (dst_kind, dst_conn, dst_cwd) = {
                 let p = panes.lock().expect("panes");
@@ -2570,17 +3365,25 @@ fn resolve_overwrite(
             let store2 = store.clone();
             let h = handle.clone();
             handle.spawn(async move {
-                let new_name = unique_dest_name(&name, &dst_kind, dst_conn.as_ref(), &dst_cwd, &store2).await;
+                let new_name =
+                    unique_dest_name(&name, &dst_kind, dst_conn.as_ref(), &dst_cwd, &store2).await;
                 // Keep the ORIGINAL name as the source; `new_name` names only the destination.
                 // Building the source path from `new_name` pointed RETR/STOR at a file that does
                 // not exist at the source and left the transfer stuck on "queued".
                 let src_name = name;
                 let _ = slint::invoke_from_event_loop(move || {
-                    do_transfer(&h, store2, panes, engine, idx, ui, src_pane, dst_pane, src_name, new_name, is_dir, total);
+                    do_transfer(
+                        &h, store2, panes, engine, idx, ui, src_pane, dst_pane, src_name, new_name,
+                        is_dir, total,
+                    );
                 });
             });
         }
-        _ => { if let Some(ui) = ui.upgrade() { ui.set_status("cancelled".into()); } } // 0 = cancel
+        _ => {
+            if let Some(ui) = ui.upgrade() {
+                ui.set_status("cancelled".into());
+            }
+        } // 0 = cancel
     }
 }
 
@@ -2613,8 +3416,9 @@ async fn unique_dest_name(
                 if let Some(pw) = password_for(store, spec) {
                     let mut s = spec.clone();
                     s.initial_path = dst_cwd.to_string();
-                    if let Ok(entries) = net::connect_and_list(&s, &pw).await {
-                        let taken: std::collections::HashSet<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+                    if let Ok((entries, _)) = net::connect_and_list(&s, &pw).await {
+                        let taken: std::collections::HashSet<&str> =
+                            entries.iter().map(|e| e.name.as_str()).collect();
                         for c in &candidates {
                             if !taken.contains(c.as_str()) {
                                 return c.clone();
@@ -2625,14 +3429,39 @@ async fn unique_dest_name(
             }
         }
     }
-    candidates.into_iter().next().unwrap_or_else(|| format!("{} new{}", stem, ext))
+    candidates
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| format!("{} new{}", stem, ext))
 }
 
 /// Wire the overwrite-conflict dialog buttons.
-fn wire_overwrite(ui: &App, handle: &Handle, store: Arc<dyn CredentialStore>, panes: Panes, engine: TransferEngine, idx: Arc<Mutex<HashMap<i32, usize>>>) {
-    let (h, st, pn, en, ix, uw) = (handle.clone(), store.clone(), panes.clone(), engine.clone(), idx.clone(), ui.as_weak());
+fn wire_overwrite(
+    ui: &App,
+    handle: &Handle,
+    store: Arc<dyn CredentialStore>,
+    panes: Panes,
+    engine: TransferEngine,
+    idx: Arc<Mutex<HashMap<i32, usize>>>,
+) {
+    let (h, st, pn, en, ix, uw) = (
+        handle.clone(),
+        store.clone(),
+        panes.clone(),
+        engine.clone(),
+        idx.clone(),
+        ui.as_weak(),
+    );
     ui.on_resolve_overwrite(move |decision| {
-        resolve_overwrite(&h, st.clone(), pn.clone(), en.clone(), ix.clone(), uw.clone(), decision);
+        resolve_overwrite(
+            &h,
+            st.clone(),
+            pn.clone(),
+            en.clone(),
+            ix.clone(),
+            uw.clone(),
+            decision,
+        );
     });
 }
 
@@ -2721,28 +3550,67 @@ fn wire_send_sync(ui: &App, store: Arc<dyn CredentialStore>, conns: ConnList) {
 }
 
 /// Local → Remote folder: walk local, enqueue one upload per file (mkdir -p on the server).
-fn copy_local_to_remote(handle: &Handle, engine: TransferEngine, idx: Arc<Mutex<HashMap<i32, usize>>>, ui: Weak<App>, spec: ConnectionSpec, local_base: PathBuf, remote_base: String) {
+fn copy_local_to_remote(
+    handle: &Handle,
+    engine: TransferEngine,
+    idx: Arc<Mutex<HashMap<i32, usize>>>,
+    ui: Weak<App>,
+    spec: ConnectionSpec,
+    local_base: PathBuf,
+    remote_base: String,
+) {
     let (engine2, idx2, uw, lb) = (engine.clone(), idx.clone(), ui.clone(), local_base.clone());
-    let _ = ui.upgrade().map(|u| u.set_status("preparing folder upload…".into()));
+    let _ = ui
+        .upgrade()
+        .map(|u| u.set_status("preparing folder upload…".into()));
     handle.spawn(async move {
-        let files = tokio::task::spawn_blocking(move || walk_local(&lb)).await.unwrap_or_default();
+        let files = tokio::task::spawn_blocking(move || walk_local(&lb))
+            .await
+            .unwrap_or_default();
         let _ = slint::invoke_from_event_loop(move || {
             let Some(ui) = uw.upgrade() else { return };
-            if files.is_empty() { ui.set_status("folder is empty".into()); return; }
+            if files.is_empty() {
+                ui.set_status("folder is empty".into());
+                return;
+            }
             ui.set_status(format!("uploading {} files…", files.len()).into());
             for (lp, rel, size) in &files {
                 let rp = join_remote(PathBuf::from(&remote_base).join(rel));
-                enqueue(&engine2, &ui, &idx2, spec.clone(), TransferDirection::Upload, lp.clone(), rp, rel, if *size > 0 { Some(*size) } else { None });
+                enqueue(
+                    &engine2,
+                    &ui,
+                    &idx2,
+                    spec.clone(),
+                    TransferDirection::Upload,
+                    lp.clone(),
+                    rp,
+                    rel,
+                    if *size > 0 { Some(*size) } else { None },
+                );
             }
         });
     });
 }
 
 /// Remote → Local folder: walk remote, enqueue one download per file (mkdir -p local).
-fn copy_remote_to_local(handle: &Handle, store: Arc<dyn CredentialStore>, engine: TransferEngine, idx: Arc<Mutex<HashMap<i32, usize>>>, ui: Weak<App>, spec: ConnectionSpec, remote_base: String, local_base: PathBuf) {
-    let Some(password) = password_for(&store, &spec) else { set_err(&ui, "missing credential"); return };
+fn copy_remote_to_local(
+    handle: &Handle,
+    store: Arc<dyn CredentialStore>,
+    engine: TransferEngine,
+    idx: Arc<Mutex<HashMap<i32, usize>>>,
+    ui: Weak<App>,
+    spec: ConnectionSpec,
+    remote_base: String,
+    local_base: PathBuf,
+) {
+    let Some(password) = password_for(&store, &spec) else {
+        set_err(&ui, "missing credential");
+        return;
+    };
     let (engine2, idx2, uw, rb) = (engine.clone(), idx.clone(), ui.clone(), remote_base.clone());
-    let _ = ui.upgrade().map(|u| u.set_status("preparing folder download…".into()));
+    let _ = ui
+        .upgrade()
+        .map(|u| u.set_status("preparing folder download…".into()));
     handle.spawn(async move {
         let files = net::walk_remote(&spec, &password, &rb).await;
         let _ = slint::invoke_from_event_loop(move || {
@@ -2791,7 +3659,15 @@ fn copy_remote_to_local(handle: &Handle, store: Arc<dyn CredentialStore>, engine
 /// Relay one file: download src→temp (any protocol), then upload temp→dst (any protocol).
 /// Retries once after a short delay — many shared-hosting FTP servers limit concurrent
 /// sessions and need a moment to release the slot after the browsing connection's quit().
-async fn relay_one(src_spec: &ConnectionSpec, pw_src: &str, dst_spec: &ConnectionSpec, pw_dst: &str, rp: &str, tmpf: &Path, dst_rp: &str) -> Result<(), String> {
+async fn relay_one(
+    src_spec: &ConnectionSpec,
+    pw_src: &str,
+    dst_spec: &ConnectionSpec,
+    pw_dst: &str,
+    rp: &str,
+    tmpf: &Path,
+    dst_rp: &str,
+) -> Result<(), String> {
     // 1. Download src → temp (retry once)
     let dl = relay_download(src_spec, pw_src, rp, tmpf).await;
     if dl.is_err() {
@@ -2799,12 +3675,8 @@ async fn relay_one(src_spec: &ConnectionSpec, pw_src: &str, dst_spec: &Connectio
         tokio::time::sleep(std::time::Duration::from_millis(800)).await;
         relay_download(src_spec, pw_src, rp, tmpf).await?;
     }
-    // Verify temp file has content
-    let local_size = std::fs::metadata(tmpf).map(|m| m.len()).unwrap_or(0);
-    if local_size == 0 {
-        let _ = std::fs::remove_file(tmpf);
-        return Err("downloaded file is empty".to_string());
-    }
+    // Note: a 0-byte temp file here is a LEGITIMATE empty remote file (a failed download
+    // already returned Err above), so it must be relayed like any other file — do NOT reject it.
     // 2. Pause to let the src server release the session slot
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     // 3. Upload temp → dst (FTPS first, plaintext fallback)
@@ -2817,23 +3689,39 @@ async fn relay_one(src_spec: &ConnectionSpec, pw_src: &str, dst_spec: &Connectio
     Ok(())
 }
 
-async fn relay_download(spec: &ConnectionSpec, pw: &str, remote: &str, local: &Path) -> Result<(), String> {
+async fn relay_download(
+    spec: &ConnectionSpec,
+    pw: &str,
+    remote: &str,
+    local: &Path,
+) -> Result<(), String> {
     match spec.protocol {
         Protocol::Ftp => {
-            let (s, p, r, t) = (spec.clone(), pw.to_string(), remote.to_string(), local.to_path_buf());
-            tokio::time::timeout(std::time::Duration::from_secs(30),
-                tokio::task::spawn_blocking(move || net::ftp::download(&s, &p, &r, &t, |_| {}, None)))
-                .await
-                .map_err(|_| "download timeout (30s)".to_string())?
-                .map_err(|e| e.to_string())?
-                .map_err(|e| e.to_string())?;
+            let (s, p, r, t) = (
+                spec.clone(),
+                pw.to_string(),
+                remote.to_string(),
+                local.to_path_buf(),
+            );
+            tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                tokio::task::spawn_blocking(move || {
+                    net::ftp::download(&s, &p, &r, &t, |_| {}, None)
+                }),
+            )
+            .await
+            .map_err(|_| "download timeout (30s)".to_string())?
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
         }
         Protocol::Sftp => {
-            tokio::time::timeout(std::time::Duration::from_secs(30),
-                net::sftp::download(spec, pw, remote, local, |_| {}, None))
-                .await
-                .map_err(|_| "download timeout (30s)".to_string())?
-                .map_err(|e| e.to_string())?;
+            tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                net::sftp::download(spec, pw, remote, local, |_| {}, None),
+            )
+            .await
+            .map_err(|_| "download timeout (30s)".to_string())?
+            .map_err(|e| e.to_string())?;
         }
     }
     Ok(())
@@ -2844,23 +3732,37 @@ async fn relay_download(spec: &ConnectionSpec, pw: &str, remote: &str, local: &P
 /// divergences from the proven path: PROT C deadlocks the data channel on many servers (a
 /// 20s stall every copy), and the plaintext fallback hit 5xx ("filename only letters/numbers",
 /// "no file name") on real hosts. There is no reason to differ from disk→FTP, so we don't.
-async fn relay_upload(spec: &ConnectionSpec, pw: &str, local: &Path, remote: &str) -> Result<(), String> {
+async fn relay_upload(
+    spec: &ConnectionSpec,
+    pw: &str,
+    local: &Path,
+    remote: &str,
+) -> Result<(), String> {
     match spec.protocol {
         Protocol::Ftp => {
-            let (s, p, r, t) = (spec.clone(), pw.to_string(), remote.to_string(), local.to_path_buf());
-            tokio::time::timeout(std::time::Duration::from_secs(30),
-                tokio::task::spawn_blocking(move || net::ftp::upload(&s, &p, &t, &r, |_| {}, None)))
-                .await
-                .map_err(|_| "upload timeout (30s)".to_string())?
-                .map_err(|e| e.to_string())?
-                .map_err(|e| e.to_string())?;
+            let (s, p, r, t) = (
+                spec.clone(),
+                pw.to_string(),
+                remote.to_string(),
+                local.to_path_buf(),
+            );
+            tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                tokio::task::spawn_blocking(move || net::ftp::upload(&s, &p, &t, &r, |_| {}, None)),
+            )
+            .await
+            .map_err(|_| "upload timeout (30s)".to_string())?
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
         }
         Protocol::Sftp => {
-            tokio::time::timeout(std::time::Duration::from_secs(30),
-                net::sftp::upload(spec, pw, local, remote, |_| {}, None))
-                .await
-                .map_err(|_| "upload timeout (30s)".to_string())?
-                .map_err(|e| e.to_string())?;
+            tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                net::sftp::upload(spec, pw, local, remote, |_| {}, None),
+            )
+            .await
+            .map_err(|_| "upload timeout (30s)".to_string())?
+            .map_err(|e| e.to_string())?;
         }
     }
     Ok(())
@@ -2868,9 +3770,29 @@ async fn relay_upload(spec: &ConnectionSpec, pw: &str, local: &Path, remote: &st
 
 /// Remote → Remote: relay each file through a temp dir in ONE sequential task (download then
 /// upload per file), so the upload always runs after its download — no engine-job-ordering race.
-fn copy_remote_to_remote(handle: &Handle, store: Arc<dyn CredentialStore>, _engine: TransferEngine, idx: Arc<Mutex<HashMap<i32, usize>>>, ui: Weak<App>, panes: Panes, src_spec: ConnectionSpec, dst_spec: ConnectionSpec, src_base: String, dst_base: String, name: String, is_dir: bool, size: u64) {
-    let Some(pw_src) = password_for(&store, &src_spec) else { set_err(&ui, "missing src credential"); return };
-    let Some(pw_dst) = password_for(&store, &dst_spec) else { set_err(&ui, "missing dst credential"); return };
+fn copy_remote_to_remote(
+    handle: &Handle,
+    store: Arc<dyn CredentialStore>,
+    _engine: TransferEngine,
+    idx: Arc<Mutex<HashMap<i32, usize>>>,
+    ui: Weak<App>,
+    panes: Panes,
+    src_spec: ConnectionSpec,
+    dst_spec: ConnectionSpec,
+    src_base: String,
+    dst_base: String,
+    name: String,
+    is_dir: bool,
+    size: u64,
+) {
+    let Some(pw_src) = password_for(&store, &src_spec) else {
+        set_err(&ui, "missing src credential");
+        return;
+    };
+    let Some(pw_dst) = password_for(&store, &dst_spec) else {
+        set_err(&ui, "missing dst credential");
+        return;
+    };
     let ui_weak = ui.clone();
     // clones captured by the task so it can refresh both panes once the relay finishes
     let (handle_r, store_r, panes_r) = (handle.clone(), store.clone(), panes.clone());
@@ -2939,9 +3861,14 @@ fn copy_remote_to_remote(handle: &Handle, store: Arc<dyn CredentialStore>, _engi
 
 /// Recursively copy a local file/tree to a local destination. Returns file count.
 fn fs_copy_tree(src: &Path, dst: &Path) -> usize {
-    let md = match std::fs::metadata(src) { Ok(m) => m, Err(_) => return 0 };
+    let md = match std::fs::metadata(src) {
+        Ok(m) => m,
+        Err(_) => return 0,
+    };
     if !md.is_dir() {
-        if let Some(p) = dst.parent() { let _ = std::fs::create_dir_all(p); }
+        if let Some(p) = dst.parent() {
+            let _ = std::fs::create_dir_all(p);
+        }
         let _ = std::fs::copy(src, dst);
         return 1;
     }
@@ -2953,8 +3880,12 @@ fn fs_copy_tree(src: &Path, dst: &Path) -> usize {
             for e in rd.flatten() {
                 let path = e.path();
                 let dest = d.join(e.file_name());
-                if path.is_dir() { stack.push((path, dest)); }
-                else { let _ = std::fs::copy(&path, &dest); n += 1; }
+                if path.is_dir() {
+                    stack.push((path, dest));
+                } else {
+                    let _ = std::fs::copy(&path, &dest);
+                    n += 1;
+                }
             }
         }
     }
@@ -2964,8 +3895,8 @@ fn fs_copy_tree(src: &Path, dst: &Path) -> usize {
 fn password_for(store: &Arc<dyn CredentialStore>, spec: &ConnectionSpec) -> Option<String> {
     let key = (spec.host.clone(), spec.user.clone());
     if let Ok(cache) = PASSWORD_CACHE.lock() {
-        if let Some(p) = cache.get(&key).cloned() {
-            return Some(p); // cached — no Keychain read, no macOS prompt
+        if let Some(p) = cache.get(&key) {
+            return Some(p.to_string()); // Zeroizing<String> derefs to String; cached → no Keychain prompt
         }
     }
     tracing::debug!(target: "gmacftp::creds", host = %spec.host, user = %spec.user, "credential lookup (private vault; silent — no Keychain prompt)");
@@ -2974,7 +3905,7 @@ fn password_for(store: &Arc<dyn CredentialStore>, spec: &ConnectionSpec) -> Opti
         .ok()
         .map(|b| String::from_utf8_lossy(&b).into_owned())?;
     if let Ok(mut cache) = PASSWORD_CACHE.lock() {
-        cache.insert(key, p.clone());
+        cache.insert(key, Zeroizing::new(p.clone()));
     }
     Some(p)
 }
@@ -2983,20 +3914,40 @@ fn password_for(store: &Arc<dyn CredentialStore>, spec: &ConnectionSpec) -> Opti
 
 // ── pane-indexed navigation (kind-aware: Local = fs path, Remote = joined remote path) ──
 
-fn navigate_pane(handle: &Handle, store: Arc<dyn CredentialStore>, panes: Panes, ui: Weak<App>, pane: usize, name: String) {
+fn navigate_pane(
+    handle: &Handle,
+    store: Arc<dyn CredentialStore>,
+    panes: Panes,
+    ui: Weak<App>,
+    pane: usize,
+    name: String,
+) {
     let next = {
         let p = panes.lock().expect("panes");
         let cwd = p[pane].cwd.clone();
         match p[pane].kind {
             PaneKind::Local => {
                 let path = if name == ".." {
-                    PathBuf::from(&cwd).parent().map(|x| x.to_path_buf()).unwrap_or_else(|| PathBuf::from(&cwd))
-                } else { PathBuf::from(&cwd).join(name.as_str()) };
+                    PathBuf::from(&cwd)
+                        .parent()
+                        .map(|x| x.to_path_buf())
+                        .unwrap_or_else(|| PathBuf::from(&cwd))
+                } else {
+                    PathBuf::from(&cwd).join(name.as_str())
+                };
                 path.to_string_lossy().to_string()
             }
             PaneKind::Remote => {
-                if name == ".." { join_remote(Path::new(&cwd).parent().map(|x| x.to_path_buf()).unwrap_or_else(|| PathBuf::from("/"))) }
-                else { join_remote(PathBuf::from(&cwd).join(name.as_str())) }
+                if name == ".." {
+                    join_remote(
+                        Path::new(&cwd)
+                            .parent()
+                            .map(|x| x.to_path_buf())
+                            .unwrap_or_else(|| PathBuf::from("/")),
+                    )
+                } else {
+                    join_remote(PathBuf::from(&cwd).join(name.as_str()))
+                }
             }
         }
     };
@@ -3008,40 +3959,112 @@ fn navigate_pane(handle: &Handle, store: Arc<dyn CredentialStore>, panes: Panes,
     refresh_pane(handle, store, panes, ui, pane);
 }
 
-fn nav_pane_back(handle: &Handle, store: Arc<dyn CredentialStore>, panes: Panes, ui: Weak<App>, pane: usize) {
-    let target = { let mut p = panes.lock().expect("panes"); let t = p[pane].nav.back(); if let Some(ref t) = t { p[pane].cwd = t.clone(); } t };
-    if target.is_some() { refresh_pane(handle, store, panes, ui, pane); }
+fn nav_pane_back(
+    handle: &Handle,
+    store: Arc<dyn CredentialStore>,
+    panes: Panes,
+    ui: Weak<App>,
+    pane: usize,
+) {
+    let target = {
+        let mut p = panes.lock().expect("panes");
+        let t = p[pane].nav.back();
+        if let Some(ref t) = t {
+            p[pane].cwd = t.clone();
+        }
+        t
+    };
+    if target.is_some() {
+        refresh_pane(handle, store, panes, ui, pane);
+    }
 }
-fn nav_pane_forward(handle: &Handle, store: Arc<dyn CredentialStore>, panes: Panes, ui: Weak<App>, pane: usize) {
-    let target = { let mut p = panes.lock().expect("panes"); let t = p[pane].nav.forward(); if let Some(ref t) = t { p[pane].cwd = t.clone(); } t };
-    if target.is_some() { refresh_pane(handle, store, panes, ui, pane); }
+fn nav_pane_forward(
+    handle: &Handle,
+    store: Arc<dyn CredentialStore>,
+    panes: Panes,
+    ui: Weak<App>,
+    pane: usize,
+) {
+    let target = {
+        let mut p = panes.lock().expect("panes");
+        let t = p[pane].nav.forward();
+        if let Some(ref t) = t {
+            p[pane].cwd = t.clone();
+        }
+        t
+    };
+    if target.is_some() {
+        refresh_pane(handle, store, panes, ui, pane);
+    }
 }
-fn nav_pane_up(handle: &Handle, store: Arc<dyn CredentialStore>, panes: Panes, ui: Weak<App>, pane: usize) {
+fn nav_pane_up(
+    handle: &Handle,
+    store: Arc<dyn CredentialStore>,
+    panes: Panes,
+    ui: Weak<App>,
+    pane: usize,
+) {
     let parent = {
         let p = panes.lock().expect("panes");
         let cwd = p[pane].cwd.clone();
         match p[pane].kind {
-            PaneKind::Local => PathBuf::from(&cwd).parent().map(|x| x.to_string_lossy().to_string()).unwrap_or(cwd),
-            PaneKind::Remote => join_remote(Path::new(&cwd).parent().map(|x| x.to_path_buf()).unwrap_or_else(|| PathBuf::from("/"))),
+            PaneKind::Local => PathBuf::from(&cwd)
+                .parent()
+                .map(|x| x.to_string_lossy().to_string())
+                .unwrap_or(cwd),
+            PaneKind::Remote => join_remote(
+                Path::new(&cwd)
+                    .parent()
+                    .map(|x| x.to_path_buf())
+                    .unwrap_or_else(|| PathBuf::from("/")),
+            ),
         }
     };
-    { let mut p = panes.lock().expect("panes"); p[pane].nav.go(parent.clone()); p[pane].cwd = parent; }
+    {
+        let mut p = panes.lock().expect("panes");
+        p[pane].nav.go(parent.clone());
+        p[pane].cwd = parent;
+    }
     refresh_pane(handle, store, panes, ui, pane);
 }
 
 // ── callback wiring ───────────────────────────────────────────────────────────
 
 /// Connect a server into the ACTIVE pane (used by command palette / manager / auto-connect).
-fn do_connect(handle: &Handle, store: Arc<dyn CredentialStore>, conns: ConnList, sessions: Sessions, panes: Panes, ui: Weak<App>, id: i32) {
+fn do_connect(
+    handle: &Handle,
+    store: Arc<dyn CredentialStore>,
+    conns: ConnList,
+    sessions: Sessions,
+    panes: Panes,
+    ui: Weak<App>,
+    id: i32,
+) {
     let pane = ui.upgrade().map(|u| active_pane_idx(&u)).unwrap_or(1);
     connect_into_pane(handle, store, conns, sessions, panes, ui, pane, id);
 }
 
-fn wire_connect(ui: &App, handle: &Handle, store: Arc<dyn CredentialStore>, conns: ConnList, sessions: Sessions, panes: Panes) {
+fn wire_connect(
+    ui: &App,
+    handle: &Handle,
+    store: Arc<dyn CredentialStore>,
+    conns: ConnList,
+    sessions: Sessions,
+    panes: Panes,
+) {
     let (handle, ui_weak) = (handle.clone(), ui.as_weak());
     ui.on_connect_to(move |id| {
         let pane = ui_weak.upgrade().map(|u| active_pane_idx(&u)).unwrap_or(1);
-        connect_into_pane(&handle, store.clone(), conns.clone(), sessions.clone(), panes.clone(), ui_weak.clone(), pane, id);
+        connect_into_pane(
+            &handle,
+            store.clone(),
+            conns.clone(),
+            sessions.clone(),
+            panes.clone(),
+            ui_weak.clone(),
+            pane,
+            id,
+        );
     });
 }
 
@@ -3054,26 +4077,57 @@ fn wire_refresh(ui: &App, handle: &Handle, store: Arc<dyn CredentialStore>, pane
 }
 
 /// Wire navigate + back/forward/up for one pane (0 → navigate_local/nav_local_*, 1 → remote).
-fn wire_nav_pane(ui: &App, handle: &Handle, store: Arc<dyn CredentialStore>, panes: Panes, pane: usize) {
+fn wire_nav_pane(
+    ui: &App,
+    handle: &Handle,
+    store: Arc<dyn CredentialStore>,
+    panes: Panes,
+    pane: usize,
+) {
     {
         let (h, st, pn, uw) = (handle.clone(), store.clone(), panes.clone(), ui.as_weak());
-        let cb = move |name: slint::SharedString| navigate_pane(&h, st.clone(), pn.clone(), uw.clone(), pane, name.to_string());
-        if pane == 0 { ui.on_navigate_local(cb); } else { ui.on_navigate_remote(cb); }
+        let cb = move |name: slint::SharedString| {
+            navigate_pane(
+                &h,
+                st.clone(),
+                pn.clone(),
+                uw.clone(),
+                pane,
+                name.to_string(),
+            )
+        };
+        if pane == 0 {
+            ui.on_navigate_local(cb);
+        } else {
+            ui.on_navigate_remote(cb);
+        }
     }
     {
         let (h, st, pn, uw) = (handle.clone(), store.clone(), panes.clone(), ui.as_weak());
         let cb = move || nav_pane_back(&h, st.clone(), pn.clone(), uw.clone(), pane);
-        if pane == 0 { ui.on_nav_local_back(cb); } else { ui.on_nav_remote_back(cb); }
+        if pane == 0 {
+            ui.on_nav_local_back(cb);
+        } else {
+            ui.on_nav_remote_back(cb);
+        }
     }
     {
         let (h, st, pn, uw) = (handle.clone(), store.clone(), panes.clone(), ui.as_weak());
         let cb = move || nav_pane_forward(&h, st.clone(), pn.clone(), uw.clone(), pane);
-        if pane == 0 { ui.on_nav_local_forward(cb); } else { ui.on_nav_remote_forward(cb); }
+        if pane == 0 {
+            ui.on_nav_local_forward(cb);
+        } else {
+            ui.on_nav_remote_forward(cb);
+        }
     }
     {
         let (h, st, pn, uw) = (handle.clone(), store.clone(), panes.clone(), ui.as_weak());
         let cb = move || nav_pane_up(&h, st.clone(), pn.clone(), uw.clone(), pane);
-        if pane == 0 { ui.on_nav_local_up(cb); } else { ui.on_nav_remote_up(cb); }
+        if pane == 0 {
+            ui.on_nav_local_up(cb);
+        } else {
+            ui.on_nav_remote_up(cb);
+        }
     }
 }
 
@@ -3097,7 +4151,11 @@ fn wire_toggle_theme(ui: &App) {
     ui.on_toggle_theme(move || {
         let Some(ui) = ui_weak.upgrade() else { return };
         let g = crate::Tokens::get(&ui);
-        let next = if g.get_theme() == "dark" { "light" } else { "dark" };
+        let next = if g.get_theme() == "dark" {
+            "light"
+        } else {
+            "dark"
+        };
         g.set_theme(next.into());
         let mut s = store::settings::load();
         s.theme = next.to_string();
@@ -3120,7 +4178,10 @@ fn wire_copy_path(ui: &App) {
             ui.get_remote_cwd().to_string()
         };
         let full = if pane == "local" {
-            PathBuf::from(&cwd).join(&name).to_string_lossy().into_owned()
+            PathBuf::from(&cwd)
+                .join(&name)
+                .to_string_lossy()
+                .into_owned()
         } else {
             join_remote(PathBuf::from(&cwd).join(&name))
         };
@@ -3142,9 +4203,20 @@ fn wire_connect_selected(
     let handle = handle.clone();
     let ui_weak = ui.as_weak();
     ui.on_connect_selected_to_pane(move |_pane| {
-        let id = ui_weak.upgrade().map(|u| u.get_selected_connection()).unwrap_or(-1);
+        let id = ui_weak
+            .upgrade()
+            .map(|u| u.get_selected_connection())
+            .unwrap_or(-1);
         if id >= 0 {
-            do_connect(&handle, store.clone(), conns.clone(), sessions.clone(), panes.clone(), ui_weak.clone(), id);
+            do_connect(
+                &handle,
+                store.clone(),
+                conns.clone(),
+                sessions.clone(),
+                panes.clone(),
+                ui_weak.clone(),
+                id,
+            );
         }
     });
 }
@@ -3162,18 +4234,37 @@ fn wire_set_pane_local(ui: &App, panes: Panes) {
 /// ticked "Don't ask again this session" earlier in this connection, delete immediately;
 /// otherwise populate the delete-confirmation dialog and open it. The dialog's confirm button
 /// routes through `confirm_delete`.
-fn request_delete(ui: &App, handle: &Handle, store: Arc<dyn CredentialStore>, panes: Panes, pane: usize, name: String, is_dir: bool) {
+fn request_delete(
+    ui: &App,
+    handle: &Handle,
+    store: Arc<dyn CredentialStore>,
+    panes: Panes,
+    pane: usize,
+    name: String,
+    is_dir: bool,
+) {
     if delete_confirm_skipped(pane) {
         delete_entry(handle, store, panes, ui.as_weak(), pane, name, is_dir);
         return;
     }
-    let cwd = if pane == 0 { ui.get_local_cwd().to_string() } else { ui.get_remote_cwd().to_string() };
+    let cwd = if pane == 0 {
+        ui.get_local_cwd().to_string()
+    } else {
+        ui.get_remote_cwd().to_string()
+    };
     let path = if pane == 0 {
-        PathBuf::from(&cwd).join(&name).to_string_lossy().into_owned()
+        PathBuf::from(&cwd)
+            .join(&name)
+            .to_string_lossy()
+            .into_owned()
     } else {
         join_remote(PathBuf::from(&cwd).join(&name))
     };
-    ui.set_delete_pane(if pane == 0 { "local".into() } else { "remote".into() });
+    ui.set_delete_pane(if pane == 0 {
+        "local".into()
+    } else {
+        "remote".into()
+    });
     ui.set_delete_name(name.into());
     ui.set_delete_path(path.into());
     ui.set_delete_is_dir(is_dir);
@@ -3185,7 +4276,11 @@ fn request_delete(ui: &App, handle: &Handle, store: Arc<dyn CredentialStore>, pa
 /// the connection), then perform the delete and close the dialog.
 fn confirm_delete(handle: &Handle, store: Arc<dyn CredentialStore>, panes: Panes, ui: Weak<App>) {
     let Some(ui) = ui.upgrade() else { return };
-    let pane = if ui.get_delete_pane().as_str() == "remote" { 1 } else { 0 };
+    let pane = if ui.get_delete_pane().as_str() == "remote" {
+        1
+    } else {
+        0
+    };
     if ui.get_delete_dont_ask() {
         set_skip_delete_confirm(pane, true);
     }
@@ -3197,17 +4292,27 @@ fn confirm_delete(handle: &Handle, store: Arc<dyn CredentialStore>, panes: Panes
 }
 
 fn wire_request_delete(ui: &App, handle: &Handle, store: Arc<dyn CredentialStore>, panes: Panes) {
-    let (handle, store, panes, ui_weak) = (handle.clone(), store.clone(), panes.clone(), ui.as_weak());
+    let (handle, store, panes, ui_weak) =
+        (handle.clone(), store.clone(), panes.clone(), ui.as_weak());
     ui.on_request_delete(move |pane_s, name, is_dir| {
         if let Some(ui) = ui_weak.upgrade() {
             let pane = if pane_s.as_str() == "remote" { 1 } else { 0 };
-            request_delete(&ui, &handle, store.clone(), panes.clone(), pane, name.to_string(), is_dir);
+            request_delete(
+                &ui,
+                &handle,
+                store.clone(),
+                panes.clone(),
+                pane,
+                name.to_string(),
+                is_dir,
+            );
         }
     });
 }
 
 fn wire_confirm_delete(ui: &App, handle: &Handle, store: Arc<dyn CredentialStore>, panes: Panes) {
-    let (handle, store, panes, ui_weak) = (handle.clone(), store.clone(), panes.clone(), ui.as_weak());
+    let (handle, store, panes, ui_weak) =
+        (handle.clone(), store.clone(), panes.clone(), ui.as_weak());
     ui.on_confirm_delete(move || {
         confirm_delete(&handle, store.clone(), panes.clone(), ui_weak.clone());
     });
@@ -3218,15 +4323,29 @@ fn wire_confirm_delete(ui: &App, handle: &Handle, store: Arc<dyn CredentialStore
 /// Arrow up/down: move the active pane's selection by `delta` (clamped to the list).
 fn move_selection(ui: &App, delta: i32) {
     let pane = active_pane_idx(ui);
-    let count = if pane == 0 { ui.get_local_count() } else { ui.get_remote_count() };
-    if count <= 0 { return; }
+    let count = if pane == 0 {
+        ui.get_local_count()
+    } else {
+        ui.get_remote_count()
+    };
+    if count <= 0 {
+        return;
+    }
     let cur = pane_selected(ui, pane);
     let next = if cur < 0 {
-        if delta > 0 { 0 } else { count - 1 }
+        if delta > 0 {
+            0
+        } else {
+            count - 1
+        }
     } else {
         (cur + delta).max(0).min(count - 1)
     };
-    if pane == 0 { ui.set_local_selected(next); } else { ui.set_remote_selected(next); }
+    if pane == 0 {
+        ui.set_local_selected(next);
+    } else {
+        ui.set_remote_selected(next);
+    }
     refresh_selected_path(ui);
 }
 
@@ -3243,7 +4362,11 @@ fn type_ahead(ui: &App, letter: &str) {
     for i in 0..entries.row_count() {
         if let Some(row) = entries.row_data(i) {
             if row.name.to_string().to_lowercase().starts_with(c) {
-                if pane == 0 { ui.set_local_selected(i as i32); } else { ui.set_remote_selected(i as i32); }
+                if pane == 0 {
+                    ui.set_local_selected(i as i32);
+                } else {
+                    ui.set_remote_selected(i as i32);
+                }
                 return;
             }
         }
@@ -3251,7 +4374,14 @@ fn type_ahead(ui: &App, letter: &str) {
 }
 
 /// Enter: copy the active pane's selected entry to the OTHER pane.
-fn pane_enter(handle: &Handle, store: Arc<dyn CredentialStore>, panes: Panes, engine: TransferEngine, idx: Arc<Mutex<HashMap<i32, usize>>>, ui: Weak<App>) {
+fn pane_enter(
+    handle: &Handle,
+    store: Arc<dyn CredentialStore>,
+    panes: Panes,
+    engine: TransferEngine,
+    idx: Arc<Mutex<HashMap<i32, usize>>>,
+    ui: Weak<App>,
+) {
     let Some(ui) = ui.upgrade() else { return };
     let active = active_pane_idx(&ui);
     let (src, dst) = if active == 0 { (0, 1) } else { (1, 0) };
@@ -3265,9 +4395,21 @@ fn pane_delete(handle: &Handle, store: Arc<dyn CredentialStore>, panes: Panes, u
     let Some(ui) = ui.upgrade() else { return };
     let pane = active_pane_idx(&ui);
     let sel = pane_selected(&ui, pane);
-    if sel < 0 { return; }
-    let Some(row) = pane_entries(&ui, pane).row_data(sel as usize) else { return };
-    request_delete(&ui, handle, store, panes, pane, row.name.to_string(), row.is_dir);
+    if sel < 0 {
+        return;
+    }
+    let Some(row) = pane_entries(&ui, pane).row_data(sel as usize) else {
+        return;
+    };
+    request_delete(
+        &ui,
+        handle,
+        store,
+        panes,
+        pane,
+        row.name.to_string(),
+        row.is_dir,
+    );
 }
 
 /// Space: Quick Look preview (macOS). Local file → `qlmanage -p`; remote → download to a temp
@@ -3276,26 +4418,43 @@ fn pane_preview(handle: &Handle, store: Arc<dyn CredentialStore>, panes: Panes, 
     let Some(ui) = ui.upgrade() else { return };
     let pane = active_pane_idx(&ui);
     let sel = pane_selected(&ui, pane);
-    if sel < 0 { return; }
-    let Some(row) = pane_entries(&ui, pane).row_data(sel as usize) else { return };
-    if row.is_dir { return; }
+    if sel < 0 {
+        return;
+    }
+    let Some(row) = pane_entries(&ui, pane).row_data(sel as usize) else {
+        return;
+    };
+    if row.is_dir {
+        return;
+    }
     let name = row.name.to_string();
     let (kind, conn, cwd) = {
         let p = panes.lock().expect("panes");
-        (p[pane].kind.clone(), p[pane].conn.clone(), p[pane].cwd.clone())
+        (
+            p[pane].kind.clone(),
+            p[pane].conn.clone(),
+            p[pane].cwd.clone(),
+        )
     };
     match kind {
         PaneKind::Local => {
             let path = PathBuf::from(&cwd).join(&name);
-            let _ = std::process::Command::new("qlmanage").arg("-p").arg(&path).spawn();
+            let _ = std::process::Command::new("qlmanage")
+                .arg("-p")
+                .arg(&path)
+                .spawn();
         }
         PaneKind::Remote => {
             let Some(spec) = conn else { return };
-            let Some(pw) = password_for(&store, &spec) else { return };
+            let Some(pw) = password_for(&store, &spec) else {
+                return;
+            };
             let rp = join_remote(PathBuf::from(&cwd).join(&name));
-            let tmp = std::env::temp_dir().join(format!("gmacftp-preview-{}", rand::random::<u64>()));
+            let tmp =
+                std::env::temp_dir().join(format!("gmacftp-preview-{}", rand::random::<u64>()));
             handle.spawn(async move {
-                let mut s = spec.clone(); s.initial_path = cwd.clone();
+                let mut s = spec.clone();
+                s.initial_path = cwd.clone();
                 let _ = std::fs::remove_file(&tmp);
                 if net::download_file(&s, &pw, &rp, tmp.clone()).await.is_ok() {
                     // M3/MEMO-3: run qlmanage to completion on a dedicated OS thread, then remove
@@ -3303,7 +4462,10 @@ fn pane_preview(handle: &Handle, store: Arc<dyn CredentialStore>, panes: Panes, 
                     // $TMPDIR (and Time Machine snapshots of it). .status() blocks until the panel
                     // closes — safe because it's not on the async runtime.
                     std::thread::spawn(move || {
-                        let _ = std::process::Command::new("qlmanage").arg("-p").arg(&tmp).status();
+                        let _ = std::process::Command::new("qlmanage")
+                            .arg("-p")
+                            .arg(&tmp)
+                            .status();
                         let _ = std::fs::remove_file(&tmp);
                     });
                 }
@@ -3316,8 +4478,12 @@ fn pane_preview(handle: &Handle, store: Arc<dyn CredentialStore>, panes: Panes, 
 /// the local filesystem.
 fn disconnect_pane(engine: TransferEngine, panes: Panes, ui: Weak<App>, pane: usize) {
     set_skip_delete_confirm(pane, false); // THIS pane's connection ended → re-arm it
-    // Abort only THIS pane's connection's transfers — not every session's.
-    if let Some(id) = panes.lock().expect("panes")[pane].conn.as_ref().map(|c| c.id) {
+                                          // Abort only THIS pane's connection's transfers — not every session's.
+    if let Some(id) = panes.lock().expect("panes")[pane]
+        .conn
+        .as_ref()
+        .map(|c| c.id)
+    {
         engine.abort(id);
     }
     set_pane_local(panes, ui, pane);
@@ -3331,16 +4497,23 @@ fn refresh_selected_path(ui: &App) {
 fn current_selected_path(ui: &App) -> String {
     let pane = active_pane_idx(ui);
     let sel = pane_selected(ui, pane);
-    let cwd = if pane == 0 { ui.get_local_cwd().to_string() } else { ui.get_remote_cwd().to_string() };
+    let cwd = if pane == 0 {
+        ui.get_local_cwd().to_string()
+    } else {
+        ui.get_remote_cwd().to_string()
+    };
     if sel >= 0 {
-        pane_entries(ui, pane).row_data(sel as usize).map(|r| {
-            let n = r.name.to_string();
-            if pane == 0 {
-                PathBuf::from(&cwd).join(&n).to_string_lossy().into_owned()
-            } else {
-                join_remote(PathBuf::from(&cwd).join(&n))
-            }
-        }).unwrap_or_else(|| cwd.clone())
+        pane_entries(ui, pane)
+            .row_data(sel as usize)
+            .map(|r| {
+                let n = r.name.to_string();
+                if pane == 0 {
+                    PathBuf::from(&cwd).join(&n).to_string_lossy().into_owned()
+                } else {
+                    join_remote(PathBuf::from(&cwd).join(&n))
+                }
+            })
+            .unwrap_or_else(|| cwd.clone())
     } else {
         cwd
     }
@@ -3365,14 +4538,26 @@ fn copy_to_clipboard(text: &str) -> bool {
 
 /// Sort popover → set the targeted pane's sort key and re-apply the view.
 fn apply_sort_field(ui: &App, key: &str) {
-    let pane = if ui.get_sort_pane().as_str() == "remote" { 1 } else { 0 };
-    if pane == 0 { ui.set_local_sort_key(key.into()); } else { ui.set_remote_sort_key(key.into()); }
+    let pane = if ui.get_sort_pane().as_str() == "remote" {
+        1
+    } else {
+        0
+    };
+    if pane == 0 {
+        ui.set_local_sort_key(key.into());
+    } else {
+        ui.set_remote_sort_key(key.into());
+    }
     apply_view_pane(ui, pane);
 }
 
 /// Sort popover → toggle the targeted pane's asc/desc and re-apply.
 fn toggle_sort_dir(ui: &App) {
-    let pane = if ui.get_sort_pane().as_str() == "remote" { 1 } else { 0 };
+    let pane = if ui.get_sort_pane().as_str() == "remote" {
+        1
+    } else {
+        0
+    };
     let next = |cur: &str| if cur == "asc" { "desc" } else { "asc" };
     if pane == 0 {
         ui.set_local_sort_dir(next(&ui.get_local_sort_dir()).into());
@@ -3384,7 +4569,14 @@ fn toggle_sort_dir(ui: &App) {
 
 /// Wire the bottom-bar path + sort-popover callbacks.
 fn wire_misc_ui(ui: &App) {
-    { let uw = ui.as_weak(); ui.on_update_selected_path(move || { if let Some(ui) = uw.upgrade() { refresh_selected_path(&ui); } }); }
+    {
+        let uw = ui.as_weak();
+        ui.on_update_selected_path(move || {
+            if let Some(ui) = uw.upgrade() {
+                refresh_selected_path(&ui);
+            }
+        });
+    }
     {
         let uw = ui.as_weak();
         ui.on_copy_selected_path(move || {
@@ -3401,8 +4593,22 @@ fn wire_misc_ui(ui: &App) {
             }
         });
     }
-    { let uw = ui.as_weak(); ui.on_apply_sort_field(move |key| { if let Some(ui) = uw.upgrade() { apply_sort_field(&ui, &key); } }); }
-    { let uw = ui.as_weak(); ui.on_toggle_sort_dir(move || { if let Some(ui) = uw.upgrade() { toggle_sort_dir(&ui); } }); }
+    {
+        let uw = ui.as_weak();
+        ui.on_apply_sort_field(move |key| {
+            if let Some(ui) = uw.upgrade() {
+                apply_sort_field(&ui, &key);
+            }
+        });
+    }
+    {
+        let uw = ui.as_weak();
+        ui.on_toggle_sort_dir(move || {
+            if let Some(ui) = uw.upgrade() {
+                toggle_sort_dir(&ui);
+            }
+        });
+    }
 }
 
 /// Wire all keyboard + sidebar-eject callbacks.
@@ -3416,27 +4622,57 @@ fn wire_keyboard(
 ) {
     {
         let ui_weak = ui.as_weak();
-        ui.on_move_selection(move |delta| { if let Some(ui) = ui_weak.upgrade() { move_selection(&ui, delta); } });
+        ui.on_move_selection(move |delta| {
+            if let Some(ui) = ui_weak.upgrade() {
+                move_selection(&ui, delta);
+            }
+        });
     }
     {
         let ui_weak = ui.as_weak();
-        ui.on_type_ahead(move |letter| { if let Some(ui) = ui_weak.upgrade() { type_ahead(&ui, &letter); } });
+        ui.on_type_ahead(move |letter| {
+            if let Some(ui) = ui_weak.upgrade() {
+                type_ahead(&ui, &letter);
+            }
+        });
     }
     {
-        let (h, st, pn, en, ix, uw) = (handle.clone(), store.clone(), panes.clone(), engine.clone(), idx.clone(), ui.as_weak());
-        ui.on_pane_enter(move || { pane_enter(&h, st.clone(), pn.clone(), en.clone(), ix.clone(), uw.clone()); });
+        let (h, st, pn, en, ix, uw) = (
+            handle.clone(),
+            store.clone(),
+            panes.clone(),
+            engine.clone(),
+            idx.clone(),
+            ui.as_weak(),
+        );
+        ui.on_pane_enter(move || {
+            pane_enter(
+                &h,
+                st.clone(),
+                pn.clone(),
+                en.clone(),
+                ix.clone(),
+                uw.clone(),
+            );
+        });
     }
     {
         let (h, st, pn, uw) = (handle.clone(), store.clone(), panes.clone(), ui.as_weak());
-        ui.on_pane_delete(move || { pane_delete(&h, st.clone(), pn.clone(), uw.clone()); });
+        ui.on_pane_delete(move || {
+            pane_delete(&h, st.clone(), pn.clone(), uw.clone());
+        });
     }
     {
         let (h, st, pn, uw) = (handle.clone(), store.clone(), panes.clone(), ui.as_weak());
-        ui.on_pane_preview(move || { pane_preview(&h, st.clone(), pn.clone(), uw.clone()); });
+        ui.on_pane_preview(move || {
+            pane_preview(&h, st.clone(), pn.clone(), uw.clone());
+        });
     }
     {
         let (en, pn, uw) = (engine.clone(), panes.clone(), ui.as_weak());
-        ui.on_disconnect_pane(move |pane| { disconnect_pane(en.clone(), pn.clone(), uw.clone(), pane as usize); });
+        ui.on_disconnect_pane(move |pane| {
+            disconnect_pane(en.clone(), pn.clone(), uw.clone(), pane as usize);
+        });
     }
 }
 
@@ -3479,7 +4715,9 @@ fn wire_clear_finished(ui: &App, idx: Arc<Mutex<HashMap<i32, usize>>>) {
             let mut i = jobs.row_count();
             while i > 0 {
                 i -= 1;
-                let finished = jobs.row_data(i).is_some_and(|r| r.state.as_str() == "done" || r.state.as_str() == "failed");
+                let finished = jobs
+                    .row_data(i)
+                    .is_some_and(|r| r.state.as_str() == "done" || r.state.as_str() == "failed");
                 if finished {
                     jobs.remove(i);
                 }
@@ -3506,7 +4744,9 @@ fn wire_dismiss_transfer(ui: &App, idx: Arc<Mutex<HashMap<i32, usize>>>) {
         TRANSFER_JOBS.with(|jm| {
             let b = jm.borrow();
             let Some(jobs) = b.as_ref() else { return };
-            if let Some(i) = (0..jobs.row_count()).find(|&i| jobs.row_data(i).map(|r| r.id == id).unwrap_or(false)) {
+            if let Some(i) = (0..jobs.row_count())
+                .find(|&i| jobs.row_data(i).map(|r| r.id == id).unwrap_or(false))
+            {
                 jobs.remove(i);
             }
             if let Ok(mut g) = idx.lock() {
@@ -3537,10 +4777,19 @@ fn wire_disconnect(ui: &App, panes: Panes, sessions: Sessions, engine: TransferE
     ui.on_disconnect(move || {
         let pane = ui_weak.upgrade().map(|u| active_pane_idx(&u)).unwrap_or(1);
         set_skip_delete_confirm(pane, false); // the active pane's connection ended → re-arm it
-        // Toolbar Disconnect = eject the active pane's session from the pool entirely.
-        let conn_id = panes.lock().expect("panes")[pane].conn.as_ref().map(|c| c.id.0 as i32);
+                                              // Toolbar Disconnect = eject the active pane's session from the pool entirely.
+        let conn_id = panes.lock().expect("panes")[pane]
+            .conn
+            .as_ref()
+            .map(|c| c.id.0 as i32);
         if let Some(id) = conn_id {
-            disconnect_session(engine.clone(), sessions.clone(), panes.clone(), ui_weak.clone(), id);
+            disconnect_session(
+                engine.clone(),
+                sessions.clone(),
+                panes.clone(),
+                ui_weak.clone(),
+                id,
+            );
         } else {
             // Active pane has no connection (already local — the Disconnect button is disabled
             // in this state). Nothing to abort per-connection; just return it to local.
@@ -3555,16 +4804,34 @@ fn wire_disconnect(ui: &App, panes: Panes, sessions: Sessions, engine: TransferE
 }
 
 /// CONNECTED sidebar controls: click a session → show it in the active pane; eject → drop it.
-fn wire_session_controls(ui: &App, handle: &Handle, store: Arc<dyn CredentialStore>, sessions: Sessions, panes: Panes, engine: TransferEngine) {
+fn wire_session_controls(
+    ui: &App,
+    handle: &Handle,
+    store: Arc<dyn CredentialStore>,
+    sessions: Sessions,
+    panes: Panes,
+    engine: TransferEngine,
+) {
     {
-        let (h, st, se, pn, uw) = (handle.clone(), store.clone(), sessions.clone(), panes.clone(), ui.as_weak());
+        let (h, st, se, pn, uw) = (
+            handle.clone(),
+            store.clone(),
+            sessions.clone(),
+            panes.clone(),
+            ui.as_weak(),
+        );
         ui.on_switch_to_session(move |id| {
             let pane = uw.upgrade().map(|u| active_pane_idx(&u)).unwrap_or(0);
             switch_to_session(&h, st.clone(), se.clone(), pn.clone(), uw.clone(), pane, id);
         });
     }
     {
-        let (se, pn, en, uw) = (sessions.clone(), panes.clone(), engine.clone(), ui.as_weak());
+        let (se, pn, en, uw) = (
+            sessions.clone(),
+            panes.clone(),
+            engine.clone(),
+            ui.as_weak(),
+        );
         ui.on_disconnect_session(move |id| {
             disconnect_session(en.clone(), se.clone(), pn.clone(), uw.clone(), id);
         });
@@ -3587,12 +4854,25 @@ fn wire_toggle_hidden(ui: &App) {
 /// key, flip asc/desc; otherwise make it the active key (ascending). Then re-apply the view.
 fn sort_by(ui: &App, pane: usize, key: &str) {
     let (cur_key, cur_dir) = if pane == 0 {
-        (ui.get_local_sort_key().to_string(), ui.get_local_sort_dir().to_string())
+        (
+            ui.get_local_sort_key().to_string(),
+            ui.get_local_sort_dir().to_string(),
+        )
     } else {
-        (ui.get_remote_sort_key().to_string(), ui.get_remote_sort_dir().to_string())
+        (
+            ui.get_remote_sort_key().to_string(),
+            ui.get_remote_sort_dir().to_string(),
+        )
     };
     let (nk, nd) = if cur_key == key {
-        (cur_key, if cur_dir == "asc" { "desc".to_string() } else { "asc".to_string() })
+        (
+            cur_key,
+            if cur_dir == "asc" {
+                "desc".to_string()
+            } else {
+                "asc".to_string()
+            },
+        )
     } else {
         (key.to_string(), "asc".to_string())
     };
@@ -3632,10 +4912,25 @@ fn wire_transfer_download(
     engine: TransferEngine,
     idx: Arc<Mutex<HashMap<i32, usize>>>,
 ) {
-    let (handle, store, panes, engine, idx, ui_weak) =
-        (handle.clone(), store.clone(), panes.clone(), engine, idx, ui.as_weak());
+    let (handle, store, panes, engine, idx, ui_weak) = (
+        handle.clone(),
+        store.clone(),
+        panes.clone(),
+        engine,
+        idx,
+        ui.as_weak(),
+    );
     ui.on_download(move || {
-        transfer(&handle, store.clone(), panes.clone(), engine.clone(), idx.clone(), ui_weak.clone(), 1, 0);
+        transfer(
+            &handle,
+            store.clone(),
+            panes.clone(),
+            engine.clone(),
+            idx.clone(),
+            ui_weak.clone(),
+            1,
+            0,
+        );
     });
 }
 
@@ -3648,10 +4943,25 @@ fn wire_transfer_upload(
     engine: TransferEngine,
     idx: Arc<Mutex<HashMap<i32, usize>>>,
 ) {
-    let (handle, store, panes, engine, idx, ui_weak) =
-        (handle.clone(), store.clone(), panes.clone(), engine, idx, ui.as_weak());
+    let (handle, store, panes, engine, idx, ui_weak) = (
+        handle.clone(),
+        store.clone(),
+        panes.clone(),
+        engine,
+        idx,
+        ui.as_weak(),
+    );
     ui.on_upload(move || {
-        transfer(&handle, store.clone(), panes.clone(), engine.clone(), idx.clone(), ui_weak.clone(), 0, 1);
+        transfer(
+            &handle,
+            store.clone(),
+            panes.clone(),
+            engine.clone(),
+            idx.clone(),
+            ui_weak.clone(),
+            0,
+            1,
+        );
     });
 }
 
@@ -3717,11 +5027,18 @@ fn wire_edit(ui: &App, store: Arc<dyn CredentialStore>, conns: ConnList) {
     let ui_weak = ui.as_weak();
     ui.on_edit_connection(move |id| {
         let Some(ui) = ui_weak.upgrade() else { return };
-        let spec = conns.lock().expect("connections lock").iter()
-            .find(|c| c.id.0 as i32 == id).cloned();
+        let spec = conns
+            .lock()
+            .expect("connections lock")
+            .iter()
+            .find(|c| c.id.0 as i32 == id)
+            .cloned();
         let Some(spec) = spec else { return };
-        let pw = store.get(&spec.host, &spec.user).ok()
-            .map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default();
+        let pw = store
+            .get(&spec.host, &spec.user)
+            .ok()
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .unwrap_or_default();
         ui.set_editor_id(spec.id.0 as i32);
         ui.set_editor_name(spec.name.into());
         ui.set_editor_protocol(spec.protocol.to_string().into());
@@ -3762,9 +5079,17 @@ fn wire_save(ui: &App, store: Arc<dyn CredentialStore>, conns: ConnList) {
         let host = ui.get_editor_host().trim().to_string();
         let user = ui.get_editor_user().to_string();
         let password = ui.get_editor_password().to_string();
-        let protocol: Protocol = ui.get_editor_protocol().trim().to_ascii_lowercase()
-            .parse().unwrap_or(Protocol::Ftp);
-        let port: u16 = ui.get_editor_port().trim().parse().unwrap_or(protocol.default_port());
+        let protocol: Protocol = ui
+            .get_editor_protocol()
+            .trim()
+            .to_ascii_lowercase()
+            .parse()
+            .unwrap_or(Protocol::Ftp);
+        let port: u16 = ui
+            .get_editor_port()
+            .trim()
+            .parse()
+            .unwrap_or(protocol.default_port());
         let id = ui.get_editor_id();
 
         if name.trim().is_empty() || host.is_empty() || user.is_empty() {
@@ -3780,13 +5105,24 @@ fn wire_save(ui: &App, store: Arc<dyn CredentialStore>, conns: ConnList) {
             }
             // keep the session cache in sync so the new password is used immediately
             if let Ok(mut c) = PASSWORD_CACHE.lock() {
-                c.insert((host.clone(), user.clone()), password.clone());
+                c.insert(
+                    (host.clone(), user.clone()),
+                    Zeroizing::new(password.clone()),
+                );
             }
         }
 
         let spec = ConnectionSpec {
-            id: ConnectionId(if id < 0 { next_id(&conns.lock().expect("lock")) } else { id as usize }),
-            name, protocol, host, port, user,
+            id: ConnectionId(if id < 0 {
+                next_id(&conns.lock().expect("lock"))
+            } else {
+                id as usize
+            }),
+            name,
+            protocol,
+            host,
+            port,
+            user,
             initial_path: String::new(),
         };
         {
@@ -3803,7 +5139,12 @@ fn wire_save(ui: &App, store: Arc<dyn CredentialStore>, conns: ConnList) {
         refresh_connections_model(&ui, &conns);
         ui.set_editor_open(false);
         ui.set_manager_message(
-            if id < 0 { format!("added “{}”", spec.name) } else { format!("saved “{}”", spec.name) }.into(),
+            if id < 0 {
+                format!("added “{}”", spec.name)
+            } else {
+                format!("saved “{}”", spec.name)
+            }
+            .into(),
         );
     });
 }
@@ -3864,7 +5205,10 @@ fn merge_new(conns: &ConnList, specs: Vec<ConnectionSpec>) -> usize {
         if g.iter().any(|c| (c.host.clone(), c.user.clone()) == key) {
             continue;
         }
-        g.push(ConnectionSpec { id: ConnectionId(next), ..s });
+        g.push(ConnectionSpec {
+            id: ConnectionId(next),
+            ..s
+        });
         next += 1;
         count += 1;
     }
@@ -3883,7 +5227,12 @@ fn import_from_path(path: &Path, conns: &ConnList, store: &Arc<dyn CredentialSto
     let Ok(text) = std::fs::read_to_string(path) else {
         return format!("could not read {label}");
     };
-    let ext_is = |e: &str| path.extension().and_then(|x| x.to_str()).map(|x| x.eq_ignore_ascii_case(e)).unwrap_or(false);
+    let ext_is = |e: &str| {
+        path.extension()
+            .and_then(|x| x.to_str())
+            .map(|x| x.eq_ignore_ascii_case(e))
+            .unwrap_or(false)
+    };
     let trimmed = text.trim_start();
     let result = if ext_is("json") {
         store::load_seed(&text, store.as_ref())
@@ -3920,8 +5269,14 @@ fn enqueue(
 ) {
     static NEXT_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
     let id = TransferId(NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
-    let dir_s = match direction { TransferDirection::Download => "download", TransferDirection::Upload => "upload" };
-    let verb = match direction { TransferDirection::Download => "Downloading", TransferDirection::Upload => "Uploading" };
+    let dir_s = match direction {
+        TransferDirection::Download => "download",
+        TransferDirection::Upload => "upload",
+    };
+    let verb = match direction {
+        TransferDirection::Download => "Downloading",
+        TransferDirection::Upload => "Uploading",
+    };
     // Cap at i32::MAX (not wrap) for the Slint int fields — a >2 GiB file would otherwise wrap to
     // a negative transfer-total and hide the bottom progress bar (gated on transfer-total > 0).
     // The true u64 total still drives the progress TEXT via fmt_transfer_progress(u64).
@@ -3967,7 +5322,14 @@ fn enqueue(
     if engine.try_enqueue(job, spec).is_err() {
         // M4/CONC-1: the bounded worker channel was full — the job was NOT accepted. Mark
         // the just-inserted row as failed so it never sits on "queued" forever silently.
-        jobs_set(id.0 as i32, idx, "failed", 0, total_i, "transfer queue full");
+        jobs_set(
+            id.0 as i32,
+            idx,
+            "failed",
+            0,
+            total_i,
+            "transfer queue full",
+        );
     }
 }
 
@@ -3988,8 +5350,15 @@ fn spawn_progress_forwarder(
     handle.clone().spawn(async move {
         while let Some(u) = rx.recv().await {
             let id = u.id.0 as i32;
-            let (idx, eta, ui, store, panes, pending_gen, handle) =
-                (idx.clone(), eta.clone(), ui.clone(), store.clone(), panes.clone(), pending_gen.clone(), handle.clone());
+            let (idx, eta, ui, store, panes, pending_gen, handle) = (
+                idx.clone(),
+                eta.clone(),
+                ui.clone(),
+                store.clone(),
+                panes.clone(),
+                pending_gen.clone(),
+                handle.clone(),
+            );
             let _ = slint::invoke_from_event_loop(move || {
                 let Some(ui) = ui.upgrade() else { return };
                 let total = u.bytes_total.unwrap_or(0);
@@ -3998,14 +5367,22 @@ fn spawn_progress_forwarder(
                 TRANSFER_JOBS.with(|jm| {
                     let b = jm.borrow();
                     let Some(jobs) = b.as_ref() else { return };
-                    let Some(i) = idx.lock().ok().and_then(|g| g.get(&id).copied()) else { return };
-                    let Some(mut row) = jobs.row_data(i) else { return };
+                    let Some(i) = idx.lock().ok().and_then(|g| g.get(&id).copied()) else {
+                        return;
+                    };
+                    let Some(mut row) = jobs.row_data(i) else {
+                        return;
+                    };
                     match &u.state {
                         TransferState::Active => {
                             row.state = "active".into();
                             row.done = u.bytes_done as i32;
                             row.total = total.min(i32::MAX as u64) as i32;
-                            row.fraction = if total > 0 { u.bytes_done as f32 / total as f32 } else { 0.0 };
+                            row.fraction = if total > 0 {
+                                u.bytes_done as f32 / total as f32
+                            } else {
+                                0.0
+                            };
                             row.progress_text = fmt_transfer_progress(u.bytes_done, total).into();
                             row.message = format_eta(&eta, id, u.bytes_done, total);
                         }
@@ -4020,20 +5397,26 @@ fn spawn_progress_forwarder(
                             row.state = "failed".into();
                             row.message = msg.clone().into();
                         }
-	                    }
-	                    jobs.set_row_data(i, row);
-	                    update_transfer_summary_from_model(&ui, jobs);
-	                });
+                    }
+                    jobs.set_row_data(i, row);
+                    update_transfer_summary_from_model(&ui, jobs);
+                });
 
                 // compact bottom bar mirrors the active/done/failed job
                 match &u.state {
                     TransferState::Active => {
-                        let frac = if total > 0 { u.bytes_done as f32 / total as f32 } else { 0.0 };
+                        let frac = if total > 0 {
+                            u.bytes_done as f32 / total as f32
+                        } else {
+                            0.0
+                        };
                         ui.set_transfer_active(true);
                         ui.set_transfer_done(u.bytes_done as i32);
                         ui.set_transfer_total(total.min(i32::MAX as u64) as i32);
                         ui.set_transfer_fraction(frac);
-                        ui.set_transfer_progress_text(fmt_transfer_progress(u.bytes_done, total).into());
+                        ui.set_transfer_progress_text(
+                            fmt_transfer_progress(u.bytes_done, total).into(),
+                        );
                     }
                     TransferState::Done => {
                         ui.set_transfer_active(false);
@@ -4043,8 +5426,13 @@ fn spawn_progress_forwarder(
                         // This runs on the UI thread; spawn the timer on the runtime, then hop
                         // back to the UI thread for the re-list (Slint models are !Send).
                         let gen = pending_gen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-                        let (h, st, pn, uw, pg) =
-                            (handle.clone(), store.clone(), panes.clone(), ui.as_weak(), pending_gen.clone());
+                        let (h, st, pn, uw, pg) = (
+                            handle.clone(),
+                            store.clone(),
+                            panes.clone(),
+                            ui.as_weak(),
+                            pending_gen.clone(),
+                        );
                         handle.spawn(async move {
                             tokio::time::sleep(std::time::Duration::from_millis(600)).await;
                             if pg.load(std::sync::atomic::Ordering::SeqCst) == gen {
@@ -4067,7 +5455,12 @@ fn spawn_progress_forwarder(
 }
 
 /// Crude per-job ETA ("~Ns") from a sampled bytes/sec rate; empty when unknown.
-fn format_eta(eta: &Arc<Mutex<HashMap<i32, (Instant, u64)>>>, id: i32, done: u64, total: u64) -> slint::SharedString {
+fn format_eta(
+    eta: &Arc<Mutex<HashMap<i32, (Instant, u64)>>>,
+    id: i32,
+    done: u64,
+    total: u64,
+) -> slint::SharedString {
     if total == 0 || done == 0 {
         return "".into();
     }
@@ -4077,7 +5470,11 @@ fn format_eta(eta: &Arc<Mutex<HashMap<i32, (Instant, u64)>>>, id: i32, done: u64
             let r = match g.get(&id) {
                 Some((t, prev)) => {
                     let dt = now.duration_since(*t).as_secs_f32();
-                    if dt > 0.05 { (done - prev) as f32 / dt } else { 0.0 }
+                    if dt > 0.05 {
+                        (done - prev) as f32 / dt
+                    } else {
+                        0.0
+                    }
                 }
                 None => 0.0,
             };
@@ -4110,6 +5507,13 @@ fn join_remote(p: PathBuf) -> String {
     // Drop empty segments and ".." (traversal), collapse to a single leading slash with no
     // trailing slash. Neutralizes a malicious server listing "../../etc/passwd": the path can't
     // escape upward. Legitimate remote paths (absolute cwd + single-segment names) have no "..".
-    let parts: Vec<&str> = s.split('/').filter(|seg| !seg.is_empty() && *seg != "..").collect();
-    if parts.is_empty() { "/".to_string() } else { format!("/{}", parts.join("/")) }
+    let parts: Vec<&str> = s
+        .split('/')
+        .filter(|seg| !seg.is_empty() && *seg != "..")
+        .collect();
+    if parts.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", parts.join("/"))
+    }
 }

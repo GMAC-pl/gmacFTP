@@ -5,9 +5,7 @@ use super::Protocol;
 
 /// Index into the App's `Vec<ConnectionSpec>` — stable for the app's lifetime
 /// (seed connections load first, user-added ones append; the list never reorders).
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct ConnectionId(pub usize);
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

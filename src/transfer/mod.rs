@@ -13,7 +13,9 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 
-use crate::model::{ConnectionId, ConnectionSpec, Protocol, TransferDirection, TransferId, TransferJob};
+use crate::model::{
+    ConnectionId, ConnectionSpec, Protocol, TransferDirection, TransferId, TransferJob,
+};
 use crate::net::{ftp, sftp};
 use crate::store::CredentialStore;
 
@@ -42,17 +44,15 @@ pub struct TransferEngine {
 impl TransferEngine {
     /// Spawn the worker. Must be called from within a Tokio runtime.
     /// `updates` is where progress/final events land — the UI reads the other end.
-    pub fn start(
-        store: Arc<dyn CredentialStore>,
-        updates: mpsc::Sender<TransferUpdate>,
-    ) -> Self {
+    pub fn start(store: Arc<dyn CredentialStore>, updates: mpsc::Sender<TransferUpdate>) -> Self {
         // CONC-1: capacity large enough that a folder transfer (one Cmd per file) plus any
         // in-flight single-file job never overflows try_send. Cmd is small; 256 ≈ negligible.
         let (tx, mut rx) = mpsc::channel::<Cmd>(256);
         let aborted_conns: Arc<Mutex<HashSet<usize>>> = Arc::new(Mutex::new(HashSet::new()));
         let current: Arc<Mutex<Option<(usize, Arc<AtomicBool>)>>> = Arc::new(Mutex::new(None));
         let paused = Arc::new(AtomicBool::new(false));
-        let (aborted_w, current_w, paused_w) = (aborted_conns.clone(), current.clone(), paused.clone());
+        let (aborted_w, current_w, paused_w) =
+            (aborted_conns.clone(), current.clone(), paused.clone());
         tokio::spawn(async move {
             while let Some(Cmd::Run(job, spec)) = rx.recv().await {
                 // Pause-all: hold the dequeued job without starting it until cleared.
@@ -76,7 +76,12 @@ impl TransferEngine {
                 }
             }
         });
-        Self { tx, aborted_conns, current, paused }
+        Self {
+            tx,
+            aborted_conns,
+            current,
+            paused,
+        }
     }
 
     /// Sync enqueue — safe to call from a UI callback (no .await). Returns Err(()) only
@@ -181,18 +186,32 @@ async fn run_one(
         (TransferDirection::Download, Protocol::Sftp) => {
             let progress = throttled(updates.clone(), id, total);
             let local = std::path::PathBuf::from(&job.local_path);
-            sftp::download(&spec, &password, &job.remote_path, &local, progress, Some(&**flag))
-                .await
-                .map(|_| ())
-                .map_err(|e| e.to_string())
+            sftp::download(
+                &spec,
+                &password,
+                &job.remote_path,
+                &local,
+                progress,
+                Some(&**flag),
+            )
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
         }
         (TransferDirection::Upload, Protocol::Sftp) => {
             let progress = throttled(updates.clone(), id, total);
             let local = std::path::PathBuf::from(&job.local_path);
-            sftp::upload(&spec, &password, &local, &job.remote_path, progress, Some(&**flag))
-                .await
-                .map(|_| ())
-                .map_err(|e| e.to_string())
+            sftp::upload(
+                &spec,
+                &password,
+                &local,
+                &job.remote_path,
+                progress,
+                Some(&**flag),
+            )
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
         }
     };
 
@@ -221,7 +240,9 @@ fn throttled(
     id: TransferId,
     total: Option<u64>,
 ) -> impl Fn(u64) + Send + Sync + 'static {
-    let last = Arc::new(std::sync::Mutex::new(Instant::now() - Duration::from_secs(1)));
+    let last = Arc::new(std::sync::Mutex::new(
+        Instant::now() - Duration::from_secs(1),
+    ));
     move |done: u64| {
         let should_emit = {
             let mut g = match last.lock() {

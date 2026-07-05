@@ -44,7 +44,10 @@ struct SeedConnection {
 /// Parse the seed JSON, push every password into the credential store (Keychain in
 /// production, in-memory in tests), zeroize it, and return the password-free specs.
 /// Hosts are trimmed (some a third-party file manager favorites carried a stray leading space).
-pub fn load_seed(json: &str, store: &dyn CredentialStore) -> Result<Vec<ConnectionSpec>, ImportError> {
+pub fn load_seed(
+    json: &str,
+    store: &dyn CredentialStore,
+) -> Result<Vec<ConnectionSpec>, ImportError> {
     let seed: SeedFile = serde_json::from_str(json)?;
     let mut specs = Vec::with_capacity(seed.connections.len());
     for (i, s) in seed.connections.into_iter().enumerate() {
@@ -93,11 +96,17 @@ pub fn load_seed(json: &str, store: &dyn CredentialStore) -> Result<Vec<Connecti
 /// `<Protocol>` mapping (FileZilla): 0 = FTP, 1 = SFTP (SSH2), 3/4 = FTP over TLS (explicit/
 /// implicit). gmacFTP's `Protocol::Ftp` negotiates FTPS itself, so 0/3/4 all map to `Ftp`.
 /// Unsupported protocols (WebDAV/S3/HTTP, etc.) are skipped.
-pub fn load_filezilla(xml: &str, store: &dyn CredentialStore) -> Result<Vec<ConnectionSpec>, ImportError> {
+pub fn load_filezilla(
+    xml: &str,
+    store: &dyn CredentialStore,
+) -> Result<Vec<ConnectionSpec>, ImportError> {
     let doc = roxmltree::Document::parse(xml)?;
     let mut specs = Vec::new();
     let mut idx = 0usize;
-    for server in doc.descendants().filter(|n| n.tag_name().name() == "Server") {
+    for server in doc
+        .descendants()
+        .filter(|n| n.tag_name().name() == "Server")
+    {
         let host = child_text(&server, "Host");
         if host.is_empty() {
             continue;
@@ -110,10 +119,18 @@ pub fn load_filezilla(xml: &str, store: &dyn CredentialStore) -> Result<Vec<Conn
             "0" | "3" | "4" | "" => Protocol::Ftp, // "" defaults to FTP (FileZilla omits it)
             _ => continue, // WebDAV/S3/HTTP etc. — gmacFTP can't speak these; skip
         };
-        let port = if port == 0 { protocol.default_port() } else { port };
+        let port = if port == 0 {
+            protocol.default_port()
+        } else {
+            port
+        };
         let name = {
             let n = child_text(&server, "Name");
-            if n.is_empty() { host.clone() } else { n }
+            if n.is_empty() {
+                host.clone()
+            } else {
+                n
+            }
         };
 
         // Secret -> vault, then drop the buffer. Never retained on the spec.
@@ -256,19 +273,29 @@ mod tests {
         assert_eq!(store.get("ftp.example.com", "u1").unwrap(), b"secret1");
         assert_eq!(store.get("sftp.example.com", "u2").unwrap(), b"secret2");
         // and are NOT carried on the spec
-        assert!(!serde_json::to_string(&specs[0]).unwrap().contains("secret1"));
+        assert!(!serde_json::to_string(&specs[0])
+            .unwrap()
+            .contains("secret1"));
     }
 
     #[test]
     fn imports_real_sitemanager_xml_when_present() {
         // Exercises the actual FileZilla export (nested <Folder>, XML decl, attributes) when the
         // dev data file exists. Skips gracefully otherwise (no file in a clean checkout / CI).
-        let Ok(xml) = std::fs::read_to_string("data/sitemanager.xml") else { return };
+        let Ok(xml) = std::fs::read_to_string("data/sitemanager.xml") else {
+            return;
+        };
         let store = InMemoryStore::default();
         let specs = load_filezilla(&xml, &store).unwrap();
-        assert!(specs.len() > 1, "expected multiple servers, got {}", specs.len());
+        assert!(
+            specs.len() > 1,
+            "expected multiple servers, got {}",
+            specs.len()
+        );
         // every spec has a host + a protocol we support
         assert!(specs.iter().all(|s| !s.host.is_empty()));
-        assert!(specs.iter().all(|s| matches!(s.protocol, Protocol::Ftp | Protocol::Sftp)));
+        assert!(specs
+            .iter()
+            .all(|s| matches!(s.protocol, Protocol::Ftp | Protocol::Sftp)));
     }
 }

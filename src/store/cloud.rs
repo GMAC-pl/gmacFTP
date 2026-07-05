@@ -90,26 +90,12 @@ mod imp {
         sync_dir().map(|d| d.join(filename(kind)))
     }
 
-    /// Atomic write (temp + rename) so a crash mid-write can't leave a half-written file.
-    pub fn atomic_write(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
-        use std::io::Write;
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
-        {
-            let mut f = std::fs::File::create(&tmp)?;
-            f.write_all(data)?;
-            f.sync_all()?;
-        }
-        std::fs::rename(&tmp, path)?;
-        Ok(())
-    }
-
     pub fn write_item(kind: &str, payload: &[u8]) -> Result<(), String> {
         let p =
             path_for(kind).ok_or_else(|| "no sync folder (iCloud Drive not set up)".to_string())?;
-        atomic_write(&p, payload).map_err(|e| e.to_string())
+        // Reuse vault's hardened atomic_write (O_EXCL + 0600 + fsync + symlink-safe rename) so
+        // synced ciphertext gets the same CRYP-3 protection as the local config dir.
+        crate::store::vault::atomic_write(&p, payload).map_err(|e| e.to_string())
     }
 
     /// `(file mtime as unix secs, file bytes)`. mtime drives last-writer-wins.
@@ -140,9 +126,6 @@ mod imp {
         None
     }
     pub fn write_item(_: &str, _: &[u8]) -> Result<(), String> {
-        Ok(())
-    }
-    pub fn atomic_write(_: &std::path::Path, _: &[u8]) -> std::io::Result<()> {
         Ok(())
     }
     pub fn read_item(_: &str) -> Option<(u64, Vec<u8>)> {
@@ -243,11 +226,10 @@ pub fn pull_and_apply() -> bool {
         return false;
     }
     let mut applied = false;
-    for (kind, local) in [
-        ("connections", connections_path()),
-        ("vault", vault_path()),
-    ] {
-        let Some((ts, payload)) = imp::read_item(kind) else { continue };
+    for (kind, local) in [("connections", connections_path()), ("vault", vault_path())] {
+        let Some((ts, payload)) = imp::read_item(kind) else {
+            continue;
+        };
         if payload.is_empty() {
             continue;
         }
@@ -267,7 +249,7 @@ pub fn pull_and_apply() -> bool {
                 if let Some(parent) = p.parent() {
                     let _ = std::fs::create_dir_all(parent);
                 }
-                if imp::atomic_write(p, &payload).is_ok() {
+                if crate::store::vault::atomic_write(p, &payload).is_ok() {
                     tracing::info!(target: "gmacftp::cloud", kind, "pulled newer state from iCloud");
                     applied = true;
                 }
@@ -337,9 +319,13 @@ pub fn fmt_ts(secs: u64) -> String {
     #[cfg(target_os = "macos")]
     {
         if let Some((mo, d, h, m)) = local_md_hm(secs as i64) {
-            const NAMES: [&str; 12] =
-                ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-            let name = NAMES.get((mo - 1).clamp(0, 11) as usize).copied().unwrap_or("???");
+            const NAMES: [&str; 12] = [
+                "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+            ];
+            let name = NAMES
+                .get((mo - 1).clamp(0, 11) as usize)
+                .copied()
+                .unwrap_or("???");
             return format!("{name} {d:02} {h:02}:{m:02}");
         }
     }
@@ -351,16 +337,33 @@ pub fn fmt_ts(secs: u64) -> String {
 fn local_md_hm(secs: i64) -> Option<(i32, i32, i32, i32)> {
     #[repr(C)]
     struct Tm {
-        tm_sec: i32, tm_min: i32, tm_hour: i32, tm_mday: i32, tm_mon: i32, tm_year: i32,
-        tm_wday: i32, tm_yday: i32, tm_isdst: i32, tm_gmtoff: i64,
+        tm_sec: i32,
+        tm_min: i32,
+        tm_hour: i32,
+        tm_mday: i32,
+        tm_mon: i32,
+        tm_year: i32,
+        tm_wday: i32,
+        tm_yday: i32,
+        tm_isdst: i32,
+        tm_gmtoff: i64,
         tm_zone: *const std::os::raw::c_char,
     }
     extern "C" {
         fn localtime_r(timep: *const i64, result: *mut Tm) -> *mut Tm;
     }
     let mut tm = Tm {
-        tm_sec: 0, tm_min: 0, tm_hour: 0, tm_mday: 1, tm_mon: 0, tm_year: 0,
-        tm_wday: 0, tm_yday: 0, tm_isdst: 0, tm_gmtoff: 0, tm_zone: std::ptr::null(),
+        tm_sec: 0,
+        tm_min: 0,
+        tm_hour: 0,
+        tm_mday: 1,
+        tm_mon: 0,
+        tm_year: 0,
+        tm_wday: 0,
+        tm_yday: 0,
+        tm_isdst: 0,
+        tm_gmtoff: 0,
+        tm_zone: std::ptr::null(),
     };
     let t = secs;
     let ok = unsafe { !localtime_r(&t as *const i64, &mut tm as *mut Tm).is_null() };
@@ -371,7 +374,9 @@ fn local_md_hm(secs: i64) -> Option<(i32, i32, i32, i32)> {
 /// Shown in the menu so the user can see WHEN the cloud copy was last written (and whether one
 /// exists at all on this Mac).
 pub fn remote_connections_ts() -> Option<u64> {
-    imp::read_item("connections").map(|(ts, _)| ts).filter(|ts| *ts > 0)
+    imp::read_item("connections")
+        .map(|(ts, _)| ts)
+        .filter(|ts| *ts > 0)
 }
 
 /// Explicitly push the current connections + vault to the sync folder (the "Send" action).
@@ -403,12 +408,20 @@ pub fn send_now() -> String {
             fmt_ts(ts)
         )
     } else if conn_wrote && vault_wrote {
-        format!("Written to {} ({}) — connections + vault.", where_, fmt_ts(ts))
+        format!(
+            "Written to {} ({}) — connections + vault.",
+            where_,
+            fmt_ts(ts)
+        )
     } else {
         format!(
             "Send ({}) failed: {}",
             fmt_ts(ts),
-            if errors.is_empty() { "no local data".into() } else { errors.join("; ") }
+            if errors.is_empty() {
+                "no local data".into()
+            } else {
+                errors.join("; ")
+            }
         )
     }
 }

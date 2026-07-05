@@ -1,0 +1,18 @@
+version: 2
+updates:
+  # Keep Cargo dependencies current (Cargo.lock is committed, so this updates both manifest + lock).
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    # Group patch/minor bumps so they land in reviewable batches; surface majors separately.
+    groups:
+      patch-and-minor:
+        update-types: ["patch", "minor"]
+  # Keep GitHub Actions versions current (checkout, rust-toolchain, rust-cache, audit-check).
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5

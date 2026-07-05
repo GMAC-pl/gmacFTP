@@ -4,6 +4,21 @@
 
 _(Nothing yet.)_
 
+## 0.0.15 — 2026-07-05
+
+A second hardening pass from a line-by-line code audit. No customer/personal data was ever at risk; these close defense-in-depth and correctness gaps the audit surfaced.
+
+- **Atomic writes extended to `settings.json` + `known_hosts`.** The v0.0.13 "atomic writes everywhere user data lives" claim now actually covers both: a crash mid-save can no longer truncate your settings or — more importantly — the SFTP `known_hosts` trust anchor (a truncated `known_hosts` would silently re-open previously-verified hosts to MITM on the next connection).
+- **Download temp files hardened against symlink-swap (CRYP-3 extended).** FTP/SFTP `.part` files and the updater DMG now open with `O_EXCL` + mode `0600` + symlink-safe retry, matching the vault. A pre-planted `<dest>.part` symlink (e.g. in `~/Downloads`) can no longer redirect downloaded bytes onto the symlink's target.
+- **Updater integrity hardening.** The DMG download now (1) refuses any asset URL that isn't `https://` on `github.com`, (2) sanitizes the release version before it becomes a filename (a git tag could contain `/`), (3) streams to disk with a 300 MiB cap instead of reading the whole DMG into memory, and (4) writes via the atomic temp+rename path.
+- **FTP STARTTLS downgrade is now visible.** When a server refuses TLS and the connection falls back to plaintext FTP (password sent unencrypted — an active MITM can force this), the status bar warns "Connected via plaintext FTP". The password is still never sent on the failed-secure attempt.
+- **Password cache hygiene.** The session password cache (which avoids re-prompting the Keychain) now stores `Zeroizing<String>` (cleartext wiped on drop/overwrite) and evicts a session's password when that session is ejected — instead of holding every password for the whole process.
+- **SFTP `known_hosts` keyed by `host:port`.** Two SFTP servers on different ports of the same host no longer collide on the bare hostname (which caused false MITM rejections or cross-port key pinning). Existing entries are re-confirmed once on first connect after the upgrade.
+- **Relay copies empty files correctly.** Remote→remote relay no longer rejects legitimate 0-byte files (`.gitkeep`, markers) as "downloaded file is empty".
+- **Removed the unused `ubiquity-kvstore` entitlement** (`NSUbiquitousKeyValueStore` is not used — sync is plain files in iCloud Drive). CloudKit + `keychain-access-groups` are retained because the synchronizable vault master-key write requires them.
+- **CI: `cargo fmt --check` + `cargo audit`.** The format gate is now enforced, and a dedicated audit job fails on new vulnerabilities (ignoring only the unfixable `rsa` Marvin-Attack advisory and the two Linux-only `quick-xml` advisories that don't reach the macOS binary — see SECURITY.md). Also bumped `anyhow` to 1.0.103 (clears its unsoundness advisory). Added Dependabot for Cargo + GitHub Actions.
+- Docs: `SECURITY.md` now classifies the `cargo audit` advisories into macOS-runtime (accepted / not-exploitable) vs Linux-only/build-only (not in the shipped binary).
+
 ## 0.0.14 — 2026-07-01
 
 - **Renamed the public app bundle to "gmacFTP".** The app you install is now `gmacFTP.app` with the display name **gmacFTP** (was "gmacFTP Public") — so the menu bar, Applications folder, GitHub DMG, and Homebrew install all show one consistent name. The local personal build is now `gmacFTP-Personal.app` (local-only; avoids a filename clash). Purely cosmetic — no behavior change.

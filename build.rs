@@ -7,15 +7,14 @@ fn main() {
     println!("cargo:rerun-if-env-changed=MACKFTP_CONFIG_ORGANIZATION");
     println!("cargo:rerun-if-env-changed=MACKFTP_CONFIG_APPLICATION");
 
-    let bundle_id = std::env::var("MACKFTP_BUNDLE_ID")
-        .unwrap_or_else(|_| "app.mackftp.client".to_string());
-    let qualifier = std::env::var("MACKFTP_CONFIG_QUALIFIER")
-        .unwrap_or_else(|_| "app".to_string());
+    let bundle_id =
+        std::env::var("MACKFTP_BUNDLE_ID").unwrap_or_else(|_| "app.mackftp.client".to_string());
+    let qualifier = std::env::var("MACKFTP_CONFIG_QUALIFIER").unwrap_or_else(|_| "app".to_string());
     // Preserve the legacy storage identity so saved servers survive the product rename.
-    let organization = std::env::var("MACKFTP_CONFIG_ORGANIZATION")
-        .unwrap_or_else(|_| "mackftp".to_string());
-    let application = std::env::var("MACKFTP_CONFIG_APPLICATION")
-        .unwrap_or_else(|_| "client".to_string());
+    let organization =
+        std::env::var("MACKFTP_CONFIG_ORGANIZATION").unwrap_or_else(|_| "mackftp".to_string());
+    let application =
+        std::env::var("MACKFTP_CONFIG_APPLICATION").unwrap_or_else(|_| "client".to_string());
 
     println!("cargo:rustc-env=MACKFTP_BUNDLE_ID={bundle_id}");
     println!("cargo:rustc-env=MACKFTP_CONFIG_QUALIFIER={qualifier}");
