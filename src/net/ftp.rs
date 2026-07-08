@@ -224,6 +224,45 @@ fn connect(spec: &ConnectionSpec, password: &str) -> Result<Box<dyn FtpConn>, Ne
     Ok(Box::new(plain))
 }
 
+/// [`connect`] with a bounded retry on transient `421 Too many connections` rejections.
+///
+/// Shared-hosting FTP servers cap concurrent sessions per user. A folder download fires one RETR
+/// connection per file, and the server needs a moment to release the previous slot after QUIT —
+/// so the next connect can briefly land on `421 Too many connections`. Without a retry that turned
+/// every file in a large folder into an instant failure, cascading into a rapid storm of 421
+/// errors in the UI. We back off and retry a few times; the slot frees and the file proceeds.
+/// Non-421 errors (auth, TLS, not-found) are returned immediately — only session-limit rejections
+/// are transient enough to retry.
+fn connect_with_retry(spec: &ConnectionSpec, password: &str) -> Result<Box<dyn FtpConn>, NetError> {
+    const ATTEMPTS: u32 = 5;
+    // Escalating backoff (ms): give the server time to release the previous session slot. Shared
+    // hosts sometimes hold a slot briefly in TCP TIME_WAIT after QUIT, so a large folder needs a
+    // few seconds of patience before a file is declared failed (data loss).
+    const BACKOFF_MS: [u64; 4] = [300, 800, 2000, 5000];
+    let mut last: Option<NetError> = None;
+    for attempt in 0..ATTEMPTS {
+        match connect(spec, password) {
+            Ok(c) => return Ok(c),
+            Err(e) => {
+                let transient = matches!(&e, NetError::Ftp(msg) if msg.contains("421"));
+                if !transient || attempt + 1 == ATTEMPTS {
+                    return Err(e);
+                }
+                tracing::warn!(
+                    host = %spec.host,
+                    attempt = attempt + 1,
+                    "FTP 421 (session limit) — backing off and retrying"
+                );
+                last = Some(e);
+                std::thread::sleep(std::time::Duration::from_millis(
+                    BACKOFF_MS[attempt as usize],
+                ));
+            }
+        }
+    }
+    Err(last.expect("retry loop runs at least once before returning"))
+}
+
 /// Per-operation socket I/O timeout. suppaftp's control + data-channel reads are blocking
 /// syscalls with no internal timeout; without this, a server that stalls mid-LIST/RETR/STOR
 /// (or stops replying on the control channel) hangs the blocking pool thread AND the
@@ -309,7 +348,7 @@ pub fn walk(
     password: &str,
     root_dir: &str,
 ) -> Result<Vec<(String, u64)>, NetError> {
-    let mut c = connect(spec, password)?;
+    let mut c = connect_with_retry(spec, password)?;
     let mut out = Vec::new();
     let root = if root_dir.trim().is_empty() {
         "/"
@@ -418,7 +457,7 @@ pub fn download(
     cancel: Option<&AtomicBool>, // M1: cooperative cancel so abort() stops an in-flight transfer
 ) -> Result<u64, NetError> {
     validate_ftp_path(remote_path)?; // NETW-4: CRLF/NUL command-smuggling guard
-    let mut c = connect(spec, password)?;
+    let mut c = connect_with_retry(spec, password)?;
     if let Some(parent) = local_path.parent() {
         let _ = std::fs::create_dir_all(parent); // supports folder downloads
     }
@@ -478,7 +517,7 @@ pub fn upload(
     cancel: Option<&AtomicBool>, // M1
 ) -> Result<u64, NetError> {
     validate_ftp_path(remote_path)?; // NETW-4
-    let mut c = connect(spec, password)?;
+    let mut c = connect_with_retry(spec, password)?;
     if let Some(parent) = parent_remote(remote_path) {
         mkdirs(c.as_mut(), &parent); // supports folder uploads (mkdir -p ancestors)
     }

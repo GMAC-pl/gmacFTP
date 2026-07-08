@@ -109,7 +109,7 @@ impl FileVault {
         // Reuse the in-memory key (Keychain-resolved at open) — do NOT re-hit the Keychain
         // or the master.key file on every write.
         let key = *self.key.lock().unwrap_or_else(|e| e.into_inner());
-        let blob = encrypt(&key, &plaintext).map_err(|e| CredentialError::Other(e))?;
+        let blob = encrypt(&key, &plaintext).map_err(CredentialError::Other)?;
         atomic_write(&self.vault_path, &blob).map_err(|e| CredentialError::Other(e.to_string()))?;
         // Best-effort mirror of vault.bin (and connections.json) to iCloud if sync is on —
         // push_state warns internally, so it never turns a successful local write into a failure.
