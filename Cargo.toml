@@ -43,7 +43,7 @@ keyring = { version = "4", features = ["apple-native-keyring-store"] }
 
 # --- Private encrypted credential vault (no macOS Keychain prompt) ---
 aes-gcm = "0.11"
-rand = "0.8"
+rand = "0.10"
 base64 = "0.22"
 argon2 = "0.5"   # derive the master-key-wrapping key from the user's sync passphrase
 
