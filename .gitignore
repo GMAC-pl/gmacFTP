@@ -1,6 +1,7 @@
 # Rust build artifacts
 /target/
 **/*.rs.bk
+*.dmg
 
 # local private data (connection exports, env)
 /data/
