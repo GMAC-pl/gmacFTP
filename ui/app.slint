@@ -85,8 +85,8 @@ export global I18n {
     out property <string> edit-cap:   locale == "pl" ? "Edytuj"    : "Edit";
     out property <string> del-cap:    locale == "pl" ? "Usuń"      : "Delete";
     out property <string> delete-dont-ask: locale == "pl" ? "Nie pytaj ponownie w tej sesji" : "Don't ask again this session";
-    out property <string> overwrite-title: locale == "pl" ? "Plik już istnieje" : "File already exists";
-    out property <string> overwrite-msg: locale == "pl" ? "Plik o tej nazwie już istnieje w miejscu docelowym. Co chcesz zrobić?" : "A file with this name already exists at the destination. What do you want to do?";
+    out property <string> overwrite-title: locale == "pl" ? "Plik lub folder już istnieje" : "File or folder already exists";
+    out property <string> overwrite-msg: locale == "pl" ? "Plik lub folder o tej nazwie już istnieje w miejscu docelowym. Co chcesz zrobić?" : "A file or folder with this name already exists at the destination. What do you want to do?";
     out property <string> overwrite-cap: locale == "pl" ? "Nadpisz" : "Overwrite";
     out property <string> save-new-cap: locale == "pl" ? "Zapisz jako nowy" : "Save as new";
     out property <string> passphrase-set-title: locale == "pl" ? "Ustaw hasło synchronizacji" : "Set sync passphrase";
@@ -329,6 +329,7 @@ component LabeledToolButton inherits Rectangle {
     in property <bool> disabled: false;
     in property <bool> emphasized: false;       // filled accent chip (primary action)
     in property <bool> danger-emphasis: false;  // emphasized but danger-filled (destructive primary)
+    in property <int> badge: 0;                // count chip (top-right); only shown when > 0
     callback clicked();
     height: 30px; min-width: 72px;
     border-radius: 6px;
@@ -352,6 +353,14 @@ component LabeledToolButton inherits Rectangle {
             text: root.text;
             color: root.disabled ? (root.emphasized ? #FFFFFF99 : Tokens.text-ter) : (root.emphasized ? #FFFFFF : root.text-color);
             font-size: 12px; font-weight: root.emphasized ? 600 : 500; vertical-alignment: center;
+        }
+    }
+    if root.badge > 0 : Rectangle {
+        x: root.width - self.width - 5px; y: -4px; height: 16px; width: max(16px, ltb-badge-text.preferred-width + 8px);
+        border-radius: 8px; background: Tokens.accent;
+        ltb-badge-text := Text {
+            x: 0px; y: 0px; width: parent.width; height: parent.height;
+            text: root.badge; color: #FFFFFF; font-size: 9px; font-weight: 700; vertical-alignment: center; horizontal-alignment: center;
         }
     }
     ta := TouchArea { mouse-cursor: root.disabled ? not-allowed : pointer; clicked => { if (!root.disabled) { root.clicked(); } } }
@@ -823,6 +832,8 @@ export component App inherits Window {
     in-out property <int> selected-connection: -1;
     in-out property <[TransferRow]> transfer-jobs;
     in-out property <string> transfer-summary: "0 transfers";
+    in-out property <int> transfer-done-count: 0;     // completed (done) rows — drives the header pill
+    in-out property <int> transfer-pending-count: 0;  // active + queued — drives the toolbar badge
     in-out property <bool> transfer-panel-open: false;
     in-out property <bool> transfers-paused: false;   // engine pause-all toggle (transfer panel)
     // Tier 2: each pane is independently "local" or a remote host
@@ -1059,7 +1070,7 @@ export component App inherits Window {
                     Rectangle { horizontal-stretch: 1; }
                     LabeledToolButton { width: 88px; icon: "refresh"; text: I18n.refresh; clicked => { root.refresh(); } }
                     ToolDivider { }
-                    LabeledToolButton { width: 124px; icon: "activity"; text: "Transfers"; clicked => { root.transfer-panel-open = !root.transfer-panel-open; } }
+                    LabeledToolButton { width: 124px; icon: "activity"; text: "Transfers"; badge: root.transfer-pending-count; clicked => { root.transfer-panel-open = !root.transfer-panel-open; } }
                     if root.transfer-jobs.length > 0 : VerticalLayout {
                         width: 18px; alignment: center;
                         Rectangle {
@@ -1600,7 +1611,7 @@ export component App inherits Window {
                     text: root.transfer-progress-text;
                     color: Tokens.text-sec; font-family: "JetBrains Mono"; font-size: 10px; vertical-alignment: center;
                 }
-                if root.status != "" : Text { x: 384px; y: 0px; width: 360px; height: parent.height; text: root.status; color: Tokens.success; font-size: 11px; vertical-alignment: center; overflow: elide; }
+                if root.status != "" && !root.transfer-active : Text { x: 384px; y: 0px; width: 360px; height: parent.height; text: root.status; color: Tokens.success; font-size: 11px; vertical-alignment: center; overflow: elide; }
                 if root.error != "" : Text {
                     x: root.width - 620px; y: 0px; width: 260px; height: parent.height;
                     text: "error: " + root.error; color: Tokens.danger; font-size: 11px; vertical-alignment: center; overflow: elide;
@@ -1878,8 +1889,13 @@ export component App inherits Window {
                         }
                         Text { x: 58px; y: 0px; width: 82px; height: parent.height; text: "Transfers"; color: Tokens.text; font-size: 15px; font-weight: 700; vertical-alignment: center; horizontal-alignment: left; }
                         if root.transfer-jobs.length > 0 : Rectangle {
-                            x: 139px; y: 20px; width: 21px; height: 20px; border-radius: 10px; background: Tokens.accent;
-                            Text { text: root.transfer-jobs.length; color: #FFFFFF; font-size: 10px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                            x: 132px; y: 19px; height: 22px; width: hdr-badge-text.preferred-width + 16px;
+                            border-radius: 11px; background: Tokens.accent;
+                            hdr-badge-text := Text {
+                                x: 0px; y: 0px; width: parent.width; height: parent.height;
+                                text: root.transfer-done-count + " / " + root.transfer-jobs.length;
+                                color: #FFFFFF; font-size: 10px; font-weight: 700; vertical-alignment: center; horizontal-alignment: center;
+                            }
                         }
                         Rectangle {
                             x: 414px; y: 17px; width: 34px; height: 26px; border-radius: 4px; background: Tokens.bg;

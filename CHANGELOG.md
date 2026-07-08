@@ -4,6 +4,21 @@
 
 _(Nothing yet.)_
 
+## 0.0.17 — 2026-07-08
+
+A bugfix release. Folder downloads from an FTP/SFTP server were broken; this also tightens the path-containment guard that caused it.
+
+- **Folder downloads work again.** Dragging a folder (or using the arrow button) from a remote pane to a local pane no longer failed with `downloaded 0 file(s); skipped N unsafe path(s)`. The write-boundary containment guard canonicalized the destination folder path, but that folder does not exist until the first file is written — so `canonicalize` returned `NotFound` and every file was silently skipped. The guard now resolves the nearest existing ancestor instead, so a not-yet-created destination root is tolerated (single-file downloads were always unaffected).
+- **Folder downloads no longer error-loop on session-limited FTP servers.** Each file in a folder download opens its own FTP session, and shared-hosting servers that cap concurrent sessions would answer the next connect with `421 Too many connections` — which, across a large folder, cascaded into a rapid storm of errors. Downloads now retry with escalating backoff (up to ~8 s) when the server is briefly over its session limit, so the previous file's slot has time to release.
+- **Arbitrarily large folders stream through a small queue (backpressure).** A folder download no longer pre-loads every file into a fixed-size queue — that capped at a few hundred files and failed the rest with `transfer queue full`. The folder loop now streams jobs into the transfer engine one at a time, waiting when the queue is full, so a 10 000-file download flows through with bounded memory and nothing is dropped.
+- **No more per-file pane flicker during a folder transfer.** The remote/local panes used to re-list (and recalculate folder sizes) after every single file finished. They now refresh once, at the end of the whole batch.
+- **Transfer UI polish.** The compact bottom bar now shows the name of the file currently copying (it used to freeze on the initial label during a fast batch). The transfer panel summary leads with overall progress ("127 / 283 done · …"), the header pill shows done/total with proper padding, and the toolbar Transfers button carries a pending-count badge that opens the panel on click.
+- **Folders now ask before overwriting.** Copying a folder whose name already exists at the destination used to merge silently (only single files prompted). Folders now go through the same overwrite dialog — Overwrite merges into the existing folder, Save-as-new renames, Cancel aborts. (Per-file prompts inside a large folder are intentionally not added — a 300-file folder would mean 300 dialogs.)
+- **Path-containment guard hardened (defense-in-depth).** The same guard now rejects any `..` traversal component outright, and the lenient canonicalization no longer silently drops a trailing `..` (which `Path::file_name()` hides). No remote exploit was reachable — `sanitize_local_rel` already strips `..` from server-controlled names — but the write-boundary backstop is now self-sufficient rather than relying on the primary defense.
+- **Clippy is now clean under `-D warnings`.** Factored the three complex static types into aliases, gave `try_enqueue` a real error type (`QueueFull`), made the transfer-thread-local a `const` initializer, and fixed a handful of redundant-closure / unnecessary-ownership lints. The ten wide internal-helper signatures (`AppCtx`-style argument lists) are explicitly allowed — they are deliberate and noted as known in `ci.yml`. Pure code-quality; no behavior change.
+
+Verified: release build + 29 unit/integration tests + `cargo clippy -D warnings` + `cargo fmt --check` all green.
+
 ## 0.0.16 — 2026-07-05
 
 A code-quality cleanup pass after the v0.0.15 audit. **No user-facing behavior change; no new features.** Everything works exactly as before — this release removes duplication and tightens a few internals the v0.0.15 audit introduced.

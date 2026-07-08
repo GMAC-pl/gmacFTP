@@ -23,6 +23,14 @@ enum Cmd {
     Run(TransferJob, ConnectionSpec),
 }
 
+/// `(conn_id, cancel_flag)` of the job the worker is currently running.
+type InFlight = (usize, Arc<AtomicBool>);
+
+/// `try_enqueue` rejection reason: the bounded worker channel was full, so the job was NOT
+/// accepted (it must be marked failed by the caller rather than left on "queued" forever).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueueFull;
+
 /// Owns the queue. Cheap to clone-share via the returned handle.
 #[derive(Clone)]
 pub struct TransferEngine {
@@ -35,7 +43,7 @@ pub struct TransferEngine {
     /// The currently in-flight job's `(conn_id, cancel_flag)`. `abort(conn_id)` sets the flag
     /// when it matches, so the orphan's terminal update is suppressed — independent of the
     /// pending-skip set, which avoids the abort/re-enqueue race the global flag had.
-    current: Arc<Mutex<Option<(usize, Arc<AtomicBool>)>>>,
+    current: Arc<Mutex<Option<InFlight>>>,
     /// Pause-all toggle (transfer panel): when set, the worker holds a freshly dequeued job
     /// without starting it until cleared. An in-flight transfer finishes normally first.
     paused: Arc<AtomicBool>,
@@ -46,10 +54,11 @@ impl TransferEngine {
     /// `updates` is where progress/final events land — the UI reads the other end.
     pub fn start(store: Arc<dyn CredentialStore>, updates: mpsc::Sender<TransferUpdate>) -> Self {
         // CONC-1: capacity large enough that a folder transfer (one Cmd per file) plus any
-        // in-flight single-file job never overflows try_send. Cmd is small; 256 ≈ negligible.
-        let (tx, mut rx) = mpsc::channel::<Cmd>(256);
+        // in-flight single-file job never overflows try_send. 8192 covers large folders (a web
+        // build with thousands of hashed assets); a Cmd is ~200 bytes so the buffer is ~1.6 MB.
+        let (tx, mut rx) = mpsc::channel::<Cmd>(8192);
         let aborted_conns: Arc<Mutex<HashSet<usize>>> = Arc::new(Mutex::new(HashSet::new()));
-        let current: Arc<Mutex<Option<(usize, Arc<AtomicBool>)>>> = Arc::new(Mutex::new(None));
+        let current: Arc<Mutex<Option<InFlight>>> = Arc::new(Mutex::new(None));
         let paused = Arc::new(AtomicBool::new(false));
         let (aborted_w, current_w, paused_w) =
             (aborted_conns.clone(), current.clone(), paused.clone());
@@ -88,11 +97,11 @@ impl TransferEngine {
     /// if the worker channel is full (the job was not accepted). A fresh job for a connection
     /// clears any stale per-conn abort for it (reconnect resumes transfers). This does NOT
     /// touch an in-flight orphan's per-job flag, so there is no abort/re-enqueue race.
-    pub fn try_enqueue(&self, job: TransferJob, spec: ConnectionSpec) -> Result<(), ()> {
+    pub fn try_enqueue(&self, job: TransferJob, spec: ConnectionSpec) -> Result<(), QueueFull> {
         if let Ok(mut g) = self.aborted_conns.lock() {
             g.remove(&spec.id.0);
         }
-        self.tx.try_send(Cmd::Run(job, spec)).map_err(|_| ())
+        self.tx.try_send(Cmd::Run(job, spec)).map_err(|_| QueueFull)
     }
 
     pub async fn enqueue(&self, job: TransferJob, spec: ConnectionSpec) {

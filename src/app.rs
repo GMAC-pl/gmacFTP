@@ -3,6 +3,11 @@
 //! `slint::invoke_from_event_loop`. All Slint callbacks are wired here, including the
 //! connection manager (add / edit / delete / import from a third-party file manager).
 
+// Internal UI-controller helpers thread a lot of shared state (handle, store, panes, engine,
+// idx, ui) plus per-call args. These wide signatures are deliberate and accepted (see the
+// "known lints" note in ci.yml) — collapsing them into a context struct is a separate change.
+#![allow(clippy::too_many_arguments)]
+
 #[cfg(target_os = "macos")]
 use std::cell::Cell;
 use std::cmp::Ordering;
@@ -28,6 +33,9 @@ use gmacftp::transfer::{TransferEngine, TransferState, TransferUpdate};
 use crate::{App, ConnRow, EntryRow, LocalFavoriteRow, TransferRow};
 
 type ConnList = Arc<Mutex<Vec<ConnectionSpec>>>;
+type PasswordCache = HashMap<(String, String), Zeroizing<String>>;
+type PendingCopy = (usize, usize, String, bool, Option<u64>);
+type PendingExternalUpload = (ConnectionSpec, PathBuf, String, String, Option<u64>, bool);
 
 /// Per-session password cache: (host, user) -> password. The first read per connection
 /// hits the Keychain (one macOS auth prompt); every later connect/navigation/refresh in
@@ -36,7 +44,7 @@ type ConnList = Arc<Mutex<Vec<ConnectionSpec>>>;
 /// "Always Allow" to an ad-hoc-signed app across launches, so this in-memory cache is
 /// the fix within a session.)
 use zeroize::Zeroizing;
-static PASSWORD_CACHE: LazyLock<Mutex<HashMap<(String, String), Zeroizing<String>>>> =
+static PASSWORD_CACHE: LazyLock<Mutex<PasswordCache>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 const MAX_LOCAL_FOLDER_STAT_FILES: usize = 3_000;
@@ -44,15 +52,13 @@ const MAX_REMOTE_FOLDER_STAT_FILES: usize = 2_000;
 
 /// A copy blocked on a name conflict, awaiting the user's choice in the overwrite dialog.
 /// (src_pane, dst_pane, name, is_dir, total)
-static PENDING_COPY: LazyLock<Mutex<Option<(usize, usize, String, bool, Option<u64>)>>> =
-    LazyLock::new(|| Mutex::new(None));
+static PENDING_COPY: LazyLock<Mutex<Option<PendingCopy>>> = LazyLock::new(|| Mutex::new(None));
 
 /// Finder→server uploads blocked on the overwrite-conflict dialog (the external-drag twin of
 /// PENDING_COPY). A FIFO queue: a multi-file drop may contain several conflicting names, confirmed
 /// one at a time. (spec, local source path, remote directory, name, byte size, is_dir).
-static PENDING_EXTERNAL_UPLOAD: LazyLock<
-    Mutex<VecDeque<(ConnectionSpec, PathBuf, String, String, Option<u64>, bool)>>,
-> = LazyLock::new(|| Mutex::new(VecDeque::new()));
+static PENDING_EXTERNAL_UPLOAD: LazyLock<Mutex<VecDeque<PendingExternalUpload>>> =
+    LazyLock::new(|| Mutex::new(VecDeque::new()));
 
 /// Per-pane "Don't ask again this session" for the delete-confirmation dialog, indexed by pane
 /// (0 = left, 1 = right). Keying per-pane (not one global flag) means ticking it while deleting on
@@ -83,8 +89,9 @@ fn set_skip_delete_confirm(pane: usize, v: bool) {
 // Background tasks (transfer forwarder, folder walks) reach it via this thread-local on the
 // UI thread instead of capturing the Rc across threads (which would violate Send).
 thread_local! {
-    static TRANSFER_JOBS: std::cell::RefCell<Option<Rc<VecModel<TransferRow>>>> =
-        std::cell::RefCell::new(None);
+    static TRANSFER_JOBS: std::cell::RefCell<Option<Rc<VecModel<TransferRow>>>> = const {
+        std::cell::RefCell::new(None)
+    };
 }
 /// Push a transfer row from anywhere on the UI thread.
 fn jobs_push(row: TransferRow, idx: &Arc<Mutex<HashMap<i32, usize>>>) {
@@ -114,11 +121,15 @@ fn transfer_summary_from_rows(rows: &[TransferRow]) -> String {
         .filter_map(|r| parse_mbps(r.message.as_str()))
         .sum::<f32>();
 
+    let total = rows.len();
     let mut parts = Vec::new();
+    // Lead with overall progress so a batch transfer always shows "X / Y done" at a glance
+    // (was: only "N active / N queued" — the total and how far along were not visible).
+    parts.push(format!("{done} / {total} done"));
     if active > 0 {
         parts.push(format!("{active} active"));
         if speed > 0.0 {
-            parts.push(format!("{speed:.1} MB/s total"));
+            parts.push(format!("{speed:.1} MB/s"));
         }
     }
     if queued > 0 {
@@ -126,12 +137,6 @@ fn transfer_summary_from_rows(rows: &[TransferRow]) -> String {
     }
     if failed > 0 {
         parts.push(format!("{failed} failed"));
-    }
-    if done > 0 && active == 0 && queued == 0 && failed == 0 {
-        parts.push(format!("{done} done"));
-    }
-    if parts.is_empty() {
-        parts.push(format!("{} transfers", rows.len()));
     }
     parts.join(" · ")
 }
@@ -148,6 +153,13 @@ fn update_transfer_summary_from_model(ui: &App, jobs: &Rc<VecModel<TransferRow>>
     let rows = (0..jobs.row_count())
         .filter_map(|i| jobs.row_data(i))
         .collect::<Vec<_>>();
+    let done = rows.iter().filter(|r| r.state.as_str() == "done").count() as i32;
+    let pending = rows
+        .iter()
+        .filter(|r| matches!(r.state.as_str(), "active" | "queued"))
+        .count() as i32;
+    ui.set_transfer_done_count(done);
+    ui.set_transfer_pending_count(pending);
     ui.set_transfer_summary(transfer_summary_from_rows(&rows).into());
 }
 
@@ -162,9 +174,15 @@ fn update_transfer_summary(ui: &App) {
     });
 }
 
+/// Monotonic transfer id shared by single-file (`enqueue`), folder-batch, and relay rows so two
+/// transfers can never collide on the same panel-row id (the forwarder matches updates by id).
+static XFER_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+fn fresh_xfer_id() -> usize {
+    XFER_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 fn next_xfer_id() -> i32 {
-    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
-    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as i32
+    fresh_xfer_id() as i32
 }
 
 /// Update an existing transfer row by id (UI thread).
@@ -693,7 +711,7 @@ pub fn run() {
     // Mac reflects the latest state from the user's other devices — and, if the sync folder is
     // still empty but this Mac already has servers, seed it from them (migration). No-op if
     // sync disabled. Local files are never deleted, so existing servers are always kept.
-    let _ = store::cloud::bootstrap();
+    store::cloud::bootstrap();
     // Create the store AFTER the pull so FileVault::open loads the just-pulled vault (and so
     // is_locked() reflects the post-pull state).
     let store: Arc<dyn CredentialStore> = Arc::new(store::default_store());
@@ -1874,11 +1892,11 @@ fn apply_palette_filter(ui: &App) {
         .filter(|row| {
             conn_row_matches(row, &query)
                 || (demo
-                    && row.label.to_string() == "Backups"
+                    && &*row.label == "Backups"
                     && "production backups".contains(query.trim().to_lowercase().as_str()))
         })
         .map(|mut row| {
-            if demo && row.label.to_string() == "Backups" {
+            if demo && &*row.label == "Backups" {
                 row.label = "Production Backups".into();
             }
             row
@@ -2976,13 +2994,7 @@ fn transfer(
         .lock()
         .ok()
         .and_then(|g| g.get(&(src_pane, name.clone())).copied())
-        .or_else(|| {
-            if row.size > 0 {
-                Some(row.size as u64)
-            } else {
-                None
-            }
-        });
+        .or((row.size > 0).then_some(row.size as u64));
     start_transfer(
         handle,
         store,
@@ -2998,8 +3010,9 @@ fn transfer(
     );
 }
 
-/// Start a copy: for a single file, check the destination for a name clash and open the overwrite
-/// dialog if there is one; otherwise (or for folders) run the transfer immediately.
+/// Start a copy: check the destination for a name clash and open the overwrite dialog if there is
+/// one (folders too — copying a folder that already exists asks before merging into it); otherwise
+/// run the transfer immediately.
 fn start_transfer(
     handle: &Handle,
     store: Arc<dyn CredentialStore>,
@@ -3013,23 +3026,6 @@ fn start_transfer(
     is_dir: bool,
     total: Option<u64>,
 ) {
-    if is_dir {
-        do_transfer(
-            handle,
-            store,
-            panes,
-            engine,
-            idx,
-            ui,
-            src_pane,
-            dst_pane,
-            name.clone(),
-            name,
-            is_dir,
-            total,
-        );
-        return;
-    }
     let (dst_kind, dst_conn, dst_cwd) = {
         let p = panes.lock().expect("panes");
         let s = &p[dst_pane];
@@ -3549,6 +3545,85 @@ fn wire_send_sync(ui: &App, store: Arc<dyn CredentialStore>, conns: ConnList) {
     });
 }
 
+/// One planned file in a folder transfer (the Send-friendly payload built off the UI thread; the
+/// panel row is materialised from it on the UI thread because Slint models are !Send).
+#[derive(Clone)]
+struct PlannedXfer {
+    id: usize,
+    label: String,
+    local_path: String,
+    remote_path: String,
+    bytes_total: Option<u64>,
+}
+
+/// Push one panel row per planned transfer (on the UI thread, awaited via a oneshot so no engine
+/// update can ever race ahead of its row), then stream the jobs into the engine with BACKPRESSURE.
+/// The bounded worker channel therefore never overflows for an arbitrarily large folder — the loop
+/// simply waits for the engine to drain a slot before handing it the next file. This is what lets a
+/// 10 000-file download flow through a small queue with bounded memory (no "transfer queue full").
+async fn stream_folder_transfers(
+    engine: &TransferEngine,
+    ui: Weak<App>,
+    idx: Arc<Mutex<HashMap<i32, usize>>>,
+    spec: ConnectionSpec,
+    direction: TransferDirection,
+    host: String,
+    plans: Vec<PlannedXfer>,
+    status_msg: String,
+) {
+    let dir_s: &'static str = match direction {
+        TransferDirection::Download => "download",
+        TransferDirection::Upload => "upload",
+    };
+    let route = match direction {
+        TransferDirection::Upload => format!("local -> {host}"),
+        TransferDirection::Download => format!("{host} -> local"),
+    };
+    let plans_for_rows = plans.clone();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+    let _ = slint::invoke_from_event_loop(move || {
+        for p in &plans_for_rows {
+            let total_i = p.bytes_total.unwrap_or(0).min(i32::MAX as u64) as i32;
+            let row = TransferRow {
+                id: p.id as i32,
+                name: p.label.clone().into(),
+                direction: dir_s.into(),
+                done: 0,
+                total: total_i,
+                progress_text: fmt_transfer_progress(0, p.bytes_total.unwrap_or(0)).into(),
+                fraction: 0.0,
+                state: "queued".into(),
+                message: "".into(),
+                route: route.clone().into(),
+            };
+            jobs_push(row, &idx);
+        }
+        if let Some(ui) = ui.upgrade() {
+            ui.set_status(status_msg.into());
+            ui.set_transfer_active(true);
+            ui.set_transfer_total(0);
+            ui.set_transfer_done(0);
+            ui.set_transfer_fraction(0.0);
+            update_transfer_summary(&ui);
+        }
+        let _ = ready_tx.send(());
+    });
+    // Wait until every row is inserted on the UI thread — guarantees a row exists for each job
+    // before the engine can emit its first Active/Done update (else the update is dropped and the
+    // row would sit on "queued" forever).
+    let _ = ready_rx.await;
+    for p in plans {
+        let job = TransferJob {
+            id: TransferId(p.id),
+            direction,
+            local_path: p.local_path,
+            remote_path: p.remote_path,
+            bytes_total: p.bytes_total,
+        };
+        engine.enqueue(job, spec.clone()).await;
+    }
+}
+
 /// Local → Remote folder: walk local, enqueue one upload per file (mkdir -p on the server).
 fn copy_local_to_remote(
     handle: &Handle,
@@ -3559,36 +3634,46 @@ fn copy_local_to_remote(
     local_base: PathBuf,
     remote_base: String,
 ) {
-    let (engine2, idx2, uw, lb) = (engine.clone(), idx.clone(), ui.clone(), local_base.clone());
+    let (engine2, idx2, uw) = (engine.clone(), idx.clone(), ui.clone());
+    let host = spec.host.clone();
     let _ = ui
         .upgrade()
         .map(|u| u.set_status("preparing folder upload…".into()));
     handle.spawn(async move {
-        let files = tokio::task::spawn_blocking(move || walk_local(&lb))
+        let files = tokio::task::spawn_blocking(move || walk_local(&local_base))
             .await
             .unwrap_or_default();
-        let _ = slint::invoke_from_event_loop(move || {
-            let Some(ui) = uw.upgrade() else { return };
-            if files.is_empty() {
-                ui.set_status("folder is empty".into());
-                return;
-            }
-            ui.set_status(format!("uploading {} files…", files.len()).into());
-            for (lp, rel, size) in &files {
-                let rp = join_remote(PathBuf::from(&remote_base).join(rel));
-                enqueue(
-                    &engine2,
-                    &ui,
-                    &idx2,
-                    spec.clone(),
-                    TransferDirection::Upload,
-                    lp.clone(),
-                    rp,
-                    rel,
-                    if *size > 0 { Some(*size) } else { None },
-                );
-            }
-        });
+        let mut plans: Vec<PlannedXfer> = Vec::with_capacity(files.len());
+        for (lp, rel, size) in &files {
+            let rp = join_remote(PathBuf::from(&remote_base).join(rel));
+            plans.push(PlannedXfer {
+                id: fresh_xfer_id(),
+                label: rel.clone(),
+                local_path: lp.to_string_lossy().to_string(),
+                remote_path: rp,
+                bytes_total: if *size > 0 { Some(*size) } else { None },
+            });
+        }
+        if plans.is_empty() {
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(ui) = uw.upgrade() {
+                    ui.set_status("folder is empty".into());
+                }
+            });
+            return;
+        }
+        let n = plans.len();
+        stream_folder_transfers(
+            &engine2,
+            uw,
+            idx2,
+            spec,
+            TransferDirection::Upload,
+            host,
+            plans,
+            format!("uploading {n} files…"),
+        )
+        .await;
     });
 }
 
@@ -3608,50 +3693,87 @@ fn copy_remote_to_local(
         return;
     };
     let (engine2, idx2, uw, rb) = (engine.clone(), idx.clone(), ui.clone(), remote_base.clone());
+    let host = spec.host.clone();
     let _ = ui
         .upgrade()
         .map(|u| u.set_status("preparing folder download…".into()));
     handle.spawn(async move {
         let files = net::walk_remote(&spec, &password, &rb).await;
-        let _ = slint::invoke_from_event_loop(move || {
-            let Some(ui) = uw.upgrade() else { return };
-            match files {
-                Ok(list) if list.is_empty() => ui.set_status("folder is empty".into()),
-                Ok(list) => {
-                    ui.set_status(format!("downloading {} files…", list.len()).into());
-                    let mut skipped: usize = 0;
-                    for (rp, size) in &list {
-                        // Contain server-controlled relative paths (PATH-1/2): reject `..`/
-                        // absolute/control-byte entries instead of joining them verbatim.
-                        let rel = match net::sanitize_local_rel(
-                            &rp.strip_prefix(&remote_base).map(|p| p.to_string()).unwrap_or_default(),
-                        ) {
-                            Ok(c) => c,
-                            Err(e) => {
-                                tracing::warn!(remote = %rp, error = %e, "skipping unsafe remote path");
-                                skipped += 1;
-                                continue;
-                            }
-                        };
-                        let lp = local_base.join(&rel);
-                        // Defense-in-depth (safe.rs assert_within): confirm the resolved local
-                        // path stays inside the user-chosen download root.
-                        if let Err(e) = net::assert_within(&local_base, &lp) {
-                            tracing::warn!(remote = %rp, error = %e, "skipping out-of-root path");
+        let mut plans: Vec<PlannedXfer> = Vec::new();
+        let mut skipped: usize = 0;
+        match files {
+            Err(e) => {
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(ui) = uw.upgrade() {
+                        ui.set_error(e.to_string().into());
+                    }
+                });
+                return;
+            }
+            Ok(list) => {
+                for (rp, size) in &list {
+                    // Contain server-controlled relative paths (PATH-1/2): reject `..`/
+                    // absolute/control-byte entries instead of joining them verbatim.
+                    let rel = match net::sanitize_local_rel(
+                        &rp.strip_prefix(&remote_base)
+                            .map(|p| p.to_string())
+                            .unwrap_or_default(),
+                    ) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            tracing::warn!(remote = %rp, error = %e, "skipping unsafe remote path");
                             skipped += 1;
                             continue;
                         }
-                        enqueue(&engine2, &ui, &idx2, spec.clone(), TransferDirection::Download, lp, rp.clone(), &rel, if *size > 0 { Some(*size) } else { None });
+                    };
+                    let lp = local_base.join(&rel);
+                    // Defense-in-depth (safe.rs assert_within): confirm the resolved local path
+                    // stays inside the user-chosen download root.
+                    if let Err(e) = net::assert_within(&local_base, &lp) {
+                        tracing::warn!(remote = %rp, error = %e, "skipping out-of-root path");
+                        skipped += 1;
+                        continue;
                     }
-                    if skipped > 0 {
-                        ui.set_status(
-                            format!("downloaded {} file(s); skipped {skipped} unsafe path(s)", list.len() - skipped).into(),
-                        );
-                    }
+                    plans.push(PlannedXfer {
+                        id: fresh_xfer_id(),
+                        label: rel,
+                        local_path: lp.to_string_lossy().to_string(),
+                        remote_path: rp.clone(),
+                        bytes_total: if *size > 0 { Some(*size) } else { None },
+                    });
                 }
-                Err(e) => ui.set_error(e.to_string().into()),
             }
-        });
+        }
+        if plans.is_empty() {
+            let msg = if skipped > 0 {
+                format!("no safe files to download (skipped {skipped} unsafe path(s))")
+            } else {
+                "folder is empty".to_string()
+            };
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(ui) = uw.upgrade() {
+                    ui.set_status(msg.into());
+                }
+            });
+            return;
+        }
+        let n = plans.len();
+        let status_msg = if skipped > 0 {
+            format!("downloading {n} files… (skipped {skipped} unsafe path(s))")
+        } else {
+            format!("downloading {n} files…")
+        };
+        stream_folder_transfers(
+            &engine2,
+            uw,
+            idx2,
+            spec,
+            TransferDirection::Download,
+            host,
+            plans,
+            status_msg,
+        )
+        .await;
     });
 }
 
@@ -5267,8 +5389,7 @@ fn enqueue(
     label_name: &str,
     bytes_total: Option<u64>,
 ) {
-    static NEXT_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
-    let id = TransferId(NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+    let id = TransferId(fresh_xfer_id());
     let dir_s = match direction {
         TransferDirection::Download => "download",
         TransferDirection::Upload => "upload",
@@ -5385,6 +5506,9 @@ fn spawn_progress_forwarder(
                             };
                             row.progress_text = fmt_transfer_progress(u.bytes_done, total).into();
                             row.message = format_eta(&eta, id, u.bytes_done, total);
+                            // Mirror the file currently being copied into the compact bottom bar
+                            // — otherwise a fast batch leaves it stuck on the initial label.
+                            ui.set_transfer_label(row.name.clone());
                         }
                         TransferState::Done => {
                             row.state = "done".into();
@@ -5421,7 +5545,15 @@ fn spawn_progress_forwarder(
                     TransferState::Done => {
                         ui.set_transfer_active(false);
                         ui.set_transfer_fraction(1.0);
-                        ui.set_status("transfer complete".into());
+                        // Only announce completion once the WHOLE batch is finished. Setting this on
+                        // every file's Done made "transfer complete" flash between files and overlap
+                        // the bottom-bar filename; mid-batch we clear it (and the bar hides status
+                        // while transfer-active anyway). transfer-pending-count was just refreshed.
+                        if ui.get_transfer_pending_count() == 0 {
+                            ui.set_status("transfer complete".into());
+                        } else {
+                            ui.set_status("".into());
+                        }
                         // (Re)arm a trailing 600ms refresh timer; only the latest arming fires.
                         // This runs on the UI thread; spawn the timer on the runtime, then hop
                         // back to the UI thread for the re-list (Slint models are !Send).
@@ -5438,7 +5570,25 @@ fn spawn_progress_forwarder(
                             if pg.load(std::sync::atomic::Ordering::SeqCst) == gen {
                                 let _ = slint::invoke_from_event_loop(move || {
                                     if let Some(ui) = uw.upgrade() {
-                                        refresh_both_panes(&h, st, pn, ui.as_weak());
+                                        // Suppress the re-list while a batch (folder) transfer is
+                                        // still in flight — otherwise each file's Done fires its
+                                        // own pane refresh (flicker + size recalculation). Refresh
+                                        // only once the panel has no active/queued rows left.
+                                        let busy = TRANSFER_JOBS.with(|jm| {
+                                            jm.borrow()
+                                                .as_ref()
+                                                .map(|jobs| {
+                                                    (0..jobs.row_count()).any(|i| {
+                                                        jobs.row_data(i).is_some_and(|r| {
+                                                            matches!(&*r.state, "active" | "queued")
+                                                        })
+                                                    })
+                                                })
+                                                .unwrap_or(false)
+                                        });
+                                        if !busy {
+                                            refresh_both_panes(&h, st, pn, ui.as_weak());
+                                        }
                                     }
                                 });
                             }
