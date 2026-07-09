@@ -35,7 +35,7 @@ futures = "0.3"
 suppaftp = { version = "8", features = ["native-tls"] }
 
 # --- SFTP (pure Rust, no C deps) ---
-russh = "0.61"
+russh = "0.62"
 russh-sftp = "2"
 
 # --- Keychain (v4 split the backends into per-store features) ---
