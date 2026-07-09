@@ -1,13 +1,13 @@
 //! FTP / FTPS client (suppaftp 8 + native-tls).
 //!
 //! Security ordering: connect (plaintext control channel) -> into_secure (AUTH TLS) ->
-//! login (USER/PASS). The password is sent ONLY on the transport that succeeds: under
-//! TLS when the server supports it, or on a fresh plaintext connection for legacy hosts
-//! (WDMyCloud LAN, old FTP) — never on a failed-secure attempt. This is standard
-//! FTP-client behavior and keeps every one of the 26 FTP seed hosts connectable.
+//! login (USER/PASS). The password is never sent until explicit FTPS is established. Plain
+//! FTP remains available only after a deliberate, application-level opt-in for a legacy host;
+//! a refused `AUTH TLS` can never silently downgrade an authenticated session.
 
 use std::io::{Read, Write};
 
+use std::net::{TcpStream, ToSocketAddrs};
 use std::str::FromStr;
 use suppaftp::list::File;
 use suppaftp::native_tls::TlsConnector;
@@ -37,6 +37,13 @@ pub fn accept_invalid_tls() -> bool {
         || std::env::var("MACKFTP_TLS_INSECURE")
             .map(|v| v == "1")
             .unwrap_or(false)
+}
+
+/// Whether this one saved connection was explicitly approved for plaintext FTP. This deliberately
+/// reads the per-connection setting instead of a process-wide switch: accepting legacy FTP for
+/// one LAN server must never authorize a downgrade for another host.
+pub fn allow_plaintext_ftp(spec: &ConnectionSpec) -> bool {
+    spec.allow_plaintext_ftp
 }
 
 /// The FTP methods gmacFTP uses, abstracted so a secured (FTPS) and a plain stream are
@@ -85,15 +92,22 @@ macro_rules! impl_ftp_conn {
                 self.quit()
             }
             fn retr_stream(&mut self, path: &str) -> Result<Box<dyn Read>, FtpError> {
-                self.retr_as_stream(path)
-                    .map(|s| Box::new(s) as Box<dyn Read>)
+                self.retr_as_stream(path).map(|s| {
+                    // Defense in depth: passive streams are configured by
+                    // `timed_passive_stream`, and this also covers a future active-mode
+                    // caller before the stream is erased behind `dyn Read`.
+                    apply_io_timeout(s.get_ref());
+                    Box::new(s) as Box<dyn Read>
+                })
             }
             fn finalize_retr(&mut self, stream: Box<dyn Read>) -> Result<(), FtpError> {
                 self.finalize_retr_stream(stream)
             }
             fn put_stream(&mut self, path: &str) -> Result<Box<dyn Write>, FtpError> {
-                self.put_with_stream(path)
-                    .map(|s| Box::new(s) as Box<dyn Write>)
+                self.put_with_stream(path).map(|s| {
+                    apply_io_timeout(s.get_ref());
+                    Box::new(s) as Box<dyn Write>
+                })
             }
             fn finalize_put(&mut self, writer: Box<dyn Write>) -> Result<(), FtpError> {
                 self.finalize_put_stream(writer)
@@ -152,12 +166,12 @@ fn parent_remote(remote_path: &str) -> Option<String> {
     }
 }
 
-/// Connect + authenticate. Tries explicit FTPS; on TLS-not-supported, reconnects plain.
+/// Connect + authenticate with explicit FTPS.
 ///
-/// The returned connection's [`FtpConn::is_plaintext`] is `true` when the session is a plaintext
-/// FTP connection (the password was sent in the clear) so the UI can surface a warning; it is
-/// `false` for the secure FTPS path. The password is NEVER sent on the failed-secure attempt —
-/// only on the transport that succeeds.
+/// A refused `AUTH TLS` is an error by default. A legacy plaintext connection is attempted only
+/// when [`ConnectionSpec::allow_plaintext_ftp`] was explicitly enabled for this exact saved
+/// connection; even then it starts over on a fresh
+/// control socket, so no credentials ever cross the failed FTPS attempt.
 ///
 /// TLS strictness follows the `accept_any_cert` setting (**default OFF = strict** — verify the
 /// cert chain). Users who need lenient mode for a mismatched-cert shared host toggle the shield
@@ -181,46 +195,54 @@ fn connect(spec: &ConnectionSpec, password: &str) -> Result<Box<dyn FtpConn>, Ne
         tls_builder.danger_accept_invalid_certs(true);
     }
 
-    if let Ok(tls) = tls_builder.build() {
-        let connector = NativeTlsConnector::from(tls);
-        match NativeTlsFtpStream::connect(addr) {
-            Ok(stream) => match stream.into_secure(connector, &spec.host) {
-                Ok(mut sec) => {
-                    map_login(sec.login(spec.user.as_str(), password))?;
-                    sec.transfer_type(FileType::Binary)
-                        .map_err(NetError::from_ftp)?; // TYPE I — preserve binary integrity
-                    apply_io_timeout(sec.get_ref());
-                    return Ok(Box::new(sec));
-                }
-                // The server replied to AUTH TLS with an error (504/500) => it does not
-                // speak TLS. Safe to fall back to plaintext. No password was sent yet.
-                Err(FtpError::UnexpectedResponse(resp)) => {
-                    tracing::info!(
-                        host = %spec.host,
-                        code = resp.status.code(),
-                        "server has no TLS; using plaintext FTP"
-                    );
-                }
-                // Any other failure (e.g. certificate rejected under strict TLS) is a real
-                // TLS problem. Do NOT silently downgrade to a credential-leaking plaintext
-                // session — surface it (the user can opt in via MACKFTP_TLS_INSECURE=1).
-                Err(e) => {
-                    tracing::warn!(host = %spec.host, error = %e, "TLS negotiation failed");
-                    return Err(NetError::from_ftp(e));
-                }
-            },
-            Err(e) => return Err(NetError::from_ftp(e)),
+    let tls = tls_builder
+        .build()
+        .map_err(|e| NetError::Ftp(format!("could not configure TLS: {e}")))?;
+    let connector = NativeTlsConnector::from(tls);
+    let stream =
+        NativeTlsFtpStream::connect_with_stream(connect_tcp(addr)?).map_err(NetError::from_ftp)?;
+    match stream.into_secure(connector, &spec.host) {
+        Ok(mut sec) => {
+            // `suppaftp` otherwise uses unbounded `TcpStream::connect` for every passive data
+            // channel. Preserve its passive-mode compatibility while bounding the connection and
+            // subsequent I/O on every LIST/RETR/STOR data socket.
+            sec = sec.passive_stream_builder(timed_passive_stream);
+            map_login(sec.login(spec.user.as_str(), password))?;
+            sec.transfer_type(FileType::Binary)
+                .map_err(NetError::from_ftp)?; // TYPE I — preserve binary integrity
+            return Ok(Box::new(sec));
+        }
+        Err(FtpError::UnexpectedResponse(resp)) if allow_plaintext_ftp(spec) => {
+            tracing::warn!(
+                host = %spec.host,
+                code = resp.status.code(),
+                "server refused FTPS; opening explicitly authorized plaintext FTP session"
+            );
+        }
+        Err(FtpError::UnexpectedResponse(resp)) => {
+            return Err(NetError::Ftp(format!(
+                "server refused explicit FTPS (AUTH TLS, reply {}). Plaintext FTP is disabled; explicitly confirm the legacy-server warning before retrying",
+                resp.status.code()
+            )));
+        }
+        // Any other failure (e.g. certificate rejected under strict TLS) is a real TLS problem.
+        // Never silently downgrade to a credential-leaking plaintext session.
+        Err(e) => {
+            tracing::warn!(host = %spec.host, error = %e, "TLS negotiation failed");
+            return Err(NetError::from_ftp(e));
         }
     }
 
-    let mut plain = FtpStream::connect(addr).map_err(NetError::from_ftp)?;
+    // `allow_plaintext_ftp(spec)` was true for the refused-AUTH-TLS branch above. A fresh socket is
+    // required because the failed negotiation may have left bytes buffered on the first one.
+    let mut plain = FtpStream::connect_with_stream(connect_tcp(addr)?)
+        .map_err(NetError::from_ftp)?
+        .passive_stream_builder(timed_passive_stream);
     map_login(plain.login(spec.user.as_str(), password))?;
     plain
         .transfer_type(FileType::Binary)
         .map_err(NetError::from_ftp)?;
-    apply_io_timeout(plain.get_ref());
-    // Plaintext fallback: the password is about to be / has been sent in the clear on this
-    // connection. Signal the caller so it can warn the user (active MITM can force this path).
+    // The caller can surface that this explicitly approved session is plaintext.
     Ok(Box::new(plain))
 }
 
@@ -270,7 +292,46 @@ fn connect_with_retry(spec: &ConnectionSpec, password: &str) -> Result<Box<dyn F
 /// wrapper. The socket timeout is the only thing that can actually unblock the syscall.
 /// 45s tolerates slow large-file data transfers while converting a true stall into a clean
 /// std::io::Error -> NetError.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 const IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+const MAX_LISTING_ENTRIES: usize = 50_000;
+const MAX_REMOTE_FILES: usize = 100_000;
+const MAX_REMOTE_DIRECTORIES: usize = 10_000;
+const MAX_RECURSION_DEPTH: usize = 64;
+
+/// Resolve every returned address and use a bounded TCP handshake for each. `TcpStream::connect`
+/// can otherwise block the `spawn_blocking` pool indefinitely before the control socket exists.
+fn connect_tcp(addr: (&str, u16)) -> Result<TcpStream, NetError> {
+    let mut resolved = addr.to_socket_addrs()?;
+    let Some(first) = resolved.next() else {
+        return Err(NetError::Ftp(format!(
+            "no addresses found for {}:{}",
+            addr.0, addr.1
+        )));
+    };
+    let mut last_error = None;
+    for socket_addr in std::iter::once(first).chain(resolved) {
+        match TcpStream::connect_timeout(&socket_addr, CONNECT_TIMEOUT) {
+            Ok(tcp) => {
+                apply_io_timeout(&tcp);
+                return Ok(tcp);
+            }
+            Err(e) => last_error = Some(e),
+        }
+    }
+    Err(NetError::Io(
+        last_error.expect("at least one resolved address"),
+    ))
+}
+
+/// `suppaftp` calls this for every passive data connection. Apply both a handshake and per-I/O
+/// limit before it can be handed to the library's `DataStream`.
+fn timed_passive_stream(addr: std::net::SocketAddr) -> Result<TcpStream, FtpError> {
+    let tcp =
+        TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT).map_err(FtpError::ConnectionError)?;
+    apply_io_timeout(&tcp);
+    Ok(tcp)
+}
 
 fn apply_io_timeout(tcp: &std::net::TcpStream) {
     let _ = tcp.set_read_timeout(Some(IO_TIMEOUT));
@@ -288,11 +349,12 @@ fn map_login(res: Result<(), FtpError>) -> Result<(), NetError> {
 }
 
 fn parse_lines(lines: Vec<String>) -> Vec<RemoteEntry> {
-    const MAX_ENTRIES: usize = 50_000; // M2/MEMO-4: bound memory against a hostile huge listing
-    let mut out = Vec::with_capacity(lines.len().min(MAX_ENTRIES));
+    let mut out = Vec::with_capacity(lines.len().min(MAX_LISTING_ENTRIES));
     for line in lines {
-        if out.len() >= MAX_ENTRIES {
-            tracing::warn!("directory listing truncated at {MAX_ENTRIES} entries (DoS guard)");
+        if out.len() >= MAX_LISTING_ENTRIES {
+            tracing::warn!(
+                "directory listing truncated at {MAX_LISTING_ENTRIES} entries (DoS guard)"
+            );
             break;
         }
         let line = line.trim();
@@ -355,7 +417,8 @@ pub fn walk(
     } else {
         root_dir
     };
-    walk_inner(c.as_mut(), root, &mut out)?;
+    let mut directories_seen = 0;
+    let _truncated = walk_inner(c.as_mut(), root, &mut out, 0, &mut directories_seen)?;
     let _ = c.quit();
     Ok(out)
 }
@@ -373,7 +436,20 @@ pub fn tree_stats(
     } else {
         root_dir
     };
-    tree_stats_inner(c.as_mut(), root, &mut stats, max_files)?;
+    let effective_max_files = if max_files == 0 {
+        MAX_REMOTE_FILES
+    } else {
+        max_files.min(MAX_REMOTE_FILES)
+    };
+    let mut directories_seen = 0;
+    tree_stats_inner(
+        c.as_mut(),
+        root,
+        &mut stats,
+        effective_max_files,
+        0,
+        &mut directories_seen,
+    )?;
     let _ = c.quit();
     Ok(stats)
 }
@@ -383,30 +459,53 @@ fn tree_stats_inner(
     dir: &str,
     stats: &mut RemoteTreeStats,
     max_files: usize,
+    depth: usize,
+    directories_seen: &mut usize,
 ) -> Result<(), NetError> {
     if stats.truncated {
         return Ok(());
     }
+    if depth >= MAX_RECURSION_DEPTH {
+        tracing::warn!("FTP tree statistics hit depth limit {MAX_RECURSION_DEPTH} (DoS guard)");
+        stats.truncated = true;
+        return Ok(());
+    }
+    if *directories_seen >= MAX_REMOTE_DIRECTORIES {
+        tracing::warn!(
+            "FTP tree statistics hit directory limit {MAX_REMOTE_DIRECTORIES} (DoS guard)"
+        );
+        stats.truncated = true;
+        return Ok(());
+    }
+    *directories_seen += 1;
     validate_ftp_path(dir)?; // NETW-4: server-controlled recursion path
     c.cwd(dir).map_err(NetError::from_ftp)?;
     let lines = list_lines(c, None).map_err(NetError::from_ftp)?;
-    for e in parse_lines(lines) {
+    let entries = parse_lines(lines);
+    // `suppaftp` currently returns an owned Vec for MLSD/LIST, so it cannot be stopped before
+    // parsing a server's entire reply. We cap all subsequent work and never recurse beyond the
+    // capped result; this also prevents a 50k-directory reply from becoming an unbounded walk.
+    let listing_truncated = entries.len() >= MAX_LISTING_ENTRIES;
+    for e in entries {
         if stats.truncated {
             break;
         }
         let full = join_remote_path(dir, &e.name);
         if e.is_dir {
-            tree_stats_inner(c, &full, stats, max_files)?;
+            tree_stats_inner(c, &full, stats, max_files, depth + 1, directories_seen)?;
         } else {
             stats.size = stats.size.saturating_add(e.size);
             stats.files_scanned += 1;
             if let Some(mtime) = e.mtime {
                 stats.newest_mtime = Some(stats.newest_mtime.map_or(mtime, |cur| cur.max(mtime)));
             }
-            if max_files > 0 && stats.files_scanned >= max_files {
+            if stats.files_scanned >= max_files {
                 stats.truncated = true;
             }
         }
+    }
+    if listing_truncated {
+        stats.truncated = true;
     }
     Ok(())
 }
@@ -415,24 +514,42 @@ fn walk_inner(
     c: &mut dyn FtpConn,
     dir: &str,
     out: &mut Vec<(String, u64)>,
-) -> Result<(), NetError> {
-    const MAX_FILES: usize = 100_000; // M2: bound memory for a folder download
-    if out.len() >= MAX_FILES {
-        tracing::warn!("folder walk truncated at {MAX_FILES} files (DoS guard)");
-        return Ok(());
+    depth: usize,
+    directories_seen: &mut usize,
+) -> Result<bool, NetError> {
+    if depth >= MAX_RECURSION_DEPTH {
+        tracing::warn!("FTP folder walk hit depth limit {MAX_RECURSION_DEPTH} (DoS guard)");
+        return Ok(true);
     }
+    if *directories_seen >= MAX_REMOTE_DIRECTORIES {
+        tracing::warn!("FTP folder walk hit directory limit {MAX_REMOTE_DIRECTORIES} (DoS guard)");
+        return Ok(true);
+    }
+    if out.len() >= MAX_REMOTE_FILES {
+        tracing::warn!("FTP folder walk truncated at {MAX_REMOTE_FILES} files (DoS guard)");
+        return Ok(true);
+    }
+    *directories_seen += 1;
     validate_ftp_path(dir)?; // NETW-4: server-controlled recursion path
     c.cwd(dir).map_err(NetError::from_ftp)?;
     let lines = list_lines(c, None).map_err(NetError::from_ftp)?;
-    for e in parse_lines(lines) {
+    let entries = parse_lines(lines);
+    let listing_truncated = entries.len() >= MAX_LISTING_ENTRIES;
+    for e in entries {
+        if out.len() >= MAX_REMOTE_FILES {
+            tracing::warn!("FTP folder walk truncated at {MAX_REMOTE_FILES} files (DoS guard)");
+            return Ok(true);
+        }
         let full = join_remote_path(dir, &e.name);
         if e.is_dir {
-            walk_inner(c, &full, out)?;
+            if walk_inner(c, &full, out, depth + 1, directories_seen)? {
+                return Ok(true);
+            }
         } else {
             out.push((full, e.size));
         }
     }
-    Ok(())
+    Ok(listing_truncated)
 }
 
 fn join_remote_path(dir: &str, name: &str) -> String {
@@ -562,4 +679,32 @@ pub fn delete(
     r.map_err(NetError::from_ftp)?;
     let _ = c.quit();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{ConnectionId, Protocol};
+
+    fn spec(allow_plaintext_ftp: bool) -> ConnectionSpec {
+        ConnectionSpec {
+            id: ConnectionId(0),
+            name: "test".into(),
+            protocol: Protocol::Ftp,
+            host: "legacy.example.test".into(),
+            port: 21,
+            user: "alice".into(),
+            initial_path: String::new(),
+            allow_plaintext_ftp,
+        }
+    }
+
+    #[test]
+    fn plaintext_ftp_is_opt_in_for_each_connection() {
+        assert!(!allow_plaintext_ftp(&spec(false)));
+        assert!(allow_plaintext_ftp(&spec(true)));
+        // This is deliberately not global state: approving one legacy server cannot enable a
+        // downgrade for another server in the same process.
+        assert!(!allow_plaintext_ftp(&spec(false)));
+    }
 }

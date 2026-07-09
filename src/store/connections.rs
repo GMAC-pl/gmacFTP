@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use crate::model::{ConnectionId, ConnectionSpec, Protocol};
 
 use super::creds::{CredentialError, CredentialStore};
+use zeroize::Zeroize;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ImportError {
@@ -64,10 +65,9 @@ pub fn load_seed(
         // store does not already hold one for this (host, user). Prevents a modified/dropped
         // seed file from clobbering a password the user changed in-app.
         let mut pw = s.password.into_bytes();
-        if store.get(&host, &s.username).is_err() {
-            store.set(&host, &s.username, &pw)?;
-        }
-        zeroize::Zeroize::zeroize(&mut pw);
+        let password_result = store_password_if_absent(store, &host, &s.username, &pw);
+        pw.zeroize();
+        password_result?;
 
         let initial_path = if s.path.trim().is_empty() {
             String::new()
@@ -83,6 +83,7 @@ pub fn load_seed(
             port,
             user: s.username,
             initial_path,
+            allow_plaintext_ftp: false,
         });
     }
     Ok(specs)
@@ -112,7 +113,6 @@ pub fn load_filezilla(
             continue;
         }
         let user = child_text(&server, "User");
-        let pass = child_text(&server, "Pass");
         let port: u16 = child_text(&server, "Port").trim().parse().unwrap_or(0);
         let protocol = match child_text(&server, "Protocol").trim() {
             "1" => Protocol::Sftp,
@@ -133,10 +133,17 @@ pub fn load_filezilla(
             }
         };
 
-        // Secret -> vault, then drop the buffer. Never retained on the spec.
-        if !pass.is_empty() {
-            let _ = store.set(&host, &user, pass.as_bytes());
-        }
+        // Secret -> vault, then wipe the buffer. Never retained on the spec. Just like the
+        // seed import, an import must not replace a saved password: this server may be skipped
+        // later by `merge_new` because the (host, user) connection already exists.
+        let mut pass = child_text(&server, "Pass").into_bytes();
+        let password_result = if pass.is_empty() {
+            Ok(())
+        } else {
+            store_password_if_absent(store, &host, &user, &pass)
+        };
+        pass.zeroize();
+        password_result?;
 
         specs.push(ConnectionSpec {
             id: ConnectionId(idx),
@@ -146,10 +153,30 @@ pub fn load_filezilla(
             port,
             user,
             initial_path: String::new(),
+            allow_plaintext_ftp: false,
         });
         idx += 1;
     }
     Ok(specs)
+}
+
+/// Add an imported password only when this exact `(host, user)` has no saved credential.
+///
+/// Import callers merge the returned connection specs only afterwards. Writing unconditionally
+/// here would therefore let a duplicate FileZilla/JSON record overwrite the password for an
+/// existing connection that is subsequently rejected by that merge. Errors other than
+/// `NotFound` are propagated: an inaccessible vault is not evidence that a credential is absent.
+fn store_password_if_absent(
+    store: &dyn CredentialStore,
+    host: &str,
+    user: &str,
+    password: &[u8],
+) -> Result<(), ImportError> {
+    match store.get(host, user) {
+        Ok(_) => Ok(()),
+        Err(CredentialError::NotFound) => store.set(host, user, password).map_err(Into::into),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Trimmed text of a direct child element, or "" when absent/empty.
@@ -207,6 +234,22 @@ mod tests {
     use super::*;
     use crate::store::InMemoryStore;
 
+    struct InaccessibleStore;
+
+    impl CredentialStore for InaccessibleStore {
+        fn get(&self, _host: &str, _user: &str) -> Result<Vec<u8>, CredentialError> {
+            Err(CredentialError::NoStorageAccess)
+        }
+
+        fn set(&self, _host: &str, _user: &str, _secret: &[u8]) -> Result<(), CredentialError> {
+            panic!("an inaccessible credential store must not be written to")
+        }
+
+        fn delete(&self, _host: &str, _user: &str) -> Result<(), CredentialError> {
+            Ok(())
+        }
+    }
+
     const SAMPLE: &str = r#"{
       "source":"a third-party file manager","count":2,
       "connections":[
@@ -230,6 +273,39 @@ mod tests {
         // and are NOT carried on the spec
         let json = serde_json::to_string(&specs[0]).unwrap();
         assert!(!json.contains("p1"));
+    }
+
+    #[test]
+    fn seed_import_never_replaces_an_existing_credential() {
+        let store = InMemoryStore::default();
+        store
+            .set("ftp.example.com", "u1", b"password-changed-in-gmacftp")
+            .unwrap();
+
+        let specs = load_seed(SAMPLE, &store).unwrap();
+
+        // `merge_new` may reject this spec as a duplicate later; the import layer must have
+        // already preserved the existing password by then.
+        assert_eq!(specs[0].host, "ftp.example.com");
+        assert_eq!(
+            store.get("ftp.example.com", "u1").unwrap(),
+            b"password-changed-in-gmacftp"
+        );
+        // A genuinely new pair is still seeded as before.
+        assert_eq!(store.get("sftp.example.com", "u2").unwrap(), b"p2");
+    }
+
+    #[test]
+    fn imports_do_not_treat_storage_failures_as_missing_passwords() {
+        let store = InaccessibleStore;
+        assert!(matches!(
+            load_seed(SAMPLE, &store),
+            Err(ImportError::Credential(CredentialError::NoStorageAccess))
+        ));
+        assert!(matches!(
+            load_filezilla(FZ_SAMPLE, &store),
+            Err(ImportError::Credential(CredentialError::NoStorageAccess))
+        ));
     }
 
     #[test]
@@ -276,6 +352,26 @@ mod tests {
         assert!(!serde_json::to_string(&specs[0])
             .unwrap()
             .contains("secret1"));
+    }
+
+    #[test]
+    fn filezilla_import_never_replaces_an_existing_credential() {
+        let store = InMemoryStore::default();
+        store
+            .set("ftp.example.com", "u1", b"password-changed-in-gmacftp")
+            .unwrap();
+
+        let specs = load_filezilla(FZ_SAMPLE, &store).unwrap();
+
+        // This is the regression case for a duplicate connection: app.rs merges (and rejects)
+        // the spec only after `load_filezilla` returns, so FileZilla's <Pass> must not clobber
+        // the credential while parsing.
+        assert_eq!(specs[0].host, "ftp.example.com");
+        assert_eq!(
+            store.get("ftp.example.com", "u1").unwrap(),
+            b"password-changed-in-gmacftp"
+        );
+        assert_eq!(store.get("sftp.example.com", "u2").unwrap(), b"secret2");
     }
 
     #[test]

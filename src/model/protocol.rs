@@ -1,10 +1,10 @@
 //! Wire protocols gmacFTP speaks.
 //!
 //! Optional seed data labels every remote as either `"ftp"` or `"sftp"` — there is no
-//! explicit `"ftps"` label. `Protocol::Ftp` does NOT mean plaintext: the net layer
-//! always negotiates explicit FTPS (AUTH TLS) first and falls back to plain FTP only
-//! if the server refuses TLS. Every connection is thus secure-by-default while staying
-//! compatible with legacy FTP servers.
+//! explicit `"ftps"` label. `Protocol::Ftp` negotiates explicit FTPS (AUTH TLS) first;
+//! a refused upgrade is an error unless the user has deliberately enabled plaintext mode for
+//! that exact legacy connection. Every connection is secure by default without dropping
+//! compatibility for explicitly approved LAN/legacy servers.
 
 use std::fmt;
 use std::str::FromStr;

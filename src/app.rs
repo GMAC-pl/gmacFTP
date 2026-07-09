@@ -36,6 +36,7 @@ type ConnList = Arc<Mutex<Vec<ConnectionSpec>>>;
 type PasswordCache = HashMap<(String, String), Zeroizing<String>>;
 type PendingCopy = (usize, usize, String, bool, Option<u64>);
 type PendingExternalUpload = (ConnectionSpec, PathBuf, String, String, Option<u64>, bool);
+type PendingHostKeyTrust = (net::HostKeyChallenge, usize);
 
 /// Per-session password cache: (host, user) -> password. The first read per connection
 /// hits the Keychain (one macOS auth prompt); every later connect/navigation/refresh in
@@ -59,6 +60,12 @@ static PENDING_COPY: LazyLock<Mutex<Option<PendingCopy>>> = LazyLock::new(|| Mut
 /// one at a time. (spec, local source path, remote directory, name, byte size, is_dir).
 static PENDING_EXTERNAL_UPLOAD: LazyLock<Mutex<VecDeque<PendingExternalUpload>>> =
     LazyLock::new(|| Mutex::new(VecDeque::new()));
+
+/// A first-contact SFTP key waiting for the user to verify its displayed SHA-256 fingerprint.
+/// The networking layer has already rejected the handshake at this point, so no password has
+/// crossed the connection. The dialog can only persist the exact challenge it displays.
+static PENDING_HOST_KEY_TRUST: LazyLock<Mutex<Option<PendingHostKeyTrust>>> =
+    LazyLock::new(|| Mutex::new(None));
 
 /// Per-pane "Don't ask again this session" for the delete-confirmation dialog, indexed by pane
 /// (0 = left, 1 = right). Keying per-pane (not one global flag) means ticking it while deleting on
@@ -733,10 +740,9 @@ pub fn run() {
         ui.set_passphrase_open(true);
     }
 
-    // One-time: fold any legacy per-server Keychain passwords into the vault in a SINGLE
-    // Keychain authorization (so the vault holds EVERY password → no per-server Keychain
-    // prompts + everything syncs). Gated on sync + a one-shot flag. An empty search (e.g. the
-    // 2nd Mac, whose passwords arrived via the synced vault) authorizes nothing → no prompt.
+    // One-time: fold only the app's saved legacy Keychain passwords into the vault. The vault
+    // queries exact `(service, account)` pairs from connections.json; it never enumerates the
+    // user's generic Keychain entries. Gated on sync + a one-shot flag.
     if store::cloud::enabled() && !store::settings::load().keychain_migrated_v2 {
         let n = store.migrate_from_keychain();
         let mut s = store::settings::load();
@@ -966,6 +972,7 @@ pub fn run() {
     );
     wire_misc_ui(&ui);
     wire_passphrase(&ui, store.clone(), conns.clone());
+    wire_host_key_trust(&ui, &handle, store.clone(), panes.clone());
     wire_send_sync(&ui, store.clone(), conns.clone());
     wire_overwrite(
         &ui,
@@ -1136,6 +1143,7 @@ fn design_demo_connections() -> Vec<ConnectionSpec> {
         port,
         user: user.to_string(),
         initial_path: String::new(),
+        allow_plaintext_ftp: false,
     })
     .collect()
 }
@@ -1740,7 +1748,9 @@ fn materialize_remote_drag(
     let root = std::env::temp_dir()
         .join("gmacftp-drag")
         .join(format!("{}", rand::random::<u64>()));
-    let target = root.join(name);
+    // `name` came from the server listing. Never let an absolute path or `..` escape the
+    // private drag staging directory before handing the materialised file to Finder.
+    let target = remote_local_target(&root, name).map_err(|e| e.to_string())?;
     std::fs::create_dir_all(if is_dir { &target } else { &root }).map_err(|e| e.to_string())?;
     if !is_dir {
         handle
@@ -1756,8 +1766,9 @@ fn materialize_remote_drag(
             .strip_prefix(remote)
             .unwrap_or(&remote_file)
             .trim_start_matches('/');
-        let rel = net::sanitize_local_rel(rel).map_err(|e| e.to_string())?;
-        let local = target.join(rel);
+        // A recursive listing is server-controlled too. Re-apply the containment guard for
+        // every entry, rather than relying on the top-level directory having been safe.
+        let local = remote_local_target(&target, rel).map_err(|e| e.to_string())?;
         if let Some(parent) = local.parent() {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
@@ -2224,6 +2235,33 @@ fn refresh_pane(
                 let started = Instant::now();
                 let (entries, plaintext) = match net::connect_and_list(&s, &password).await {
                     Ok(t) => t,
+                    Err(net::NetError::HostKeyTrustRequired(challenge)) => {
+                        let request_panes = panes.clone();
+                        let request_ui = ui.clone();
+                        let request_cwd = cwd.clone();
+                        let connection_id = spec.id;
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if !remote_pane_request_is_current(
+                                &request_panes,
+                                pane,
+                                connection_id,
+                                &request_cwd,
+                            ) {
+                                return;
+                            }
+                            let Some(ui) = request_ui.upgrade() else {
+                                return;
+                            };
+                            if let Ok(mut pending) = PENDING_HOST_KEY_TRUST.lock() {
+                                *pending = Some((challenge.clone(), pane));
+                            }
+                            set_pane_loading(&ui, pane, false);
+                            ui.set_host_key_endpoint(challenge.endpoint().into());
+                            ui.set_host_key_fingerprint(challenge.fingerprint().into());
+                            ui.set_host_key_open(true);
+                        });
+                        return;
+                    }
                     Err(e) => {
                         let request_panes = panes.clone();
                         let request_ui = ui.clone();
@@ -2292,11 +2330,9 @@ fn refresh_pane(
                         &HashMap::new(),
                         &initial_states,
                     );
-                    // FTP STARTTLS downgrade warning: the server refused TLS (or an active MITM
-                    // forced it), so the password was sent in the clear. Surface it so the user
-                    // can tell an encrypted FTPS session from a downgraded plaintext one. On a
-                    // secure connection, clear any stale plaintext warning left by an earlier
-                    // connect (status is global, so the latest connect wins).
+                    // Plain FTP is possible only when the user explicitly enabled it for this
+                    // saved legacy connection. Surface that safety-critical state; on FTPS clear
+                    // any stale warning left by an earlier connect (status is global).
                     if plaintext {
                         ui.set_status(
                             "Connected via plaintext FTP — password was sent unencrypted.".into(),
@@ -3026,20 +3062,30 @@ fn start_transfer(
     is_dir: bool,
     total: Option<u64>,
 ) {
-    let (dst_kind, dst_conn, dst_cwd) = {
+    let (src_kind, dst_kind, dst_conn, dst_cwd) = {
         let p = panes.lock().expect("panes");
+        let src = &p[src_pane];
         let s = &p[dst_pane];
-        (s.kind.clone(), s.conn.clone(), s.cwd.clone())
+        (
+            src.kind.clone(),
+            s.kind.clone(),
+            s.conn.clone(),
+            s.cwd.clone(),
+        )
     };
-    // Sanitize the server-controlled name before it reaches the local FS: strip a leading
-    // '/', drop '.'/'..' and resolve '..' segments, reject control bytes/NAME_MAX. The
-    // REMOTE source keeps its real name; only the local destination is contained (PATH-1/2).
-    let dst_local = match net::sanitize_local_rel(&name) {
-        Ok(clean) => PathBuf::from(&dst_cwd).join(clean),
-        Err(e) => {
-            set_err(&ui, &e.to_string());
-            return;
+    // Only a server name copied to the local filesystem is untrusted here. Do not sanitise
+    // Local→Local/Local→Remote names: besides being unnecessary, doing so can change a valid
+    // local filename before it reaches its intended destination.
+    let dst_local = if matches!((&src_kind, &dst_kind), (PaneKind::Remote, PaneKind::Local)) {
+        match remote_local_target(Path::new(&dst_cwd), &name) {
+            Ok(path) => path,
+            Err(e) => {
+                set_err(&ui, &e.to_string());
+                return;
+            }
         }
+    } else {
+        PathBuf::from(&dst_cwd).join(&name)
     };
     let store2 = store.clone();
     let h = handle.clone();
@@ -3133,7 +3179,20 @@ fn do_transfer(
     };
     let src_local = PathBuf::from(&src_cwd).join(&src_name);
     let src_remote = join_remote(PathBuf::from(&src_cwd).join(&src_name));
-    let dst_local = PathBuf::from(&dst_cwd).join(&dst_name);
+    // `dst_name` may be a remote directory-listing value (or its auto-suffixed variant).
+    // Rebuild the local destination through the same guard here as in `start_transfer`: this
+    // function is also called directly after resolving an overwrite dialog.
+    let dst_local = if matches!((&src_kind, &dst_kind), (PaneKind::Remote, PaneKind::Local)) {
+        match remote_local_target(Path::new(&dst_cwd), &dst_name) {
+            Ok(path) => path,
+            Err(e) => {
+                ui.set_error(e.to_string().into());
+                return;
+            }
+        }
+    } else {
+        PathBuf::from(&dst_cwd).join(&dst_name)
+    };
     let dst_remote = join_remote(PathBuf::from(&dst_cwd).join(&dst_name));
     let ui_weak = ui.as_weak();
 
@@ -3402,8 +3461,18 @@ async fn unique_dest_name(
     match dst_kind {
         PaneKind::Local => {
             for c in &candidates {
-                if !PathBuf::from(dst_cwd).join(c).exists() {
-                    return c.clone();
+                // A remote source name can reach the "Save as new" branch too. Check exactly
+                // the same cleaned, contained path that `do_transfer` will eventually write;
+                // otherwise `../report new.pdf` could be tested outside the destination and
+                // later be normalised onto an already-existing local file.
+                let Ok(clean) = net::sanitize_local_rel(c) else {
+                    continue;
+                };
+                let Ok(target) = remote_local_target(Path::new(dst_cwd), &clean) else {
+                    continue;
+                };
+                if !target.exists() {
+                    return clean;
                 }
             }
         }
@@ -3425,10 +3494,18 @@ async fn unique_dest_name(
             }
         }
     }
-    candidates
+    let fallback = candidates
         .into_iter()
         .next()
-        .unwrap_or_else(|| format!("{} new{}", stem, ext))
+        .unwrap_or_else(|| format!("{} new{}", stem, ext));
+    // Local destinations always receive the sanitised form, even after all 99 candidates are
+    // occupied. The existing behaviour still returns the first candidate in that rare case;
+    // this only prevents that fallback from reintroducing a traversal component.
+    if matches!(dst_kind, PaneKind::Local) {
+        net::sanitize_local_rel(&fallback).unwrap_or(fallback)
+    } else {
+        fallback
+    }
 }
 
 /// Wire the overwrite-conflict dialog buttons.
@@ -3514,8 +3591,42 @@ fn wire_passphrase(ui: &App, store: Arc<dyn CredentialStore>, conns: ConnList) {
     });
 }
 
-/// Fold EVERY saved password into the vault in a SINGLE Keychain authorization (one login
-/// password, not one-per-server), then it's complete for sync. No-op if already migrated.
+/// Complete the explicit SFTP first-contact trust flow. The SSH handshake has already failed
+/// closed; only an affirmative response after showing the exact endpoint + fingerprint writes a
+/// pin, then retries the current pane. Cancel leaves no `known_hosts` record behind.
+fn wire_host_key_trust(ui: &App, handle: &Handle, store: Arc<dyn CredentialStore>, panes: Panes) {
+    let (h, st, pn, uw) = (handle.clone(), store, panes, ui.as_weak());
+    ui.on_resolve_host_key_trust(move |approved| {
+        let pending = PENDING_HOST_KEY_TRUST
+            .lock()
+            .ok()
+            .and_then(|mut p| p.take());
+        let Some((challenge, pane)) = pending else {
+            return;
+        };
+        let Some(ui) = uw.upgrade() else {
+            return;
+        };
+        ui.set_host_key_open(false);
+        ui.set_host_key_endpoint("".into());
+        ui.set_host_key_fingerprint("".into());
+        if !approved {
+            ui.set_error("SFTP host key was not trusted; connection cancelled.".into());
+            return;
+        }
+        match net::sftp::trust_host_key(&challenge) {
+            Ok(()) => {
+                ui.set_error("".into());
+                ui.set_status("SFTP host key trusted for this server. Reconnecting…".into());
+                refresh_pane(&h, st.clone(), pn.clone(), ui.as_weak(), pane);
+            }
+            Err(error) => ui.set_error(error.to_string().into()),
+        }
+    });
+}
+
+/// Fold the app's saved legacy passwords into the vault, using exact known service/account
+/// pairs only. No-op if already migrated; it never searches unrelated Keychain entries.
 fn migrate_all_passwords(store: &Arc<dyn CredentialStore>, _conns: &ConnList) -> usize {
     if store::settings::load().keychain_migrated_v2 {
         return 0;
@@ -3527,8 +3638,8 @@ fn migrate_all_passwords(store: &Arc<dyn CredentialStore>, _conns: &ConnList) ->
     n
 }
 
-/// Wire "Send Servers to iCloud": migrate all passwords into the vault (one-time per
-/// Keychain-legacy server), then push the now-complete vault + connections.
+/// Wire "Send Servers to iCloud": migrate this app's known legacy passwords into the vault,
+/// then push the vault + connections.
 fn wire_send_sync(ui: &App, store: Arc<dyn CredentialStore>, conns: ConnList) {
     let (st, cn, uw) = (store.clone(), conns.clone(), ui.as_weak());
     ui.on_request_send_sync(move || {
@@ -3726,14 +3837,17 @@ fn copy_remote_to_local(
                             continue;
                         }
                     };
-                    let lp = local_base.join(&rel);
-                    // Defense-in-depth (safe.rs assert_within): confirm the resolved local path
-                    // stays inside the user-chosen download root.
-                    if let Err(e) = net::assert_within(&local_base, &lp) {
-                        tracing::warn!(remote = %rp, error = %e, "skipping out-of-root path");
-                        skipped += 1;
-                        continue;
-                    }
+                    // Build through the shared write-boundary helper as well. This includes the
+                    // resolved-path/symlink containment check and keeps every remote→local
+                    // transfer path on the same policy.
+                    let lp = match remote_local_target(&local_base, &rel) {
+                        Ok(path) => path,
+                        Err(e) => {
+                            tracing::warn!(remote = %rp, error = %e, "skipping out-of-root path");
+                            skipped += 1;
+                            continue;
+                        }
+                    };
                     plans.push(PlannedXfer {
                         id: fresh_xfer_id(),
                         label: rel,
@@ -3801,7 +3915,7 @@ async fn relay_one(
     // already returned Err above), so it must be relayed like any other file — do NOT reject it.
     // 2. Pause to let the src server release the session slot
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-    // 3. Upload temp → dst (FTPS first, plaintext fallback)
+    // 3. Upload temp → dst (FTPS; plaintext only when explicitly enabled for that destination)
     let ul = relay_upload(dst_spec, pw_dst, tmpf, dst_rp).await;
     if ul.is_err() {
         tracing::warn!(target: "gmacftp", error = ?ul, "relay upload failed, retrying");
@@ -5141,6 +5255,7 @@ fn wire_new(ui: &App) {
         ui.set_editor_port("21".into());
         ui.set_editor_user("".into());
         ui.set_editor_password("".into());
+        ui.set_editor_allow_plaintext_ftp(false);
         ui.set_editor_open(true);
     });
 }
@@ -5168,6 +5283,7 @@ fn wire_edit(ui: &App, store: Arc<dyn CredentialStore>, conns: ConnList) {
         ui.set_editor_port(spec.port.to_string().into());
         ui.set_editor_user(spec.user.into());
         ui.set_editor_password(pw.into());
+        ui.set_editor_allow_plaintext_ftp(spec.allow_plaintext_ftp);
         ui.set_editor_open(true);
     });
 }
@@ -5213,6 +5329,9 @@ fn wire_save(ui: &App, store: Arc<dyn CredentialStore>, conns: ConnList) {
             .parse()
             .unwrap_or(protocol.default_port());
         let id = ui.get_editor_id();
+        // This is deliberately saved per host. It is never a global option: enabling a legacy
+        // LAN server must not permit a STARTTLS stripping downgrade for another FTP connection.
+        let allow_plaintext_ftp = protocol == Protocol::Ftp && ui.get_editor_allow_plaintext_ftp();
 
         if name.trim().is_empty() || host.is_empty() || user.is_empty() {
             ui.set_manager_message("name, host and user are required".into());
@@ -5246,6 +5365,7 @@ fn wire_save(ui: &App, store: Arc<dyn CredentialStore>, conns: ConnList) {
             port,
             user,
             initial_path: String::new(),
+            allow_plaintext_ftp,
         };
         {
             let mut g = conns.lock().expect("connections lock");
@@ -5665,5 +5785,55 @@ fn join_remote(p: PathBuf) -> String {
         "/".to_string()
     } else {
         format!("/{}", parts.join("/"))
+    }
+}
+
+/// Build a local destination from a server-controlled relative name.
+///
+/// `PathBuf::join` accepts an absolute second operand and preserves `..`, so this must be the
+/// only route for remote → local names. `sanitize_local_rel` handles lexical traversal; the
+/// resolved-path check additionally catches a pre-existing symlink below the chosen root.
+fn remote_local_target(root: &Path, remote_name: &str) -> Result<PathBuf, net::NetError> {
+    let clean = net::sanitize_local_rel(remote_name)?;
+    let target = root.join(clean);
+    net::assert_within(root, &target)?;
+    Ok(target)
+}
+
+#[cfg(test)]
+mod path_safety_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn scratch_dir() -> PathBuf {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "gmacftp-app-path-test-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn remote_local_target_contains_lexical_and_symlink_escapes() {
+        let temp = scratch_dir();
+        let root = temp.join("downloads");
+        let target = remote_local_target(&root, "../../.ssh/authorized_keys").unwrap();
+        assert_eq!(target, root.join(".ssh/authorized_keys"));
+        assert_eq!(
+            remote_local_target(&root, "/Users/alice/evil.plist").unwrap(),
+            root.join("Users/alice/evil.plist")
+        );
+        assert!(remote_local_target(&root, "bad\rname").is_err());
+
+        std::fs::create_dir_all(&root).unwrap();
+        let outside = temp.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("escape")).unwrap();
+        assert!(remote_local_target(&root, "escape/payload").is_err());
+
+        let _ = std::fs::remove_dir_all(temp);
     }
 }

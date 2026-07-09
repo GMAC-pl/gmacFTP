@@ -4,6 +4,33 @@
 
 _(Nothing yet.)_
 
+## 0.0.18 — 2026-07-09
+
+Security hardening release. No connection passwords, server records, or personal build settings
+are included in the public source tree or release artifact.
+
+- **FTPS stays encrypted by default.** If an FTP server refuses `AUTH TLS`, gmacFTP now stops
+  instead of silently falling back to plaintext FTP. A clearly marked per-connection option exists
+  only for deliberately approved legacy or LAN servers.
+- **SFTP trust is explicit.** A server with a new host key shows its SHA-256 fingerprint before
+  authentication. The key is stored only after the user confirms it; a changed key fails closed.
+- **Network work is bounded.** FTP/SFTP connection and I/O timeouts, keepalives, and safe limits
+  for recursive listings/transfers prevent a stalled or hostile server from consuming resources
+  indefinitely.
+- **Transfers defend their final write path.** Remote names are sanitized and checked at every
+  local write boundary, including drag-and-drop and direct pane-to-pane transfers.
+- **Credential migration is scoped to gmacFTP.** The one-time legacy-Keychain migration now reads
+  only the app's known saved `(service, account)` pairs; it never enumerates unrelated Keychain
+  entries.
+- **Import is non-destructive.** JSON and FileZilla imports cannot overwrite a password already
+  saved for the same server/user pair.
+- **Safer diagnostics and CI.** Password-bearing wire logs are not forwarded to the app log, and
+  CI now treats Clippy warnings as errors and runs all test targets.
+
+Verified: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and all 38 automated
+tests pass. `cargo audit` has three documented upstream advisories without an available compatible
+fix; none are silently ignored outside CI's explicit allowlist.
+
 ## 0.0.17 — 2026-07-08
 
 A bugfix release. Folder downloads from an FTP/SFTP server were broken; this also tightens the path-containment guard that caused it.

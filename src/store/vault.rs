@@ -21,21 +21,26 @@
 //! `MigratingStore` wraps the vault and falls back to the Keychain ONCE per credential
 //! (lazy migration), writing through to the vault so the next read is silent.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use aes_gcm::{
-    aead::{Aead, KeyInit},
+    aead::{consts::U12, Aead, KeyInit},
     Aes256Gcm, Nonce,
 };
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use rand::RngCore;
 use zeroize::Zeroizing;
 
-use super::creds::{CredentialError, CredentialStore};
+use super::creds::{CredentialError, CredentialStore, SERVICE_PREFIX};
 #[cfg(target_os = "macos")]
 use super::keychain::MacCredentialStore;
+
+/// Every public release so far has used this service prefix. Keep this explicit rather than
+/// guessing from a Keychain item's shape: generic-password items are shared with every app on
+/// the user's Mac.
+const RELEASE_SERVICE_PREFIXES: &[&str] = &["app.mackftp.client"];
 
 fn config_dir() -> Option<PathBuf> {
     directories::ProjectDirs::from(
@@ -44,6 +49,41 @@ fn config_dir() -> Option<PathBuf> {
         env!("MACKFTP_CONFIG_APPLICATION"),
     )
     .map(|pd| pd.config_dir().to_path_buf())
+}
+
+/// Service prefixes this build is allowed to read during the Keychain-to-vault migration.
+///
+/// `SERVICE_PREFIX` supports intentionally overridden/private builds; the fixed entry is the
+/// only prefix used by public releases, retained so those existing installations keep working.
+fn known_service_prefixes() -> Vec<&'static str> {
+    let mut prefixes = Vec::with_capacity(RELEASE_SERVICE_PREFIXES.len() + 1);
+    prefixes.push(SERVICE_PREFIX);
+    prefixes.extend_from_slice(RELEASE_SERVICE_PREFIXES);
+    prefixes.sort_unstable();
+    prefixes.dedup();
+    prefixes
+}
+
+/// Read only the connection identities that gmacFTP already owns. A broad Keychain query cannot
+/// express a prefix match for the service field, so the safe alternative is a set of exact
+/// `(service, account)` reads derived from our password-free metadata.
+fn keychain_migration_candidates() -> Vec<(String, String)> {
+    let Ok(Some(specs)) = super::connections::load_metadata() else {
+        return Vec::new();
+    };
+    migration_candidates_from_specs(specs)
+}
+
+fn migration_candidates_from_specs(
+    specs: impl IntoIterator<Item = crate::model::ConnectionSpec>,
+) -> Vec<(String, String)> {
+    let mut candidates = BTreeSet::new();
+    for spec in specs {
+        if !spec.host.is_empty() && !spec.user.is_empty() {
+            candidates.insert((spec.host, spec.user));
+        }
+    }
+    candidates.into_iter().collect()
 }
 
 /// NUL-separated "host\x00user" — hostnames/usernames never contain NUL.
@@ -163,53 +203,60 @@ impl FileVault {
         true
     }
 
-    /// One-shot migration: enumerate the legacy per-server Keychain entries (service
-    /// `{SERVICE_PREFIX}/host`, account = user) and fold them into this vault in a single
-    /// batched persist. ONE Keychain authorization covers all of them (vs N per-server prompts).
-    /// After this the vault holds every password → no Keychain fallback prompts + everything
-    /// syncs. Returns how many were migrated.
+    /// One-shot migration of legacy per-server Keychain entries into the vault.
+    ///
+    /// This deliberately queries only exact `(service, account)` pairs for servers already
+    /// saved in `connections.json`. It never performs a broad generic-password search: that
+    /// would expose credentials belonging to unrelated applications and, before this check was
+    /// added, could copy them into the synced vault. The service prefix is likewise limited to
+    /// the current build identity and the explicit identity used by shipped public releases.
+    ///
+    /// A missing metadata file simply means there is no connection for the app to migrate. The
+    /// normal lazy lookup still preserves access to a current-prefix legacy credential when its
+    /// connection is later added/imported. Returns how many credentials were migrated.
     pub fn migrate_from_keychain(&self) -> usize {
         #[cfg(target_os = "macos")]
         {
-            use security_framework::item::{ItemClass, ItemSearchOptions, Limit};
-            // ONE Keychain operation reads EVERY generic-password item (one authorization, not
-            // one-per-server). The host is the segment after the last '/' in the service, so
-            // legacy items saved under ANY service prefix (old bundle id, old app name) match.
-            let results = match ItemSearchOptions::new()
-                .class(ItemClass::generic_password())
-                .limit(Limit::All)
-                .load_attributes(true)
-                .load_data(true)
-                .search()
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::warn!(error = %e, "keychain enumerate failed");
-                    return 0;
-                }
-            };
+            use security_framework::passwords::{generic_password, PasswordOptions};
+
             let mut n = 0;
-            if let Ok(mut map) = self.map.lock() {
-                for r in results {
-                    let Some(dict) = r.simplify_dict() else {
+            let service_prefixes = known_service_prefixes();
+            for (host, user) in keychain_migration_candidates() {
+                let key = pack_key(&host, &user);
+                // Do not even query the Keychain when the encrypted vault already has the
+                // credential. In particular, migration must never replace a newer vault value.
+                if self
+                    .map
+                    .lock()
+                    .map(|map| map.contains_key(&key))
+                    .unwrap_or(true)
+                {
+                    continue;
+                }
+
+                for &prefix in &service_prefixes {
+                    let service = format!("{prefix}/{host}");
+                    let Ok(secret) =
+                        generic_password(PasswordOptions::new_generic_password(&service, &user))
+                    else {
+                        // A missing item is the common case. Access failures are also
+                        // best-effort here: lazy migration remains available on later use.
                         continue;
                     };
-                    let Some(svc) = dict.get("svce") else {
+                    let secret = Zeroizing::new(secret);
+                    if secret.is_empty() {
                         continue;
-                    };
-                    let Some((_prefix, host)) = svc.rsplit_once('/') else {
-                        continue;
-                    };
-                    let user = dict.get("acct").cloned().unwrap_or_default();
-                    let secret = dict
-                        .get("v_Data")
-                        .or_else(|| dict.get("data"))
-                        .cloned()
-                        .unwrap_or_default();
-                    if !host.is_empty() && !user.is_empty() && !secret.is_empty() {
-                        map.insert(pack_key(host, &user), B64.encode(secret.as_bytes()));
-                        n += 1;
                     }
+
+                    // Re-check under the lock so a concurrent normal save always wins over
+                    // the older legacy Keychain copy we just read.
+                    if let Ok(mut map) = self.map.lock() {
+                        if !map.contains_key(&key) {
+                            map.insert(key.clone(), B64.encode(&*secret));
+                            n += 1;
+                        }
+                    }
+                    break; // one credential per (host, user), even if prefixes overlap
                 }
             }
             if n > 0 {
@@ -575,9 +622,12 @@ fn encrypt(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, String> {
     let cipher = Aes256Gcm::new_from_slice(&key[..]).map_err(|e| e.to_string())?;
     let mut nonce_bytes = [0u8; 12];
     rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
-    let nonce = Nonce::from_slice(&nonce_bytes);
+    // Fixed-size array: this conversion cannot fail, and avoids the deprecated `from_slice` API
+    // introduced by aes-gcm 0.11's hybrid-array migration.
+    let nonce = Nonce::<U12>::try_from(nonce_bytes.as_slice())
+        .expect("a 12-byte AES-GCM nonce must convert");
     let ct = cipher
-        .encrypt(nonce, plaintext)
+        .encrypt(&nonce, plaintext)
         .map_err(|e| e.to_string())?;
     let mut out = Vec::with_capacity(12 + ct.len());
     out.extend_from_slice(&nonce_bytes);
@@ -587,9 +637,13 @@ fn encrypt(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, String> {
 
 fn decrypt(key: &[u8; 32], blob: &[u8]) -> Result<Vec<u8>, String> {
     let cipher = Aes256Gcm::new_from_slice(&key[..]).map_err(|e| e.to_string())?;
-    let nonce = Nonce::from_slice(&blob[..12]);
+    let (nonce_bytes, ciphertext) = blob
+        .split_at_checked(12)
+        .ok_or_else(|| "encrypted vault is shorter than its AES-GCM nonce".to_string())?;
+    let nonce = Nonce::<U12>::try_from(nonce_bytes)
+        .map_err(|_| "invalid AES-GCM nonce length".to_string())?;
     cipher
-        .decrypt(nonce, &blob[12..])
+        .decrypt(&nonce, ciphertext)
         .map_err(|e| e.to_string())
 }
 
@@ -724,6 +778,49 @@ fn set_mode_0600(_path: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{ConnectionId, ConnectionSpec, Protocol};
+
+    fn connection(id: usize, host: &str, user: &str) -> ConnectionSpec {
+        ConnectionSpec {
+            id: ConnectionId(id),
+            name: format!("{host} as {user}"),
+            protocol: Protocol::Ftp,
+            host: host.to_string(),
+            port: 21,
+            user: user.to_string(),
+            initial_path: String::new(),
+            allow_plaintext_ftp: false,
+        }
+    }
+
+    #[test]
+    fn keychain_migration_candidates_are_only_saved_complete_connections() {
+        let candidates = migration_candidates_from_specs(vec![
+            connection(1, "ftp.example.com", "alice"),
+            connection(2, "ftp.example.com", "alice"), // duplicate metadata row
+            connection(3, "sftp.example.com", "bob"),
+            connection(4, "", "no-host"),
+            connection(5, "anonymous.example.com", ""),
+        ]);
+
+        assert_eq!(
+            candidates,
+            vec![
+                ("ftp.example.com".to_string(), "alice".to_string()),
+                ("sftp.example.com".to_string(), "bob".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn migration_service_prefixes_are_an_explicit_allowlist() {
+        let prefixes = known_service_prefixes();
+        assert!(prefixes.contains(&SERVICE_PREFIX));
+        assert!(prefixes.contains(&"app.mackftp.client"));
+        assert!(prefixes
+            .iter()
+            .all(|prefix| *prefix == SERVICE_PREFIX || RELEASE_SERVICE_PREFIXES.contains(prefix)));
+    }
 
     #[test]
     fn vault_roundtrip_in_temp() {
@@ -741,6 +838,8 @@ mod tests {
         let mut bad = blob.clone();
         bad[20] ^= 0xff;
         assert!(decrypt(&key, &bad).is_err());
+        // A corrupted/truncated vault must report an error, never panic on a nonce slice.
+        assert!(decrypt(&key, &[0u8; 11]).is_err());
     }
 
     #[test]
