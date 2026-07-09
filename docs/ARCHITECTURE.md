@@ -27,7 +27,9 @@ The controller keeps blocking protocol work off the UI thread. Results are sent 
 - SFTP through `russh` and `russh-sftp`
 - Shared error types and remote listing structures
 
-SFTP host-key verification uses TOFU-style known-host storage in the app config directory.
+SFTP host-key verification fails closed on a new or changed key. For a new server, the UI shows
+the SHA-256 fingerprint before authentication; only an explicit user approval persists the pin in
+the app config directory. A changed pin cannot be replaced automatically.
 
 ## Storage
 

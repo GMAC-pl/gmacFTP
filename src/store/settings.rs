@@ -43,9 +43,9 @@ pub struct Settings {
     /// memory.
     #[serde(default)]
     pub sync_passphrase_set: bool,
-    /// True once the legacy per-server Keychain passwords have been folded into the vault
-    /// (one-time migration via a single Keychain authorization). v2: the v1 flag was set by a
-    /// buggy build that matched on the wrong service prefix; renaming forces a correct re-run.
+    /// True once this app's saved legacy Keychain passwords have been folded into the vault.
+    /// The migration reads only exact, allow-listed service/account pairs from connections.json;
+    /// v2 forces a safe rerun after older broad Keychain migration logic.
     #[serde(default)]
     pub keychain_migrated_v2: bool,
 }

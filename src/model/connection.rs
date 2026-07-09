@@ -18,6 +18,10 @@ pub struct ConnectionSpec {
     pub user: String,
     #[serde(default)]
     pub initial_path: String,
+    /// Legacy FTP is unencrypted. It is opt-in per saved host only, so approving one old/LAN
+    /// server cannot silently permit a TLS-downgrade to plaintext for another connection.
+    #[serde(default)]
+    pub allow_plaintext_ftp: bool,
 }
 
 impl ConnectionSpec {
@@ -58,6 +62,7 @@ mod tests {
             port,
             user: "u".into(),
             initial_path: String::new(),
+            allow_plaintext_ftp: false,
         }
     }
 

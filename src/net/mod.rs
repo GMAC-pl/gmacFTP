@@ -8,8 +8,8 @@ pub mod sftp;
 
 use crate::model::{ConnectionSpec, Protocol, RemoteEntry};
 
-pub use error::NetError;
-pub use ftp::{accept_invalid_tls, set_accept_invalid_tls};
+pub use error::{HostKeyChallenge, NetError};
+pub use ftp::{accept_invalid_tls, allow_plaintext_ftp, set_accept_invalid_tls};
 pub use safe::{assert_within, sanitize_local_rel, validate_ftp_path};
 
 #[derive(Debug, Clone, Default)]
@@ -21,8 +21,9 @@ pub struct RemoteTreeStats {
 }
 
 /// Connect + list the (initial) directory. Dispatches by protocol.
-/// Returns `(entries, plaintext_fallback)`: `true` when an FTP session fell back to plaintext
-/// (password sent unencrypted) so the UI can warn. SFTP is always encrypted → `false`.
+/// Returns `(entries, plaintext)`: `true` only when this exact FTP connection was explicitly
+/// configured for legacy plaintext mode (password sent unencrypted). SFTP is always encrypted →
+/// `false`.
 pub async fn connect_and_list(
     spec: &ConnectionSpec,
     password: &str,

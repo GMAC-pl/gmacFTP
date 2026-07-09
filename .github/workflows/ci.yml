@@ -22,14 +22,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # Formatting gate: the tree must stay rustfmt-clean (cargo fmt is part of the build contract).
       - run: cargo fmt --all -- --check
-      # Clippy runs WITHOUT -D warnings: a few known lints (large AppCtx argument lists, complex
-      # types) are intentional and tracked separately. New lints still surface in the log.
+      # Warnings are regressions in the quality gate. Intentional wide controller signatures are
+      # explicitly allowed at module scope, so this must remain warning-free.
       # No untrusted github.event.* input is used in any run: step (no injection surface).
-      - run: cargo clippy --all-targets
-      # `cargo test --lib` runs the unit tests (vault crypto roundtrip, path sanitization, FileZilla
-      # import). Integration tests in tests/relay.rs need live FTP servers (tests/run-test-servers.sh)
-      # and are not wired into CI yet.
-      - run: cargo test --lib
+      - run: cargo clippy --all-targets -- -D warnings
+      # Run unit, integration and example targets. Tests that need an explicitly configured
+      # external server skip safely when that server is absent.
+      - run: cargo test --all-targets
       - run: cargo build --release
 
   # Dependency vulnerability gate. We run `cargo audit` directly (NOT the rustsec/audit-check
@@ -54,4 +53,3 @@ jobs:
         with:
           tool: cargo-audit
       - run: cargo audit --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195
-

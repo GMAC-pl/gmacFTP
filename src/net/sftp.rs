@@ -1,8 +1,9 @@
 //! SFTP client (russh 0.61 + russh-sftp 2.3). Pure Rust, no C deps.
 //!
-//! Host-key verification is TOFU: the first connection stores the host's key fingerprint
-//! in `<config_dir>/known_hosts`; a later connection with a DIFFERENT fingerprint fails
-//! closed (rejected). This prevents silent MITM, unlike leaving check_server_key = Ok(true).
+//! Host-key verification is explicit trust-on-first-use: a newly seen fingerprint stops the
+//! connection before authentication and is never written automatically. The UI must display the
+//! [`HostKeyChallenge`](crate::net::HostKeyChallenge), collect a clear confirmation, call
+//! [`trust_host_key`], and reconnect. A changed fingerprint always fails closed.
 //!
 //! Session hygiene: every public operation opens `(Handle, SftpSession)` and explicitly
 //! `disconnect()`s the Handle in a finally block. russh 0.61 `Handle::Drop` is a no-op
@@ -11,14 +12,31 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use russh_sftp::client::SftpSession;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::model::{ConnectionSpec, RemoteEntry};
-use crate::net::error::NetError;
+use crate::net::error::{HostKeyChallenge, NetError};
 use crate::net::RemoteTreeStats;
+
+const SFTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+const SFTP_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(90);
+const SFTP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
+const SFTP_KEEPALIVE_MAX: usize = 3;
+const MAX_LISTING_ENTRIES: usize = 50_000;
+const MAX_REMOTE_FILES: usize = 100_000;
+const MAX_REMOTE_DIRECTORIES: usize = 10_000;
+const MAX_RECURSION_DEPTH: usize = 64;
+
+#[derive(Debug, Clone)]
+enum HostKeyRejection {
+    Unknown(HostKeyChallenge),
+    Mismatch { endpoint: String },
+    CheckFailed { endpoint: String, error: String },
+}
 
 struct Handler {
     /// Composite `host:port` key used for known_hosts lookups, so two SFTP servers on different
@@ -26,6 +44,9 @@ struct Handler {
     /// hostname, which caused false MITM rejections or cross-port key pinning).
     host_key: String,
     known_hosts: PathBuf,
+    /// The SSH callback can only return a boolean. Keep the human-actionable rejection here so
+    /// `open_session` can return it to the UI instead of losing it in a generic KEX error.
+    rejection: Arc<Mutex<Option<HostKeyRejection>>>,
 }
 
 impl russh::client::Handler for Handler {
@@ -35,13 +56,29 @@ impl russh::client::Handler for Handler {
         &mut self,
         key: &russh::keys::ssh_key::PublicKey,
     ) -> Result<bool, Self::Error> {
-        match tofu_verify(&self.known_hosts, &self.host_key, key) {
-            Ok(accept) => Ok(accept),
-            Err(e) => {
-                tracing::warn!(host_key = %self.host_key, error = %e, "known_hosts check failed; rejecting");
-                Ok(false) // fail closed
+        let fingerprint = key
+            .fingerprint(russh::keys::ssh_key::HashAlg::Sha256)
+            .to_string();
+        let rejection = match check_known_host(&self.known_hosts, &self.host_key, &fingerprint) {
+            Ok(HostKeyStatus::Trusted) => return Ok(true),
+            Ok(HostKeyStatus::Unknown) => {
+                HostKeyRejection::Unknown(HostKeyChallenge::new(self.host_key.clone(), fingerprint))
             }
+            Ok(HostKeyStatus::Mismatch) => HostKeyRejection::Mismatch {
+                endpoint: self.host_key.clone(),
+            },
+            Err(error) => HostKeyRejection::CheckFailed {
+                endpoint: self.host_key.clone(),
+                error,
+            },
+        };
+        tracing::warn!(host_key = %self.host_key, "SFTP host-key check rejected the connection");
+        if let Ok(mut pending) = self.rejection.lock() {
+            *pending = Some(rejection);
         }
+        // The verification callback is part of SSH key exchange: returning false ensures that no
+        // password authentication or SFTP subsystem request can proceed on an untrusted key.
+        Ok(false)
     }
 }
 
@@ -54,23 +91,24 @@ fn known_hosts_path() -> Option<PathBuf> {
     .map(|pd| pd.config_dir().join("known_hosts"))
 }
 
-/// Returns Ok(true) to accept (new or matching key), Ok(false) to reject (mismatch).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostKeyStatus {
+    Trusted,
+    Unknown,
+    Mismatch,
+}
+
+/// Check a pinned fingerprint without mutating `known_hosts`.
 ///
-/// `host_key` is the composite `host:port` trust key (see [`Handler`]). Existing pre-0.0.15
-/// entries were written as bare `host` and will no longer match, so the first connect to each
-/// host after the upgrade silently re-runs TOFU in brand-new-host mode: it does NOT prompt the
-/// user — the new `host:port` + key pair is persisted and accepted as-is. Caveat: an active MITM
-/// present on that exact first-connect-after-upgrade would be accepted with no indication, the
-/// same UX as connecting to a genuinely new host. Accepted for a v0.0.x app, and safer than
-/// silently treating a bare-host entry as trusted for every port.
-fn tofu_verify(
+/// `host_key` is the composite `host:port` trust key (see [`Handler`]). Old bare-host records
+/// are intentionally not treated as a match: the user must verify and explicitly approve the
+/// key for the actual port rather than silently extending a trust decision to a different
+/// endpoint.
+fn check_known_host(
     path: &std::path::Path,
     host_key: &str,
-    key: &russh::keys::ssh_key::PublicKey,
-) -> Result<bool, String> {
-    let fp = key
-        .fingerprint(russh::keys::ssh_key::HashAlg::Sha256)
-        .to_string();
+    fingerprint: &str,
+) -> Result<HostKeyStatus, String> {
     let existing = match std::fs::read_to_string(path) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -79,21 +117,77 @@ fn tofu_verify(
     for line in existing.lines() {
         if let Some((h, f)) = line.split_once(char::is_whitespace) {
             if h.trim() == host_key {
-                return Ok(f.trim() == fp.trim());
+                return Ok(if f.trim() == fingerprint {
+                    HostKeyStatus::Trusted
+                } else {
+                    HostKeyStatus::Mismatch
+                });
             }
         }
     }
-    // Unknown host — TOFU: persist and accept. Atomic write (O_EXCL + 0600 + fsync + rename) so
-    // a crash mid-write can't truncate known_hosts — a truncated trust anchor would silently
-    // re-open every previously-verified host to MITM on the next connection. Mode 0600 is
-    // applied by atomic_write at creation (known_hosts reveals which hosts you connect to).
+    Ok(HostKeyStatus::Unknown)
+}
+
+/// Persist a host key that the user has already verified and explicitly approved.
+///
+/// This is intentionally a separate operation from connecting. The caller should show
+/// [`HostKeyChallenge::endpoint`] and [`HostKeyChallenge::fingerprint`] verbatim, require a
+/// positive confirmation, call this function, and then retry the connection. If another process
+/// pinned a different key in the meantime, this function fails closed and will not replace it.
+pub fn trust_host_key(challenge: &HostKeyChallenge) -> Result<(), NetError> {
+    let path =
+        known_hosts_path().ok_or_else(|| NetError::Ssh("no config directory available".into()))?;
+    persist_trusted_host_key(&path, challenge).map_err(NetError::HostKey)
+}
+
+fn persist_trusted_host_key(
+    path: &std::path::Path,
+    challenge: &HostKeyChallenge,
+) -> Result<(), String> {
+    if challenge.endpoint().is_empty()
+        || challenge.fingerprint().is_empty()
+        || challenge
+            .endpoint()
+            .bytes()
+            .any(|b| b.is_ascii_control() || b.is_ascii_whitespace())
+        || challenge
+            .fingerprint()
+            .bytes()
+            .any(|b| b.is_ascii_control() || b.is_ascii_whitespace())
+    {
+        return Err("invalid host-key trust record".into());
+    }
+    let existing = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e.to_string()),
+    };
+    for line in existing.lines() {
+        if let Some((host, fingerprint)) = line.split_once(char::is_whitespace) {
+            if host.trim() == challenge.endpoint() {
+                if fingerprint.trim() == challenge.fingerprint() {
+                    return Ok(()); // idempotent approval/retry
+                }
+                return Err(format!(
+                    "refusing to replace the existing host key for {}",
+                    challenge.endpoint()
+                ));
+            }
+        }
+    }
+    // Atomic write (O_EXCL + 0600 + fsync + rename) so a crash mid-write cannot truncate a
+    // trust anchor and silently re-open previously verified hosts to MITM.
     let mut content = existing;
     if !content.is_empty() && !content.ends_with('\n') {
         content.push('\n');
     }
-    content.push_str(&format!("{host_key} {fp}\n"));
+    content.push_str(&format!(
+        "{} {}\n",
+        challenge.endpoint(),
+        challenge.fingerprint()
+    ));
     crate::store::vault::atomic_write(path, content.as_bytes()).map_err(|e| e.to_string())?;
-    Ok(true)
+    Ok(())
 }
 
 fn map_ssh<E: std::fmt::Display>(e: E) -> NetError {
@@ -108,16 +202,54 @@ async fn open_session(
 ) -> Result<(russh::client::Handle<Handler>, SftpSession), NetError> {
     let known_hosts =
         known_hosts_path().ok_or_else(|| NetError::Ssh("no config directory available".into()))?;
-    let config = Arc::new(russh::client::Config::default());
+    // A connection that goes quiet must not retain a runtime task and authenticated socket
+    // forever. Keepalives distinguish a temporarily idle SFTP operation from a dead peer.
+    let config = Arc::new(russh::client::Config {
+        inactivity_timeout: Some(SFTP_INACTIVITY_TIMEOUT),
+        keepalive_interval: Some(SFTP_KEEPALIVE_INTERVAL),
+        keepalive_max: SFTP_KEEPALIVE_MAX,
+        nodelay: true,
+        ..Default::default()
+    });
+    let rejection = Arc::new(Mutex::new(None));
     let handler = Handler {
         host_key: format!("{}:{}", spec.host, spec.effective_port()),
         known_hosts,
+        rejection: rejection.clone(),
     };
 
-    let mut handle =
-        russh::client::connect(config, (spec.host.as_str(), spec.effective_port()), handler)
-            .await
-            .map_err(map_ssh)?;
+    let mut handle = match tokio::time::timeout(
+        SFTP_CONNECT_TIMEOUT,
+        russh::client::connect(config, (spec.host.as_str(), spec.effective_port()), handler),
+    )
+    .await
+    {
+        Err(_) => {
+            return Err(NetError::Ssh(format!(
+                "SFTP connection to {} timed out after {} seconds",
+                spec.host,
+                SFTP_CONNECT_TIMEOUT.as_secs()
+            )));
+        }
+        Ok(Ok(handle)) => handle,
+        Ok(Err(error)) => {
+            let rejection = rejection.lock().ok().and_then(|mut pending| pending.take());
+            return match rejection {
+                Some(HostKeyRejection::Unknown(challenge)) => {
+                    Err(NetError::HostKeyTrustRequired(challenge))
+                }
+                Some(HostKeyRejection::Mismatch { endpoint }) => Err(NetError::HostKey(format!(
+                    "stored fingerprint for {endpoint} does not match the server; refusing the connection"
+                ))),
+                Some(HostKeyRejection::CheckFailed { endpoint, error }) => {
+                    Err(NetError::HostKey(format!(
+                        "could not verify the stored host key for {endpoint}: {error}"
+                    )))
+                }
+                None => Err(map_ssh(error)),
+            };
+        }
+    };
 
     let auth = handle
         .authenticate_password(spec.user.clone(), password.to_string())
@@ -204,10 +336,12 @@ pub async fn connect_and_list(
         };
 
         let mut out = Vec::new();
-        const MAX_ENTRIES: usize = 50_000; // M2/M10: bound memory against a hostile huge listing
-        for entry in sftp.read_dir(&dir).await.map_err(map_ssh)? {
-            if out.len() >= MAX_ENTRIES {
-                tracing::warn!("directory listing truncated at {MAX_ENTRIES} entries (DoS guard)");
+        let entries = sftp.read_dir(&dir).await.map_err(map_ssh)?;
+        for (index, entry) in entries.enumerate() {
+            if index >= MAX_LISTING_ENTRIES {
+                tracing::warn!(
+                    "directory listing truncated at {MAX_LISTING_ENTRIES} entries (DoS guard)"
+                );
                 break;
             }
             let name = entry.file_name();
@@ -246,11 +380,12 @@ pub async fn walk(
         root_dir.to_string()
     };
     let mut out = Vec::new();
-    let result = walk_sftp(&sftp, &root, &mut out).await;
+    let mut directories_seen = 0;
+    let result = walk_sftp(&sftp, &root, &mut out, 0, &mut directories_seen).await;
     let _ = handle
         .disconnect(russh::Disconnect::ByApplication, "bye", "en")
         .await; // MEMO-2/CONC-4
-    result?;
+    let _truncated = result?;
     Ok(out)
 }
 
@@ -267,7 +402,21 @@ pub async fn tree_stats(
         root_dir.to_string()
     };
     let mut stats = RemoteTreeStats::default();
-    let result = tree_stats_sftp(&sftp, &root, &mut stats, max_files).await;
+    let effective_max_files = if max_files == 0 {
+        MAX_REMOTE_FILES
+    } else {
+        max_files.min(MAX_REMOTE_FILES)
+    };
+    let mut directories_seen = 0;
+    let result = tree_stats_sftp(
+        &sftp,
+        &root,
+        &mut stats,
+        effective_max_files,
+        0,
+        &mut directories_seen,
+    )
+    .await;
     let _ = handle
         .disconnect(russh::Disconnect::ByApplication, "bye", "en")
         .await; // MEMO-2/CONC-4
@@ -280,11 +429,35 @@ async fn tree_stats_sftp(
     dir: &str,
     stats: &mut RemoteTreeStats,
     max_files: usize,
+    depth: usize,
+    directories_seen: &mut usize,
 ) -> Result<(), NetError> {
     if stats.truncated {
         return Ok(());
     }
-    for entry in sftp.read_dir(dir).await.map_err(map_ssh)? {
+    if depth >= MAX_RECURSION_DEPTH {
+        tracing::warn!("SFTP tree statistics hit depth limit {MAX_RECURSION_DEPTH} (DoS guard)");
+        stats.truncated = true;
+        return Ok(());
+    }
+    if *directories_seen >= MAX_REMOTE_DIRECTORIES {
+        tracing::warn!(
+            "SFTP tree statistics hit directory limit {MAX_REMOTE_DIRECTORIES} (DoS guard)"
+        );
+        stats.truncated = true;
+        return Ok(());
+    }
+    *directories_seen += 1;
+    let entries = sftp.read_dir(dir).await.map_err(map_ssh)?;
+    let mut listing_truncated = false;
+    for (index, entry) in entries.enumerate() {
+        if index >= MAX_LISTING_ENTRIES {
+            tracing::warn!(
+                "SFTP tree statistics truncated a directory at {MAX_LISTING_ENTRIES} entries (DoS guard)"
+            );
+            listing_truncated = true;
+            break;
+        }
         if stats.truncated {
             break;
         }
@@ -295,17 +468,28 @@ async fn tree_stats_sftp(
         let full = join_remote_path(dir, &name);
         let attrs = entry.metadata();
         if attrs.is_dir() {
-            Box::pin(tree_stats_sftp(sftp, &full, stats, max_files)).await?;
+            Box::pin(tree_stats_sftp(
+                sftp,
+                &full,
+                stats,
+                max_files,
+                depth + 1,
+                directories_seen,
+            ))
+            .await?;
         } else {
             stats.size = stats.size.saturating_add(attrs.size.unwrap_or(0));
             stats.files_scanned += 1;
             if let Some(mtime) = attrs.mtime.map(|t| t as i64) {
                 stats.newest_mtime = Some(stats.newest_mtime.map_or(mtime, |cur| cur.max(mtime)));
             }
-            if max_files > 0 && stats.files_scanned >= max_files {
+            if stats.files_scanned >= max_files {
                 stats.truncated = true;
             }
         }
+    }
+    if listing_truncated {
+        stats.truncated = true;
     }
     Ok(())
 }
@@ -314,13 +498,34 @@ async fn walk_sftp(
     sftp: &SftpSession,
     dir: &str,
     out: &mut Vec<(String, u64)>,
-) -> Result<(), NetError> {
-    const MAX_FILES: usize = 100_000; // M2: bound memory for a folder download
-    if out.len() >= MAX_FILES {
-        tracing::warn!("folder walk truncated at {MAX_FILES} files (DoS guard)");
-        return Ok(());
+    depth: usize,
+    directories_seen: &mut usize,
+) -> Result<bool, NetError> {
+    if depth >= MAX_RECURSION_DEPTH {
+        tracing::warn!("SFTP folder walk hit depth limit {MAX_RECURSION_DEPTH} (DoS guard)");
+        return Ok(true);
     }
-    for entry in sftp.read_dir(dir).await.map_err(map_ssh)? {
+    if *directories_seen >= MAX_REMOTE_DIRECTORIES {
+        tracing::warn!("SFTP folder walk hit directory limit {MAX_REMOTE_DIRECTORIES} (DoS guard)");
+        return Ok(true);
+    }
+    if out.len() >= MAX_REMOTE_FILES {
+        tracing::warn!("SFTP folder walk truncated at {MAX_REMOTE_FILES} files (DoS guard)");
+        return Ok(true);
+    }
+    *directories_seen += 1;
+    let entries = sftp.read_dir(dir).await.map_err(map_ssh)?;
+    for (index, entry) in entries.enumerate() {
+        if index >= MAX_LISTING_ENTRIES {
+            tracing::warn!(
+                "SFTP folder walk truncated a directory at {MAX_LISTING_ENTRIES} entries (DoS guard)"
+            );
+            return Ok(true);
+        }
+        if out.len() >= MAX_REMOTE_FILES {
+            tracing::warn!("SFTP folder walk truncated at {MAX_REMOTE_FILES} files (DoS guard)");
+            return Ok(true);
+        }
         let name = entry.file_name();
         if name == "." || name == ".." {
             continue;
@@ -328,12 +533,14 @@ async fn walk_sftp(
         let full = join_remote_path(dir, &name);
         let attrs = entry.metadata();
         if attrs.is_dir() {
-            Box::pin(walk_sftp(sftp, &full, out)).await?;
+            if Box::pin(walk_sftp(sftp, &full, out, depth + 1, directories_seen)).await? {
+                return Ok(true);
+            }
         } else {
             out.push((full, attrs.size.unwrap_or(0)));
         }
     }
-    Ok(())
+    Ok(false)
 }
 
 fn join_remote_path(dir: &str, name: &str) -> String {
@@ -482,4 +689,79 @@ pub async fn delete(
         .disconnect(russh::Disconnect::ByApplication, "bye", "en")
         .await; // MEMO-2/CONC-4
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Hermetic scratch dir with no additional test dependency. Auto-removed on drop.
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new() -> Self {
+            static UNIQUE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "gmacftp-sftp-known-hosts-{}-{}",
+                std::process::id(),
+                UNIQUE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn file(&self) -> PathBuf {
+            self.0.join("known_hosts")
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn unknown_host_is_not_written_until_explicit_approval() {
+        let dir = TestDir::new();
+        let path = dir.file();
+        let endpoint = "sftp.example.test:22";
+        let fingerprint = "SHA256:exampleFingerprint";
+
+        assert_eq!(
+            check_known_host(&path, endpoint, fingerprint).unwrap(),
+            HostKeyStatus::Unknown
+        );
+        assert!(
+            !path.exists(),
+            "merely checking a newly presented key must not create known_hosts"
+        );
+
+        let challenge = HostKeyChallenge::new(endpoint.into(), fingerprint.into());
+        persist_trusted_host_key(&path, &challenge).unwrap();
+        assert_eq!(
+            check_known_host(&path, endpoint, fingerprint).unwrap(),
+            HostKeyStatus::Trusted
+        );
+    }
+
+    #[test]
+    fn host_key_mismatch_fails_closed_and_cannot_replace_pin() {
+        let dir = TestDir::new();
+        let path = dir.file();
+        let endpoint = "sftp.example.test:22";
+        let original = HostKeyChallenge::new(endpoint.into(), "SHA256:original".into());
+        let changed = HostKeyChallenge::new(endpoint.into(), "SHA256:changed".into());
+
+        persist_trusted_host_key(&path, &original).unwrap();
+        assert_eq!(
+            check_known_host(&path, endpoint, changed.fingerprint()).unwrap(),
+            HostKeyStatus::Mismatch
+        );
+        assert!(persist_trusted_host_key(&path, &changed).is_err());
+        assert_eq!(
+            check_known_host(&path, endpoint, original.fingerprint()).unwrap(),
+            HostKeyStatus::Trusted
+        );
+    }
 }
