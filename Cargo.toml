@@ -32,7 +32,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "io-ut
 futures = "0.3"
 
 # --- FTP / FTPS (explicit-TLS; native-tls -> macOS Security.framework for CA compat) ---
-suppaftp = { version = "8", features = ["native-tls"] }
+suppaftp = { version = "10", features = ["native-tls"] }
 
 # --- SFTP (pure Rust, no C deps) ---
 russh = "0.61"
