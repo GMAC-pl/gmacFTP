@@ -6,6 +6,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 ENTITLEMENTS="${MACKFTP_ENTITLEMENTS:-$ROOT/gmacFTP.entitlements}"
+EXPECTED_TEAM_ID="${MACKFTP_EXPECTED_TEAM_ID:-SY4HQ4PWVU}"
 # Strip the developer's absolute home + project paths from the shipped binary (panic locations +
 # debug symbols) so the .app never leaks /Users/<name>/... . --remap-path-prefix only rewrites
 # paths embedded by file!()/env!()/panic locations — purely cosmetic, zero behavior change.
@@ -19,24 +20,29 @@ PKG_BUILD="${MACKFTP_BUILD_NUMBER:-$(git -C "$ROOT" rev-list --count HEAD 2>/dev
 
 sign_app() {
   local app="$1"
+  local expected_bundle_id="$2"
   local identity
-  identity="$(security find-identity -v -p codesigning | grep -m1 -oE 'Developer ID Application: [^"]+' || true)"
-  if [ -z "$identity" ]; then
-    identity="$(security find-identity -v -p codesigning | grep -m1 -oE 'Apple Development: [^"]+' || true)"
-  fi
+  identity="${MACKFTP_SIGN_IDENTITY:-$(security find-identity -v -p codesigning | sed -nE "s/.*\"(Developer ID Application: .*\(${EXPECTED_TEAM_ID}\))\"/\1/p" | head -1)}"
   if [ -z "$identity" ]; then
     if [ "${MACKFTP_STRICT_SIGN:-0}" = "1" ]; then
-      echo "ERROR (MACKFTP_STRICT_SIGN=1): no Developer ID Application identity found." >&2
+      echo "ERROR (MACKFTP_STRICT_SIGN=1): no Developer ID Application identity for Team ID $EXPECTED_TEAM_ID." >&2
       echo "       A distributable bundle MUST be signed with Developer ID — ad-hoc signing is" >&2
       echo "       blocked by Gatekeeper on other users' Macs." >&2
       exit 1
     fi
-    echo "==> WARNING: no Developer ID/Apple Development identity — ad-hoc signing (LOCAL ONLY;"
-    echo "    Gatekeeper blocks it on other Macs). Set MACKFTP_STRICT_SIGN=1 to fail instead."
+    identity="$(security find-identity -v -p codesigning | sed -nE "s/.*\"(Apple Development: .*\(${EXPECTED_TEAM_ID}\))\"/\1/p" | head -1)"
+  fi
+  if [ -z "$identity" ]; then
+    echo "==> WARNING: no matching signing identity — ad-hoc signing (LOCAL ONLY;"
+    echo "    Gatekeeper blocks it on other Macs). Set MACKFTP_STRICT_SIGN=1 for release builds."
     # No --deep (deprecated, Apple TN-3148); sign the bundle root with Hardened Runtime +
     # entitlements best-effort. Ad-hoc builds cannot be notarized.
     codesign -s - --force --options runtime --timestamp --entitlements "$ENTITLEMENTS" "$app" 2>/dev/null || echo "(codesign skipped)"
   else
+    if [ "${MACKFTP_STRICT_SIGN:-0}" = "1" ] && [[ "$identity" != Developer\ ID\ Application:*"($EXPECTED_TEAM_ID)" ]]; then
+      echo "ERROR: strict release signing requires Developer ID Application for Team ID $EXPECTED_TEAM_ID." >&2
+      exit 1
+    fi
     echo "==> codesign with: $identity (Hardened Runtime + entitlements)"
     codesign --force --options runtime --timestamp --entitlements "$ENTITLEMENTS" -s "$identity" "$app"
     # Hard gate: a Developer-ID build must verify cleanly before it ships.
@@ -44,10 +50,17 @@ sign_app() {
       echo "ERROR: codesign --verify --strict failed for $app" >&2
       exit 1
     fi
-    echo "==> signature verified. Notarize before distribution:"
-    echo "    hdiutil create -volname gmacFTP -srcfolder \"$app\" -ov -format UDZO gmacFTP.dmg"
-    echo "    xcrun notarytool submit gmacFTP.dmg --keychain-profile gmacftp --wait"
-    echo "    xcrun stapler staple gmacFTP.dmg && xcrun stapler staple \"$app\""
+    local signature
+    signature="$(codesign -d --verbose=4 "$app" 2>&1)"
+    if ! grep -Fxq "TeamIdentifier=$EXPECTED_TEAM_ID" <<<"$signature"; then
+      echo "ERROR: signed app TeamIdentifier does not match $EXPECTED_TEAM_ID." >&2
+      exit 1
+    fi
+    if ! grep -Fxq "Identifier=$expected_bundle_id" <<<"$signature"; then
+      echo "ERROR: signed app identifier does not match $expected_bundle_id." >&2
+      exit 1
+    fi
+    echo "==> Developer ID signature identity + bundle identifier verified"
   fi
 }
 
@@ -119,13 +132,31 @@ CREDITS
   # codesign then seals it into the signature.
   local profile="${MACKFTP_PROVISIONING_PROFILE:-$HOME/Library/MobileDevice/Provisioning Profiles/2135c4cd-cc0e-4c40-8e80-2694dc460cf4.provisionprofile}"
   if [ -f "$profile" ]; then
-    cp "$profile" "$app/Contents/embedded.provisionprofile"
-    echo "==> embedded provisioning profile"
+    local profile_plist profile_app_id
+    profile_plist="$(mktemp)"
+    if security cms -D -i "$profile" >"$profile_plist" 2>/dev/null; then
+      profile_app_id="$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:com.apple.application-identifier' "$profile_plist" 2>/dev/null || true)"
+    else
+      profile_app_id=""
+    fi
+    rm -f "$profile_plist"
+    if [ "$profile_app_id" = "$EXPECTED_TEAM_ID.$bundle_id" ]; then
+      cp "$profile" "$app/Contents/embedded.provisionprofile"
+      echo "==> embedded provisioning profile verified for $bundle_id"
+    elif [ "${MACKFTP_STRICT_SIGN:-0}" = "1" ]; then
+      echo "ERROR: provisioning profile is not valid for $EXPECTED_TEAM_ID.$bundle_id" >&2
+      exit 1
+    else
+      echo "==> WARNING: provisioning profile does not match $bundle_id — not embedding it" >&2
+    fi
   else
     echo "==> WARNING: provisioning profile not found ($profile) — iCloud entitlements won't work" >&2
+    if [ "${MACKFTP_STRICT_SIGN:-0}" = "1" ]; then
+      exit 1
+    fi
   fi
 
-  sign_app "$app"
+  sign_app "$app" "$bundle_id"
   echo "==> Built $app"
 }
 
@@ -146,7 +177,7 @@ build_bundle \
   "$PUBLIC_CONFIG_ORGANIZATION" \
   "$PUBLIC_CONFIG_APPLICATION"
 
-if [ -f .env.personal ]; then
+if [ "${MACKFTP_PUBLIC_ONLY:-0}" != "1" ] && [ -f .env.personal ]; then
   set -a
   # shellcheck disable=SC1091
   . ./.env.personal
@@ -166,10 +197,12 @@ if [ -f .env.personal ]; then
     "$PERSONAL_CONFIG_ORGANIZATION" \
     "$PERSONAL_CONFIG_APPLICATION"
 else
-  echo "==> .env.personal not found — skipped personal bundle"
+  echo "==> personal bundle skipped"
   echo "    Public bundle is ready at: target/release/gmacFTP.app"
 fi
 
 echo
-echo "Launch personal: open target/release/gmacFTP-Personal.app"
+if [ -d target/release/gmacFTP-Personal.app ]; then
+  echo "Launch personal: open target/release/gmacFTP-Personal.app"
+fi
 echo "Launch public:   open target/release/gmacFTP.app"

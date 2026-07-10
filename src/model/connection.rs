@@ -22,6 +22,10 @@ pub struct ConnectionSpec {
     /// server cannot silently permit a TLS-downgrade to plaintext for another connection.
     #[serde(default)]
     pub allow_plaintext_ftp: bool,
+    /// Certificate exceptions are security decisions for one endpoint, never a global switch.
+    /// `Settings.accept_any_cert` remains readable only as legacy UI state during migration.
+    #[serde(default)]
+    pub accept_invalid_tls: bool,
 }
 
 impl ConnectionSpec {
@@ -63,6 +67,7 @@ mod tests {
             user: "u".into(),
             initial_path: String::new(),
             allow_plaintext_ftp: false,
+            accept_invalid_tls: false,
         }
     }
 

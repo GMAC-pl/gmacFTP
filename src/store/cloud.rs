@@ -22,7 +22,88 @@
 //! dir remain the source of truth; the synced files are copies named `gmacftp.connections.json`
 //! / `gmacftp.vault.bin`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+const MAX_CONNECTIONS_BYTES: usize = 1_048_576;
+const MAX_VAULT_BYTES: usize = 1_048_576;
+const MAX_WRAPPED_KEY_BYTES: usize = 128;
+
+fn max_len(kind: &str) -> Option<usize> {
+    match kind {
+        "connections" => Some(MAX_CONNECTIONS_BYTES),
+        "vault" => Some(MAX_VAULT_BYTES),
+        "key" => Some(MAX_WRAPPED_KEY_BYTES),
+        _ => None,
+    }
+}
+
+fn valid_payload(kind: &str, payload: &[u8]) -> bool {
+    match kind {
+        "connections" => crate::store::connections::validate_metadata_bytes(payload).is_ok(),
+        // The encrypted vault's AES-GCM tag is validated by FileVault before it is ever used;
+        // here we enforce only an unambiguous minimum/maximum before writing foreign sync data.
+        "vault" => (12 + 16..=MAX_VAULT_BYTES).contains(&payload.len()),
+        "key" => crate::store::vault::valid_wrapped_key_len(payload),
+        _ => false,
+    }
+}
+
+/// Validate a sync payload and return its safe canonical representation. Connection transport
+/// exceptions are deliberately stripped: plaintext FTP and invalid-certificate approval must be
+/// made locally on every Mac and can never be enabled by editing the sync folder.
+fn normalize_payload(kind: &str, payload: &[u8]) -> Option<Vec<u8>> {
+    if max_len(kind).is_none_or(|limit| payload.len() > limit) {
+        return None;
+    }
+    if kind == "connections" {
+        crate::store::connections::normalize_sync_metadata_bytes(payload).ok()
+    } else {
+        valid_payload(kind, payload).then(|| payload.to_vec())
+    }
+}
+
+fn read_regular_limited(path: &Path, max_len: usize) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+
+    let before = std::fs::symlink_metadata(path)?;
+    if !before.file_type().is_file()
+        || before.file_type().is_symlink()
+        || before.len() > max_len as u64
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "sync item is not a bounded regular file",
+        ));
+    }
+    let file = std::fs::File::open(path)?;
+    let after = file.metadata()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if before.dev() != after.dev() || before.ino() != after.ino() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "sync item changed while opening",
+            ));
+        }
+    }
+    if !after.file_type().is_file() || after.len() > max_len as u64 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "sync item changed type or size",
+        ));
+    }
+    let mut bytes = Vec::with_capacity(after.len() as usize);
+    file.take((max_len as u64).saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > max_len {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "sync item exceeds size limit",
+        ));
+    }
+    Ok(bytes)
+}
 
 /// Is iCloud sync enabled in Settings? (Centralized so every call site reads the same flag.)
 pub fn enabled() -> bool {
@@ -101,20 +182,32 @@ mod imp {
     /// `(file mtime as unix secs, file bytes)`. mtime drives last-writer-wins.
     pub fn read_item(kind: &str) -> Option<(u64, Vec<u8>)> {
         let p = path_for(kind)?;
-        let meta = std::fs::metadata(&p).ok()?;
+        let meta = std::fs::symlink_metadata(&p).ok()?;
+        if !meta.file_type().is_file() || meta.file_type().is_symlink() {
+            return None;
+        }
         let mtime = meta
             .modified()
             .ok()?
             .duration_since(std::time::UNIX_EPOCH)
             .ok()?
             .as_secs();
-        let bytes = std::fs::read(&p).ok()?;
+        let bytes = super::read_regular_limited(&p, super::max_len(kind)?).ok()?;
+        let Some(bytes) = super::normalize_payload(kind, &bytes) else {
+            tracing::warn!(target: "gmacftp::cloud", kind, "rejected malformed sync item");
+            return None;
+        };
         Some((mtime, bytes))
     }
 
-    pub fn delete_item(kind: &str) {
-        if let Some(p) = path_for(kind) {
-            let _ = std::fs::remove_file(p);
+    pub fn delete_item(kind: &str) -> Result<(), String> {
+        let Some(p) = path_for(kind) else {
+            return Ok(());
+        };
+        match std::fs::remove_file(p) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.to_string()),
         }
     }
 }
@@ -131,7 +224,9 @@ mod imp {
     pub fn read_item(_: &str) -> Option<(u64, Vec<u8>)> {
         None
     }
-    pub fn delete_item(_: &str) {}
+    pub fn delete_item(_: &str) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// Push a single blob to iCloud. No-op if sync disabled.
@@ -139,7 +234,15 @@ pub fn push(kind: &str, payload: &[u8]) {
     if !enabled() {
         return;
     }
-    if let Err(e) = imp::write_item(kind, payload) {
+    let Some(payload) = normalize_payload(kind, payload) else {
+        tracing::warn!(target: "gmacftp::cloud", kind, "refusing to push malformed or oversized sync item");
+        return;
+    };
+    if kind == "vault" && !crate::store::vault::validate_synced_vault(&payload) {
+        tracing::warn!(target: "gmacftp::cloud", "refusing to push a vault that cannot be authenticated with the local master key");
+        return;
+    }
+    if let Err(e) = imp::write_item(kind, &payload) {
         tracing::warn!(target: "gmacftp::cloud", kind, error = %e, "iCloud push failed");
     }
 }
@@ -151,24 +254,43 @@ pub fn push_state() {
         return;
     }
     if let Some(p) = connections_path() {
-        if let Ok(bytes) = std::fs::read(&p) {
+        if let Ok(bytes) = read_regular_limited(&p, MAX_CONNECTIONS_BYTES) {
             push("connections", &bytes);
         }
     }
     if let Some(p) = vault_path() {
-        if let Ok(bytes) = std::fs::read(&p) {
+        if let Ok(bytes) = read_regular_limited(&p, MAX_VAULT_BYTES) {
             push("vault", &bytes);
         }
     }
 }
 
 /// Push the wrapped master key (`gmacftp.key.wrap`) to the sync folder. No-op if sync off.
-pub fn push_key(wrapped: &[u8]) {
+pub fn push_key(wrapped: &[u8]) -> Result<(), String> {
+    replace_key(wrapped).map(|_| ())
+}
+
+/// Replace the synced wrapped key and return its previous validated value for rollback. When
+/// sync is disabled no remote mutation occurs.
+pub(crate) fn replace_key(wrapped: &[u8]) -> Result<Option<Vec<u8>>, String> {
     if !enabled() {
-        return;
+        return Ok(None);
     }
-    if let Err(e) = imp::write_item("key", wrapped) {
-        tracing::warn!(target: "gmacftp::cloud", error = %e, "wrapped-key push failed");
+    let Some(wrapped) = normalize_payload("key", wrapped) else {
+        return Err("refusing malformed wrapped master key".to_string());
+    };
+    let previous = imp::read_item("key").map(|(_, bytes)| bytes);
+    imp::write_item("key", &wrapped).map_err(|e| format!("wrapped-key push failed: {e}"))?;
+    Ok(previous)
+}
+
+pub(crate) fn restore_key(previous: Option<&[u8]>) -> Result<(), String> {
+    if !enabled() {
+        return Ok(());
+    }
+    match previous {
+        Some(bytes) => imp::write_item("key", bytes),
+        None => imp::delete_item("key"),
     }
 }
 
@@ -183,39 +305,75 @@ pub fn read_vault() -> Option<(u64, Vec<u8>)> {
     imp::read_item("vault")
 }
 
-/// Remove the synced items (used when the user turns sync OFF, to stop sharing). Best-effort.
-pub fn purge() {
-    imp::delete_item("connections");
-    imp::delete_item("vault");
-    imp::delete_item("key");
+/// Remove the synced items (used when the user turns sync OFF, to stop sharing). All failures are
+/// reported because leaving a wrapped key or vault behind is security-relevant to the user.
+pub fn purge() -> Result<(), String> {
+    let mut errors = Vec::new();
+    for kind in ["connections", "vault", "key"] {
+        if let Err(error) = imp::delete_item(kind) {
+            tracing::warn!(target: "gmacftp::cloud", kind, %error, "could not remove synced item");
+            errors.push(format!("{kind}: {error}"));
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
 }
 
 /// Toggle iCloud sync on/off (the menu action calls this). Persists the setting, moves the
 /// master key between the device-local and iCloud-syncing Keychain stores, then seeds iCloud
 /// (enable) or stops sharing (disable). Idempotent.
-pub fn set_sync_enabled(enabled: bool) {
+pub fn set_sync_enabled(enabled: bool) -> Result<(), String> {
     let mut s = crate::store::settings::load();
     if s.sync_via_icloud == enabled {
-        return;
+        return Ok(());
+    }
+    // Move the master key so the synced vault stays decryptable on the other Mac (enable) or
+    // stops syncing (disable). The master key and cached passphrase live in the Keychain, never
+    // in plaintext in the synced folder.
+    crate::store::vault::set_master_key_syncable(enabled)?;
+    if let Err(error) = crate::store::vault::set_sync_passphrase_syncable(enabled) {
+        let master_rollback = crate::store::vault::set_master_key_syncable(!enabled);
+        return Err(format!(
+            "passphrase Keychain move failed: {error}; master-key rollback: {master_rollback:?}"
+        ));
     }
     s.sync_via_icloud = enabled;
-    crate::store::settings::save(&s);
-    // Move the master key so the synced vault stays decryptable on the other Mac (enable) or
-    // stops syncing (disable). The key is the only secret — it lives in the Keychain, never
-    // in the synced folder.
-    crate::store::vault::set_master_key_syncable(enabled);
+    if let Err(error) = crate::store::settings::try_save(&s) {
+        let passphrase_rollback = crate::store::vault::set_sync_passphrase_syncable(!enabled);
+        let master_rollback = crate::store::vault::set_master_key_syncable(!enabled);
+        return Err(format!(
+            "settings save failed after Keychain move: {error}; passphrase rollback: {passphrase_rollback:?}; master-key rollback: {master_rollback:?}"
+        ));
+    }
     if enabled {
-        push_state();
         // Re-push the wrapped key too — a prior off→on toggle purged it, and push_state only
         // covers connections/vault. No-op if no passphrase is set yet (the SET dialog handles
         // the first-time case).
         if crate::store::settings::load().sync_passphrase_set {
-            let _ = crate::store::vault::repush_sync_key();
+            if let Err(error) = crate::store::vault::repush_sync_key() {
+                let settings_rollback = crate::store::settings::try_save(&{
+                    let mut previous = crate::store::settings::load();
+                    previous.sync_via_icloud = false;
+                    previous
+                });
+                let passphrase_rollback = crate::store::vault::set_sync_passphrase_syncable(false);
+                let key_rollback = crate::store::vault::set_master_key_syncable(false);
+                return Err(format!(
+                    "could not publish wrapped key: {error}; settings rollback: {settings_rollback:?}; passphrase rollback: {passphrase_rollback:?}; master-key rollback: {key_rollback:?}"
+                ));
+            }
         }
+        push_state();
     } else {
-        purge();
+        purge().map_err(|error| {
+            format!("sync disabled locally, but some remote files could not be removed: {error}")
+        })?;
     }
     tracing::info!(target: "gmacftp::cloud", enabled, "iCloud sync toggled");
+    Ok(())
 }
 
 /// Pull: for each of connections/vault, if the iCloud item is newer than the local file's
@@ -230,7 +388,7 @@ pub fn pull_and_apply() -> bool {
         let Some((ts, payload)) = imp::read_item(kind) else {
             continue;
         };
-        if payload.is_empty() {
+        if payload.is_empty() || !valid_payload(kind, &payload) {
             continue;
         }
         let local_secs = local
@@ -242,16 +400,35 @@ pub fn pull_and_apply() -> bool {
             .unwrap_or(0);
         // iCloud wins on a tie too (it was written by some device; a local file with equal
         // mtime is the just-pushed one and re-writing it is a harmless no-op). No mtime
-        // restoration needed: pull sets local mtime=now ≥ iCloud ts, so a later pull of the
-        // same item is a no-op (ts >= local_secs is false) — no push/pull loop.
+        // restoration needed: pull sets local mtime=now ≥ iCloud ts. A timestamp tie may cause
+        // another harmless atomic rewrite, but never a push/pull feedback loop.
         if ts >= local_secs && ts > 0 {
             if let Some(p) = &local {
+                // Never replace an existing local vault with ciphertext whose AES-GCM tag and
+                // JSON plaintext cannot be verified using the already-available key. On a new
+                // Mac (no local vault yet), the bounded blob may be staged for the explicit
+                // passphrase unlock path, which authenticates it before use.
+                if kind == "vault"
+                    && p.exists()
+                    && !crate::store::vault::validate_synced_vault(&payload)
+                {
+                    tracing::warn!(target: "gmacftp::cloud", "rejected unauthenticated synced vault; local vault preserved");
+                    continue;
+                }
                 if let Some(parent) = p.parent() {
                     let _ = std::fs::create_dir_all(parent);
                 }
-                if crate::store::vault::atomic_write(p, &payload).is_ok() {
-                    tracing::info!(target: "gmacftp::cloud", kind, "pulled newer state from iCloud");
-                    applied = true;
+                // Validation happens before every overwrite. The metadata remains plaintext for
+                // compatibility, but v2 credential binding prevents it from redirecting an
+                // endpoint password to a different protocol/host/port/account.
+                match crate::store::vault::atomic_write(p, &payload) {
+                    Ok(()) => {
+                        tracing::info!(target: "gmacftp::cloud", kind, "pulled newer state from iCloud");
+                        applied = true;
+                    }
+                    Err(error) => {
+                        tracing::warn!(target: "gmacftp::cloud", kind, error = %error, "could not apply validated sync item")
+                    }
                 }
             }
         }
@@ -273,14 +450,19 @@ pub fn bootstrap() {
     // (e.g. purged by a sync off→on toggle, which only re-pushes connections/vault) →
     // re-create it from the cached passphrase. If the passphrase isn't cached either, clear
     // the flag so the SET dialog shows again on this Mac.
-    if crate::store::settings::load().sync_passphrase_set
-        && read_key().is_none()
-        && crate::store::vault::repush_sync_key().is_err()
-    {
-        let mut s = crate::store::settings::load();
-        s.sync_passphrase_set = false;
-        crate::store::settings::save(&s);
-        tracing::warn!(target: "gmacftp::cloud", "sync passphrase not in Keychain — will prompt to set one");
+    if crate::store::settings::load().sync_passphrase_set && read_key().is_none() {
+        if let Err(repush_error) = crate::store::vault::repush_sync_key() {
+            let mut s = crate::store::settings::load();
+            s.sync_passphrase_set = false;
+            match crate::store::settings::try_save(&s) {
+                Ok(()) => {
+                    tracing::warn!(target: "gmacftp::cloud", %repush_error, "sync passphrase unavailable — will prompt to set one")
+                }
+                Err(settings_error) => {
+                    tracing::error!(target: "gmacftp::cloud", %repush_error, %settings_error, "sync passphrase unavailable and prompt state could not be persisted")
+                }
+            }
+        }
     }
 }
 
@@ -291,20 +473,31 @@ fn seed_if_empty() {
     if imp::read_item("connections").is_some() {
         return;
     }
-    let mut pushed_any = false;
+    let mut connections_pushed = false;
     if let Some(p) = connections_path() {
-        if let Ok(bytes) = std::fs::read(&p) {
-            if imp::write_item("connections", &bytes).is_ok() {
-                pushed_any = true;
+        if let Ok(bytes) = read_regular_limited(&p, MAX_CONNECTIONS_BYTES) {
+            if let Some(safe) = normalize_payload("connections", &bytes) {
+                match imp::write_item("connections", &safe) {
+                    Ok(()) => connections_pushed = true,
+                    Err(error) => {
+                        tracing::warn!(target: "gmacftp::cloud", %error, "could not seed connection metadata")
+                    }
+                }
             }
         }
     }
     if let Some(p) = vault_path() {
-        if let Ok(bytes) = std::fs::read(&p) {
-            let _ = imp::write_item("vault", &bytes);
+        if let Ok(bytes) = read_regular_limited(&p, MAX_VAULT_BYTES) {
+            if let Some(safe) = normalize_payload("vault", &bytes)
+                .filter(|payload| crate::store::vault::validate_synced_vault(payload))
+            {
+                if let Err(error) = imp::write_item("vault", &safe) {
+                    tracing::warn!(target: "gmacftp::cloud", %error, "could not seed encrypted vault");
+                }
+            }
         }
     }
-    if pushed_any {
+    if connections_pushed {
         tracing::info!(target: "gmacftp::cloud", "seeded sync folder (iCloud Drive) from local files (migration)");
     }
 }
@@ -428,16 +621,23 @@ pub fn send_now() -> String {
 
 /// Write one local file's bytes to the iCloud item `kind`. Pushes to `errors` on failure.
 fn write_kind(kind: &str, path: Option<PathBuf>, errors: &mut Vec<String>) -> bool {
-    match path.and_then(|p| std::fs::read(p).ok()) {
-        Some(bytes) => match imp::write_item(kind, &bytes) {
+    let bytes = path.and_then(|p| read_regular_limited(&p, max_len(kind)?).ok());
+    match bytes {
+        Some(bytes) => match normalize_payload(kind, &bytes)
+            .filter(|payload| {
+                kind != "vault" || crate::store::vault::validate_synced_vault(payload)
+            })
+            .ok_or_else(|| "invalid local payload".to_string())
+            .and_then(|safe| imp::write_item(kind, &safe))
+        {
             Ok(()) => true,
             Err(e) => {
                 errors.push(format!("{kind} write: {e}"));
                 false
             }
         },
-        None => {
-            errors.push(format!("{kind}: no local file"));
+        _ => {
+            errors.push(format!("{kind}: no valid local file"));
             false
         }
     }
@@ -446,8 +646,47 @@ fn write_kind(kind: &str, path: Option<PathBuf>, errors: &mut Vec<String>) -> bo
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn fmt_ts_zero_is_unknown() {
         assert_eq!(fmt_ts(0), "(unknown)");
+    }
+
+    #[test]
+    fn sync_payload_limits_are_enforced_before_copying() {
+        assert!(normalize_payload("unknown", b"anything").is_none());
+        assert!(normalize_payload("vault", &[0u8; 27]).is_none());
+        assert_eq!(normalize_payload("vault", &[0u8; 28]).unwrap().len(), 28);
+        assert!(normalize_payload("vault", &vec![0u8; MAX_VAULT_BYTES + 1]).is_none());
+        assert!(normalize_payload("key", &[0u8; MAX_WRAPPED_KEY_BYTES + 1]).is_none());
+    }
+
+    #[test]
+    fn bounded_reader_rejects_a_file_over_the_limit() {
+        use rand::RngCore;
+        let path = std::env::temp_dir().join(format!(
+            "gmacftp_cloud_limit_{}_{}",
+            std::process::id(),
+            rand::rngs::OsRng.next_u64()
+        ));
+        std::fs::write(&path, vec![7u8; 65]).unwrap();
+        assert!(read_regular_limited(&path, 64).is_err());
+        assert_eq!(read_regular_limited(&path, 65).unwrap().len(), 65);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_reader_never_follows_a_sync_symlink() {
+        use rand::RngCore;
+        use std::os::unix::fs::symlink;
+        let nonce = rand::rngs::OsRng.next_u64();
+        let target = std::env::temp_dir().join(format!("gmacftp_cloud_target_{nonce}"));
+        let link = std::env::temp_dir().join(format!("gmacftp_cloud_link_{nonce}"));
+        std::fs::write(&target, b"foreign-data").unwrap();
+        symlink(&target, &link).unwrap();
+        assert!(read_regular_limited(&link, 1024).is_err());
+        let _ = std::fs::remove_file(link);
+        let _ = std::fs::remove_file(target);
     }
 }

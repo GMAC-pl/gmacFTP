@@ -17,7 +17,7 @@ use crate::model::{
     ConnectionId, ConnectionSpec, Protocol, TransferDirection, TransferId, TransferJob,
 };
 use crate::net::{ftp, sftp};
-use crate::store::CredentialStore;
+use crate::store::{CredentialKey, CredentialStore};
 
 enum Cmd {
     Run(TransferJob, ConnectionSpec),
@@ -144,7 +144,21 @@ async fn run_one(
 ) {
     let id = job.id;
     let total = job.bytes_total;
-    let password = match store.get(&spec.host, &spec.user) {
+    let credential_key = match CredentialKey::for_spec(&spec) {
+        Ok(key) => key,
+        Err(error) => {
+            let _ = updates
+                .send(TransferUpdate {
+                    id,
+                    bytes_done: 0,
+                    bytes_total: None,
+                    state: TransferState::Failed(error.to_string()),
+                })
+                .await;
+            return;
+        }
+    };
+    let password = match store.get_for(&credential_key) {
         Ok(b) => String::from_utf8_lossy(&b).into_owned(),
         Err(_) => {
             let _ = updates

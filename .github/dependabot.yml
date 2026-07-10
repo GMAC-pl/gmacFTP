@@ -10,7 +10,7 @@ updates:
     groups:
       patch-and-minor:
         update-types: ["patch", "minor"]
-  # Keep GitHub Actions versions current (checkout, rust-toolchain, rust-cache, audit-check).
+  # Keep pinned GitHub Actions current (checkout, rust-toolchain, rust-cache, install-action).
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
