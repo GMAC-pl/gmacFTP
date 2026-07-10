@@ -4,11 +4,13 @@ gmacFTP handles server addresses, usernames, passwords, local paths, and file tr
 
 ## Supported Versions
 
-The project is pre-1.0. Security fixes are handled on the main development line until formal releases exist.
+The project is pre-1.0. Security fixes are provided for the latest published release and the
+`main` branch; older releases should be upgraded.
 
 ## Reporting A Vulnerability
 
-If the repository is published with GitHub Security Advisories enabled, report vulnerabilities privately through that feature.
+Report vulnerabilities privately through
+[GitHub Security Advisories](https://github.com/GMAC-pl/gmacFTP/security/advisories/new).
 
 If private advisories are not available yet, open a minimal issue that describes the class of problem without including credentials, server names, logs with tokens, or private file paths. Maintainers can then coordinate a safe disclosure path.
 
@@ -27,25 +29,27 @@ Use localhost test servers or placeholder domains such as `example.com` when rep
 
 ## Known dependency advisories (`cargo audit`)
 
-gmacFTP ships **macOS-only**. `cargo audit` surfaces advisories that fall into three buckets —
-only the first affects the shipping binary:
+gmacFTP ships **macOS-only**. The release lockfile currently has three known vulnerability
+advisories, all explicitly reviewed:
 
-- **macOS runtime, accepted risk.** `rsa 0.10.0-rc.18` (RUSTSEC-2023-0071, "Marvin Attack",
-  MEDIUM 5.9) is pulled in transitively by `russh` (SFTP). There is **no upstream fix** (the
-  RustCrypto RSA maintainer considers the timing side-channel out of scope). Practical exposure
-  for an interactive GUI FTP client is low; prefer **ed25519** SSH host keys (already supported)
-  to avoid RSA key exchange entirely. CI's `audit` job ignores this one ID so it can still gate
-  on every other advisory.
-- **macOS runtime, not exploitable here.** `memmap2 0.9.10` (RUSTSEC-2026-0186, unsound raw
-  pointer offset) and `crypto-bigint 0.7.4` (yanked — a registry state, not a security defect)
-  reach the macOS binary via fontique/russh, but gmacFTP does not exercise the flagged code
-  paths. `anyhow`'s unsoundness (RUSTSEC-2026-0190) is **fixed** — Cargo.lock is pinned to
-  1.0.103 (bumped during this audit pass), so it no longer flags.
-- **Linux-only / build-only (NOT in the macOS binary).** `quick-xml` (RUSTSEC-2026-0194/0195,
-  both HIGH 7.5 — ignored in CI as Linux-only), plus the GTK3/X11/Wayland family (`atk`, `gtk`,
-  `gdk`, `glib`, `bincode`, `proc-macro-error`, …) pulled by Slint's winit Linux backends, and
-  the build-time proc-macros `paste` and `ttf-parser` — `cargo tree -i <crate> --target
-aarch64-apple-darwin` returns "nothing to print" for all of them. They will disappear when a
-  future Slint bump moves winit. They are tracked, not shippable, and cannot affect macOS users.
+- **macOS dependency, vulnerable operation not used.** `rsa 0.10.0-rc.18`
+  (RUSTSEC-2023-0071, "Marvin Attack", MEDIUM 5.9) is pulled in transitively by `russh` and has
+  no fixed release. The affected operation is RSA private-key decryption. gmacFTP does not load
+  user private keys or perform public-key authentication: its SFTP client uses password
+  authentication and verifies the server's public host key. CI therefore accepts this advisory
+  until `russh` can remove or replace the dependency.
+- **Linux-only.** `quick-xml 0.39.4` (RUSTSEC-2026-0194 and RUSTSEC-2026-0195, both HIGH 7.5)
+  is pulled by Slint's Wayland/accessibility dependency graph. It is absent from both macOS
+  target graphs (`cargo tree -i quick-xml --target aarch64-apple-darwin` and the equivalent
+  x86_64 command return nothing), so these parsers are not compiled into the distributed app.
 
-When `cargo audit` is run locally, expect these to appear; they are reviewed and classified here.
+The dependency audit also reports informational maintenance/unsoundness warnings. The GTK3,
+X11 and Wayland group (`atk`, `gdk`, `gtk`, `glib`, `bincode`, and `proc-macro-error`) is absent
+from the macOS target. `paste` is a proc-macro/build dependency and `ttf-parser` is a macOS
+dependency of Slint's font/rendering stack; RustSec currently marks their pinned versions
+unmaintained. These warnings have no known vulnerability entry and do not change
+`cargo audit`'s exit status; they remain tracked for future Slint upgrades.
+
+RUSTSEC-2026-0186 is fixed by pinning `memmap2 0.9.11`; the lockfile also contains the non-yanked
+`crypto-bigint 0.7.5`. CI ignores only the three reviewed vulnerability IDs above, so every new
+vulnerability fails the audit gate.

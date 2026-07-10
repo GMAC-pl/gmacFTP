@@ -1,8 +1,39 @@
 # Changelog
 
-## Unreleased
+## 0.0.19 — 2026-07-10
 
-_(Nothing yet.)_
+Security and data-integrity release following a full code, dependency, build, and release audit.
+
+- **Vault key changes are transactional.** Switching iCloud synchronization no longer deletes the
+  working Keychain master key before the replacement has been stored and read back. Keychain access
+  errors are distinct from a genuinely missing key, so a transient denial cannot generate a
+  replacement key and strand an existing vault.
+- **Credentials are scoped to the complete endpoint.** Protocol, normalized host, effective port,
+  and username form the credential identity. Existing local `(host, user)` records migrate once
+  from an exact saved-endpoint allowlist before cloud metadata is read, without sharing a password
+  with a newly imported service on the same host.
+- **Folder operations stay inside the selected tree.** Local uploads and copies no longer follow
+  symlinks; cycles, descendant copies, excessive depth, and excessive entry counts fail safely.
+  Remote drag staging is private and removed when the drag finishes or fails.
+- **Hostile-server input is bounded before allocation.** FTP and SFTP directory entries are consumed
+  incrementally. SFTP requests have operation deadlines, and FTP passive data connections are pinned
+  to the control peer instead of trusting a server-supplied PASV address.
+- **TLS exceptions are endpoint-specific.** Accepting a self-signed FTPS certificate for one saved
+  server no longer disables certificate verification for other servers.
+- **Synchronized state is validated before adoption.** Sync files have strict size and type limits;
+  encrypted vault data is authenticated before it can replace an existing local vault, and
+  plaintext connection metadata cannot sync weaker transport settings. Wrapped-key/KDF data uses
+  an explicit version and parameters while retaining compatible legacy reads.
+- **The updater verifies publisher identity.** It requires the exact GitHub asset, GitHub's byte
+  count and SHA-256 digest, a Developer ID signature from Team ID `SY4HQ4PWVU`, the expected DMG
+  signing identifier, and a stapled Apple notarization ticket before Finder opens the image.
+- **Release tooling fails closed.** Strict builds accept only the intended Developer ID team,
+  validate the provisioning profile and bundle identifier, sign the DMG itself, require successful
+  notarization, and emit a SHA-256 file. CI actions are commit-pinned with read-only permissions.
+- **Security dependency refresh.** FTP/FTPS now uses `suppaftp 10.0.0` with wire logging disabled,
+  SFTP uses `russh 0.62.2`, and `memmap2 0.9.11` replaces the vulnerable `0.9.10` release.
+- **Importer fixes.** FileZilla base64 passwords are decoded, implicit FTPS records are no longer
+  silently treated as explicit FTPS, and import input is bounded.
 
 ## 0.0.18 — 2026-07-09
 

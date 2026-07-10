@@ -9,7 +9,7 @@ pub mod sftp;
 use crate::model::{ConnectionSpec, Protocol, RemoteEntry};
 
 pub use error::{HostKeyChallenge, NetError};
-pub use ftp::{accept_invalid_tls, allow_plaintext_ftp, set_accept_invalid_tls};
+pub use ftp::{accept_invalid_tls, allow_plaintext_ftp};
 pub use safe::{assert_within, sanitize_local_rel, validate_ftp_path};
 
 #[derive(Debug, Clone, Default)]

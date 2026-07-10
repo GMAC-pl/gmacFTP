@@ -12,14 +12,14 @@ pub mod settings;
 pub mod vault;
 
 pub use connections::{load_filezilla, load_metadata, load_seed, save_metadata, ImportError};
-pub use creds::{CredentialError, CredentialStore, SERVICE_PREFIX};
+pub use creds::{canonical_host, CredentialError, CredentialKey, CredentialStore, SERVICE_PREFIX};
 #[cfg(target_os = "macos")]
 pub use keychain::MacCredentialStore;
 pub use memory::InMemoryStore;
 pub use vault::{FileVault, MigratingStore};
 
-/// The credential store to use: the encrypted private vault with lazy Keychain migration,
-/// so reads are silent (no macOS prompt) once a credential is in the vault.
+/// The credential store to use: the encrypted private vault. Legacy Keychain entries are copied
+/// only by the explicit, local-metadata-allowlisted migration before normal reads begin.
 pub fn default_store() -> MigratingStore {
     MigratingStore::new()
 }

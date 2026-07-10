@@ -1,6 +1,6 @@
 [package]
 name = "gmacftp"
-version = "0.0.18"
+version = "0.0.19"
 edition = "2021"
 rust-version = "1.88"
 description = "gmacFTP — native, lightweight FTP/FTPS/SFTP client for macOS"
@@ -32,10 +32,10 @@ tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "io-ut
 futures = "0.3"
 
 # --- FTP / FTPS (explicit-TLS; native-tls -> macOS Security.framework for CA compat) ---
-suppaftp = { version = "8", features = ["native-tls"] }
+suppaftp = { version = "10", features = ["native-tls", "no-log"] }
 
 # --- SFTP (pure Rust, no C deps) ---
-russh = "0.61"
+russh = "0.62"
 russh-sftp = "2"
 
 # --- Keychain (v4 split the backends into per-store features) ---
@@ -64,6 +64,7 @@ trash = "5"   # move local files to the OS Trash on delete (reversible, never pe
 drag = "2.1"
 # In-app update check: query the GitHub Releases API + download the latest DMG.
 ureq = { version = "2.12", features = ["json"] }
+sha2 = "0.10" # verify GitHub's release-asset digest before opening an update
 
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "3"   # one-time ForkLift internet-password import

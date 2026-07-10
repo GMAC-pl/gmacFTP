@@ -1,7 +1,10 @@
 //! App settings (persisted to `<config_dir>/settings.json`).
 
 use std::fs;
+use std::io::Read;
 use std::path::PathBuf;
+
+const MAX_SETTINGS_BYTES: usize = 128 * 1024;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Settings {
@@ -45,9 +48,14 @@ pub struct Settings {
     pub sync_passphrase_set: bool,
     /// True once this app's saved legacy Keychain passwords have been folded into the vault.
     /// The migration reads only exact, allow-listed service/account pairs from connections.json;
-    /// v2 forces a safe rerun after older broad Keychain migration logic.
+    /// Retained for compatibility with v0.0.18, whose vault still used `(host, user)` keys.
     #[serde(default)]
     pub keychain_migrated_v2: bool,
+    /// True once every locally saved connection has received an endpoint-bound credential key
+    /// `(protocol, canonical host, effective port, user)`. This must be a separate flag from the
+    /// v0.0.18 Keychain migration flag so that upgrading users are not incorrectly skipped.
+    #[serde(default)]
+    pub endpoint_credentials_migrated_v2: bool,
 }
 
 fn default_accept_any_cert() -> bool {
@@ -74,6 +82,7 @@ impl Default for Settings {
             sync_folder: None,
             sync_passphrase_set: false,
             keychain_migrated_v2: false,
+            endpoint_credentials_migrated_v2: false,
         }
     }
 }
@@ -91,23 +100,79 @@ pub fn load() -> Settings {
     let Some(p) = path() else {
         return Settings::default();
     };
-    match fs::read_to_string(&p) {
-        Ok(s) if !s.trim().is_empty() => serde_json::from_str(&s).unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "settings parse failed; using defaults");
-            Settings::default()
-        }),
+    match read_regular_limited(&p, MAX_SETTINGS_BYTES) {
+        Ok(bytes) if !bytes.iter().all(u8::is_ascii_whitespace) => serde_json::from_slice(&bytes)
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "settings parse failed; using defaults");
+                Settings::default()
+            }),
         _ => Settings::default(),
     }
 }
 
-pub fn save(s: &Settings) {
+fn read_regular_limited(path: &std::path::Path, limit: usize) -> std::io::Result<Vec<u8>> {
+    let before = fs::symlink_metadata(path)?;
+    if !before.file_type().is_file()
+        || before.file_type().is_symlink()
+        || before.len() > limit as u64
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "settings are not a bounded regular file",
+        ));
+    }
+    let mut file = fs::File::open(path)?;
+    let opened = file.metadata()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if before.dev() != opened.dev() || before.ino() != opened.ino() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "settings changed while opening",
+            ));
+        }
+    }
+    if !opened.file_type().is_file() || opened.len() > limit as u64 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "settings changed type or size",
+        ));
+    }
+    let mut bytes = Vec::with_capacity(opened.len() as usize);
+    file.by_ref()
+        .take(limit.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > limit {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "settings exceed their size limit",
+        ));
+    }
+    Ok(bytes)
+}
+
+/// Persist settings and report failures to callers that can surface them to the user.
+pub fn try_save(s: &Settings) -> Result<(), std::io::Error> {
     let Some(p) = path() else {
-        return;
+        return Ok(());
     };
     // Reuse the hardened atomic_write (O_EXCL + 0600 + fsync + rename) so a crash/power loss
     // mid-save can't truncate settings.json — fulfills the v0.0.13 "atomic writes everywhere
     // user data lives" contract (connections.json + vault already use this same helper).
-    if let Ok(json) = serde_json::to_string_pretty(s) {
-        let _ = crate::store::vault::atomic_write(&p, json.as_bytes());
+    let json = serde_json::to_string_pretty(s)
+        .map_err(|e| std::io::Error::other(format!("settings serialization failed: {e}")))?;
+    crate::store::vault::atomic_write(&p, json.as_bytes())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_migration_flag_does_not_skip_endpoint_key_upgrade() {
+        let settings: Settings = serde_json::from_str(r#"{"keychain_migrated_v2":true}"#).unwrap();
+        assert!(settings.keychain_migrated_v2);
+        assert!(!settings.endpoint_credentials_migrated_v2);
     }
 }

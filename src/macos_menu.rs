@@ -95,9 +95,15 @@ mod imp {
                     });
                     return;
                 }
-                cloud::set_sync_enabled(enabling);
-                refresh_sync_title();
-                tracing::info!(target: "gmacftp::menu", "iCloud sync toggled from menu bar");
+                match cloud::set_sync_enabled(enabling) {
+                    Ok(()) => {
+                        refresh_sync_title();
+                        tracing::info!(target: "gmacftp::menu", "iCloud sync toggled from menu bar");
+                    }
+                    Err(error) => on_ui(move |ui| {
+                        ui.set_error(format!("Could not change iCloud sync: {error}").into())
+                    }),
+                }
             }
 
             #[unsafe(method(newConnection:))]
@@ -157,17 +163,28 @@ mod imp {
                     match gmacftp::updater::check() {
                         Ok(Some(upd)) => {
                             let v = upd.version.clone();
-                            match gmacftp::updater::download(&upd.dmg_url, &upd.version) {
+                            match gmacftp::updater::download(
+                                &upd.dmg_url,
+                                &upd.version,
+                                &upd.sha256,
+                                upd.size,
+                            ) {
                                 Ok(path) => {
-                                    gmacftp::updater::open_in_finder(&path);
-                                    on_ui(move |ui| {
-                                        ui.set_status(
-                                            format!(
-                                                "Update {v} downloaded — drag gmacFTP to Applications, then relaunch."
+                                    match gmacftp::updater::open_in_finder(&path) {
+                                        Ok(()) => on_ui(move |ui| {
+                                            ui.set_status(
+                                                format!(
+                                                    "Verified update {v} downloaded — drag gmacFTP to Applications, then relaunch."
+                                                )
+                                                .into(),
                                             )
-                                            .into(),
-                                        )
-                                    });
+                                        }),
+                                        Err(e) => on_ui(move |ui| {
+                                            ui.set_error(
+                                                format!("Could not open verified update: {e}").into(),
+                                            )
+                                        }),
+                                    }
                                 }
                                 Err(e) => on_ui(move |ui| ui.set_error(format!("Update download failed: {e}").into())),
                             }

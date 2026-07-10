@@ -1,199 +1,323 @@
-//! In-app update check — lightweight, no Sparkle framework.
+//! In-app update check without embedding a third-party updater framework.
 //!
-//! "Check for Updates…" (App menu) queries the GitHub Releases API for the latest release,
-//! compares the version, and if newer, downloads the notarized DMG to ~/Downloads and opens it
-//! in Finder (the user drags gmacFTP to Applications — the standard DMG install). This is
-//! "update directly from the app" without embedding/signing a 3rd-party framework. Pure Rust
-//! (`ureq`) + the system `open` command to mount the DMG.
+//! Updates are accepted only when all of these checks succeed:
+//! - the Releases API points at the exact expected DMG name on `github.com`;
+//! - GitHub supplies a SHA-256 digest and byte size for that asset;
+//! - the streamed download matches both values;
+//! - the DMG itself has a valid Developer ID signature from gmacFTP's Apple team and a
+//!   stapled notarization ticket.
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
-/// The GitHub repo that hosts releases (also where the app pulls its source + updates from).
+use sha2::{Digest, Sha256};
+
 const REPO: &str = "GMAC-pl/gmacftp";
-/// The running build's version (e.g. "0.0.2"), baked in at compile time.
 pub const CURRENT: &str = env!("CARGO_PKG_VERSION");
-/// The host a GitHub release asset URL must resolve to. The Releases API only ever returns
-/// `github.com` `browser_download_url` values (which 302 to `objects.githubusercontent.com`);
-/// anything else indicates a hijacked release / compromised account / MITM and is refused.
-///
-/// Scope note: [`validate_asset_url`] checks the URL the API hands us (the `github.com`
-/// `browser_download_url`). `ureq` then follows the 302 to `objects.githubusercontent.com` —
-/// the allowlist does NOT constrain the redirect target, only the initial URL. For a legitimate
-/// GitHub release that's exactly the expected chain; the check is defense-in-depth against a
-/// non-`github.com` URL a compromised release/account could inject, not a full redirect-pin
-/// defense (which Gatekeeper + the HTTPS transport already cover).
+const GH_API_HOST: &str = "api.github.com";
 const GH_ASSET_HOST: &str = "github.com";
-/// Cap a downloaded DMG at 300 MiB so a hostile or compromised endpoint can't OOM the app with
-/// an unbounded stream. A real gmacFTP DMG is ~10–50 MiB.
+const GH_REDIRECT_HOSTS: &[&str] = &[
+    GH_ASSET_HOST,
+    "objects.githubusercontent.com",
+    "release-assets.githubusercontent.com",
+];
+const EXPECTED_TEAM_ID: &str = "SY4HQ4PWVU";
+const EXPECTED_DMG_IDENTIFIER: &str = "app.mackftp.client.dmg";
+const MAX_API_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_DMG_BYTES: u64 = 300 * 1024 * 1024;
 
-/// Defense-in-depth on top of the (already HTTPS) API call and macOS Gatekeeper: refuse any
-/// release asset URL that isn't `https://` on the expected GitHub host. Catches `file://`,
-/// `http://`, and off-host URLs a compromised release/account could otherwise inject.
-fn validate_asset_url(url: &str) -> Result<(), String> {
+fn https_host(url: &str) -> Result<&str, String> {
     let after = url
         .strip_prefix("https://")
-        .ok_or_else(|| format!("refusing non-HTTPS asset URL: {url}"))?;
-    let host = after.split(['/', '?', '#']).next().unwrap_or("");
-    if host.eq_ignore_ascii_case(GH_ASSET_HOST) {
+        .ok_or_else(|| format!("refusing non-HTTPS URL: {url}"))?;
+    let authority = after.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.is_empty() || authority.contains('@') {
+        return Err(format!("invalid HTTPS URL authority: {url}"));
+    }
+    let (host, port) = authority
+        .rsplit_once(':')
+        .map_or((authority, None), |(h, p)| (h, Some(p)));
+    if port.is_some_and(|p| p != "443") || host.is_empty() {
+        return Err(format!("refusing non-standard HTTPS endpoint: {url}"));
+    }
+    Ok(host)
+}
+
+fn validate_url_host(url: &str, allowed: &[&str]) -> Result<(), String> {
+    let host = https_host(url)?;
+    if allowed
+        .iter()
+        .any(|expected| host.eq_ignore_ascii_case(expected))
+    {
         Ok(())
     } else {
-        Err(format!(
-            "refusing off-host asset URL (expected {GH_ASSET_HOST}): {url}"
-        ))
+        Err(format!("refusing off-host URL: {url}"))
     }
 }
 
-/// A newer release found on GitHub (None if the running build is current or newer).
+fn parse_version(v: &str) -> Option<(u64, u64, u64)> {
+    // Release versions also become filenames. Accept only the project's numeric tag format;
+    // allowing an arbitrary semver suffix here would make path separators attacker-controlled.
+    let mut parts = v.split('.');
+    let parsed = (
+        parts.next()?.parse().ok()?,
+        parts.next()?.parse().ok()?,
+        parts.next()?.parse().ok()?,
+    );
+    parts.next().is_none().then_some(parsed)
+}
+
+fn normalized_sha256(digest: &str) -> Result<String, String> {
+    let value = digest.strip_prefix("sha256:").unwrap_or(digest);
+    if value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Ok(value.to_ascii_lowercase())
+    } else {
+        Err("release asset has no valid SHA-256 digest".into())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct LatestUpdate {
-    /// Version without the leading "v" (e.g. "0.0.3").
     pub version: String,
-    /// Direct .dmg download URL.
     pub dmg_url: String,
-    /// Human-readable release notes (the release body).
+    pub sha256: String,
+    pub size: u64,
     pub notes: String,
 }
 
-/// Query GitHub for the latest release; return it only if it's strictly newer than this build.
+/// Query GitHub for the latest release and require the exact DMG asset, size, and digest.
 pub fn check() -> Result<Option<LatestUpdate>, String> {
-    let url = format!("https://api.github.com/repos/{REPO}/releases/latest");
-    let body: serde_json::Value = ureq::get(&url)
+    let url = format!("https://{GH_API_HOST}/repos/{REPO}/releases/latest");
+    validate_url_host(&url, &[GH_API_HOST])?;
+    let response = ureq::get(&url)
         .set("User-Agent", "gmacFTP-updater")
         .set("Accept", "application/vnd.github+json")
         .call()
-        .map_err(|e| format!("GitHub request failed: {e}"))?
-        .into_json()
-        .map_err(|e| format!("invalid response: {e}"))?;
-
-    let tag = body.get("tag_name").and_then(|v| v.as_str()).unwrap_or("");
-    let version = tag.trim_start_matches('v').to_string();
-    if version.is_empty() {
-        return Err("no tag_name in latest release".into());
+        .map_err(|e| format!("GitHub request failed: {e}"))?;
+    if response
+        .header("Content-Length")
+        .and_then(|v| v.parse::<u64>().ok())
+        .is_some_and(|n| n > MAX_API_BYTES)
+    {
+        return Err("GitHub release response is unexpectedly large".into());
     }
-    if !is_newer(&version, CURRENT) {
+    let mut api_bytes = Vec::new();
+    response
+        .into_reader()
+        .take(MAX_API_BYTES.saturating_add(1))
+        .read_to_end(&mut api_bytes)
+        .map_err(|e| format!("could not read GitHub response: {e}"))?;
+    if api_bytes.len() as u64 > MAX_API_BYTES {
+        return Err("GitHub release response is unexpectedly large".into());
+    }
+    let body: serde_json::Value =
+        serde_json::from_slice(&api_bytes).map_err(|e| format!("invalid GitHub response: {e}"))?;
+
+    let tag = body
+        .get("tag_name")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "no tag_name in latest release".to_string())?;
+    let version = tag
+        .strip_prefix('v')
+        .ok_or_else(|| "release tag must start with v".to_string())?;
+    parse_version(version).ok_or_else(|| format!("invalid release version: {version:?}"))?;
+    parse_version(CURRENT).ok_or_else(|| format!("invalid current version: {CURRENT:?}"))?;
+    if !is_newer(version, CURRENT) {
         return Ok(None);
     }
-    let dmg_url = body
+
+    let expected_name = format!("gmacFTP-{version}.dmg");
+    let asset = body
         .get("assets")
         .and_then(|a| a.as_array())
-        .and_then(|arr| {
-            arr.iter().find_map(|a| {
-                let name = a.get("name")?.as_str()?;
-                let url = a.get("browser_download_url")?.as_str()?;
-                name.ends_with(".dmg").then(|| url.to_string())
-            })
+        .and_then(|assets| {
+            let mut matches = assets
+                .iter()
+                .filter(|asset| asset.get("name").and_then(|n| n.as_str()) == Some(&expected_name));
+            let first = matches.next()?;
+            matches.next().is_none().then_some(first)
         })
-        .ok_or_else(|| "no .dmg asset in latest release".to_string())?;
+        .ok_or_else(|| format!("release must contain exactly one {expected_name} asset"))?;
+    let dmg_url = asset
+        .get("browser_download_url")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "release asset has no download URL".to_string())?
+        .to_string();
+    validate_url_host(&dmg_url, &[GH_ASSET_HOST])?;
+    let size = asset
+        .get("size")
+        .and_then(|v| v.as_u64())
+        .filter(|n| *n > 0 && *n <= MAX_DMG_BYTES)
+        .ok_or_else(|| "release asset has an invalid size".to_string())?;
+    let sha256 = normalized_sha256(
+        asset
+            .get("digest")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "release asset has no GitHub SHA-256 digest".to_string())?,
+    )?;
     let notes = body
         .get("body")
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
     Ok(Some(LatestUpdate {
-        version,
+        version: version.to_string(),
         dmg_url,
+        sha256,
+        size,
         notes,
     }))
 }
 
-/// True iff `latest` (e.g. "0.0.3") is strictly newer than `current` (e.g. "0.0.2").
-/// Compares the first three numeric dot-segments; non-numeric segments count as 0.
 pub fn is_newer(latest: &str, current: &str) -> bool {
-    parse_semver(latest) > parse_semver(current)
-}
-fn parse_semver(v: &str) -> (u32, u32, u32) {
-    // Each dot-segment contributes its leading run of digits ("3-beta" -> 3, "0" -> 0).
-    let nums: Vec<u32> = v
-        .split('.')
-        .map(|seg| {
-            let digits: String = seg.chars().take_while(|c| c.is_ascii_digit()).collect();
-            digits.parse::<u32>().unwrap_or(0)
-        })
-        .collect();
-    (
-        *nums.first().unwrap_or(&0),
-        *nums.get(1).unwrap_or(&0),
-        *nums.get(2).unwrap_or(&0),
-    )
+    matches!((parse_version(latest), parse_version(current)), (Some(a), Some(b)) if a > b)
 }
 
-/// Download `dmg_url` into ~/Downloads/gmacFTP-<version>.dmg. Returns the local path.
-///
-/// Hardened update path (the v0.0.14 audit found the prior version unbounded + non-atomic +
-/// unchecked): (1) refuse any URL that isn't HTTPS on `github.com`; (2) sanitize the version
-/// before it flows into the destination path (a git tag may contain `/`); (3) stream to a
-/// `.part` temp via an exclusive (O_EXCL + 0600) open — defeating a pre-planted symlink — with
-/// a 300 MiB cap against an unbounded/OOM stream; (4) fsync + atomic rename to the final `.dmg`
-/// so a crash never leaves a half-written DMG that Finder would try to mount.
-pub fn download(url: &str, version: &str) -> Result<PathBuf, String> {
-    validate_asset_url(url)?;
-    // Sanitize the version: a git tag is attacker-controllable and may contain '/', so an
-    // unfiltered `version` could traverse out of ~/Downloads (`0.0.99/../../../tmp/evil`).
-    // Keep only alphanumerics, '.', '-', '_'.
-    let safe_version: String = version
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
-        .collect();
-    if safe_version.is_empty() {
-        return Err(format!("invalid release version: {version:?}"));
+/// Download, hash, verify the signed/notarized DMG, then atomically expose it in Downloads.
+pub fn download(
+    url: &str,
+    version: &str,
+    expected_sha256: &str,
+    expected_size: u64,
+) -> Result<PathBuf, String> {
+    validate_url_host(url, &[GH_ASSET_HOST])?;
+    parse_version(version).ok_or_else(|| format!("invalid release version: {version:?}"))?;
+    let expected_sha256 = normalized_sha256(expected_sha256)?;
+    if expected_size == 0 || expected_size > MAX_DMG_BYTES {
+        return Err("invalid expected release size".into());
     }
 
     let dir = directories::UserDirs::new()
         .and_then(|d| d.download_dir()?.canonicalize().ok())
-        .unwrap_or_else(|| PathBuf::from("."));
-    // Single source of truth for the destination name: `part` is derived from it, the rename
-    // target is it, and it's what we return — so the three can never diverge (a release-tool
-    // bug where Finder is told to open a different name than the one written would be silent).
-    let final_path = dir.join(format!("gmacFTP-{safe_version}.dmg"));
-    let mut part = final_path.clone().into_os_string();
-    part.push(".part");
-    let part = PathBuf::from(part);
+        .ok_or_else(|| "Downloads directory is unavailable".to_string())?;
+    let final_path = dir.join(format!("gmacFTP-{version}.dmg"));
+    let part = dir.join(format!(
+        ".gmacFTP-{version}-{}-{:016x}{:016x}.part",
+        std::process::id(),
+        rand::random::<u64>(),
+        rand::random::<u64>()
+    ));
 
-    let resp = ureq::get(url)
-        .set("User-Agent", "gmacFTP-updater")
-        .call()
-        .map_err(|e| format!("download failed: {e}"))?;
-    let mut reader = resp.into_reader();
-
-    // Stream with a hard size cap (replaces the unbounded read_to_end into a Vec). The exclusive
-    // open reuses vault's CRYP-3 hardening (O_EXCL + 0600 + symlink-safe).
-    let mut file = crate::store::vault::create_exclusive(&part)
-        .map_err(|e| format!("could not create {}: {e}", part.display()))?;
-    let mut buf = [0u8; 64 * 1024];
-    let mut done: u64 = 0;
-    loop {
-        let n = reader
-            .read(&mut buf)
-            .map_err(|e| format!("read failed: {e}"))?;
-        if n == 0 {
-            break;
+    let result = (|| -> Result<(), String> {
+        let response = ureq::get(url)
+            .set("User-Agent", "gmacFTP-updater")
+            .call()
+            .map_err(|e| format!("download failed: {e}"))?;
+        validate_url_host(response.get_url(), GH_REDIRECT_HOSTS)?;
+        if response
+            .header("Content-Length")
+            .and_then(|v| v.parse::<u64>().ok())
+            .is_some_and(|n| n != expected_size || n > MAX_DMG_BYTES)
+        {
+            return Err("release Content-Length does not match GitHub metadata".into());
         }
-        done = done.saturating_add(n as u64);
-        if done > MAX_DMG_BYTES {
-            let _ = std::fs::remove_file(&part);
+        let mut reader = response.into_reader();
+        let mut file = crate::store::vault::create_exclusive(&part)
+            .map_err(|e| format!("could not create {}: {e}", part.display()))?;
+        let mut hasher = Sha256::new();
+        let mut buf = [0u8; 64 * 1024];
+        let mut done = 0u64;
+        loop {
+            let n = reader
+                .read(&mut buf)
+                .map_err(|e| format!("read failed: {e}"))?;
+            if n == 0 {
+                break;
+            }
+            done = done.saturating_add(n as u64);
+            if done > MAX_DMG_BYTES || done > expected_size {
+                return Err("release exceeded its declared size".into());
+            }
+            hasher.update(&buf[..n]);
+            file.write_all(&buf[..n])
+                .map_err(|e| format!("write failed: {e}"))?;
+        }
+        if done != expected_size {
             return Err(format!(
-                "release too large (>{MAX_DMG_BYTES} bytes) — refusing"
+                "release size mismatch: expected {expected_size}, received {done}"
             ));
         }
-        file.write_all(&buf[..n])
-            .map_err(|e| format!("write failed: {e}"))?;
+        let actual = format!("{:x}", hasher.finalize());
+        if actual != expected_sha256 {
+            return Err("release SHA-256 mismatch".into());
+        }
+        file.sync_all().map_err(|e| format!("sync failed: {e}"))?;
+        drop(file);
+        verify_release_image(&part)?;
+        std::fs::rename(&part, &final_path).map_err(|e| format!("rename failed: {e}"))?;
+        tracing::info!(
+            target: "gmacftp::updater",
+            bytes = done,
+            sha256 = %actual,
+            path = %final_path.display(),
+            "update verified (GitHub digest + Developer ID team + notarization)"
+        );
+        Ok(())
+    })();
+    if let Err(error) = result {
+        let _ = std::fs::remove_file(&part);
+        return Err(error);
     }
-    file.sync_all().map_err(|e| format!("sync failed: {e}"))?;
-    std::fs::rename(&part, &final_path).map_err(|e| format!("rename failed: {e}"))?;
-    tracing::info!(
-        target: "gmacftp::updater",
-        bytes = done,
-        path = %final_path.display(),
-        "update DMG downloaded (transport-verified: HTTPS + github.com host + size cap + exclusive write). Content integrity + identity are confirmed by macOS Gatekeeper when the DMG is mounted."
-    );
     Ok(final_path)
 }
 
-/// Open `path` with the default handler (Finder mounts a .dmg → shows the install window).
-pub fn open_in_finder(path: &Path) {
-    let _ = std::process::Command::new("open").arg(path).spawn();
+#[cfg(target_os = "macos")]
+fn verify_release_image(path: &Path) -> Result<(), String> {
+    let verify = Command::new("codesign")
+        .args(["--verify", "--strict", "--verbose=2"])
+        .arg(path)
+        .output()
+        .map_err(|e| format!("could not run codesign: {e}"))?;
+    if !verify.status.success() {
+        return Err(format!(
+            "release DMG signature is invalid: {}",
+            String::from_utf8_lossy(&verify.stderr).trim()
+        ));
+    }
+    let details = Command::new("codesign")
+        .args(["-d", "--verbose=4"])
+        .arg(path)
+        .output()
+        .map_err(|e| format!("could not inspect DMG signature: {e}"))?;
+    if !details.status.success() {
+        return Err("could not inspect release DMG signature".into());
+    }
+    let metadata = String::from_utf8_lossy(&details.stderr);
+    if !metadata
+        .lines()
+        .any(|line| line.trim() == format!("TeamIdentifier={EXPECTED_TEAM_ID}"))
+    {
+        return Err("release DMG was not signed by the expected Apple team".into());
+    }
+    if !metadata
+        .lines()
+        .any(|line| line.trim() == format!("Identifier={EXPECTED_DMG_IDENTIFIER}"))
+    {
+        return Err("release DMG has an unexpected signing identifier".into());
+    }
+    let staple = Command::new("xcrun")
+        .args(["stapler", "validate"])
+        .arg(path)
+        .output()
+        .map_err(|e| format!("could not validate notarization ticket: {e}"))?;
+    if !staple.status.success() {
+        return Err("release DMG has no valid stapled notarization ticket".into());
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn verify_release_image(_path: &Path) -> Result<(), String> {
+    Err("updates are supported only on macOS".into())
+}
+
+pub fn open_in_finder(path: &Path) -> Result<(), String> {
+    Command::new("open")
+        .arg(path)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("could not open verified update: {e}"))
 }
 
 #[cfg(test)]
@@ -201,34 +325,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn newer_detection() {
+    fn strict_version_detection() {
         assert!(is_newer("0.0.3", "0.0.2"));
-        assert!(is_newer("0.1.0", "0.0.99"));
-        assert!(is_newer("1.0.0", "0.9.9"));
+        assert!(is_newer("1.0.0", "0.99.99"));
         assert!(!is_newer("0.0.2", "0.0.2"));
-        assert!(!is_newer("0.0.1", "0.0.2"));
-    }
-
-    #[test]
-    fn non_numeric_segments_are_zero() {
-        assert!(is_newer("0.0.3-beta", "0.0.2"));
         assert!(!is_newer("x.y.z", "0.0.0"));
+        assert!(!is_newer("0.0.3.1", "0.0.2"));
+        assert!(!is_newer("0.0.3-beta", "0.0.2"));
+        assert!(!is_newer("0.0.3-/../../tmp/evil", "0.0.2"));
     }
 
     #[test]
-    fn asset_url_accepts_github_https() {
-        assert!(validate_asset_url(
-            "https://github.com/GMAC-pl/gmacftp/releases/download/v0.0.15/gmacFTP-0.0.15.dmg"
-        )
-        .is_ok());
+    fn url_allowlist_rejects_spoofing_and_nonstandard_ports() {
+        assert!(validate_url_host("https://github.com/x", &[GH_ASSET_HOST]).is_ok());
+        assert!(validate_url_host("https://GITHUB.COM:443/x", &[GH_ASSET_HOST]).is_ok());
+        assert!(validate_url_host("http://github.com/x", &[GH_ASSET_HOST]).is_err());
+        assert!(validate_url_host("https://github.com.evil.test/x", &[GH_ASSET_HOST]).is_err());
+        assert!(validate_url_host("https://user@github.com/x", &[GH_ASSET_HOST]).is_err());
+        assert!(validate_url_host("https://github.com:444/x", &[GH_ASSET_HOST]).is_err());
     }
 
     #[test]
-    fn asset_url_rejects_non_https_and_off_host() {
-        assert!(validate_asset_url("http://github.com/x").is_err()); // not HTTPS
-        assert!(validate_asset_url("file:///etc/passwd").is_err()); // not HTTPS
-        assert!(validate_asset_url("https://evil.com/x").is_err()); // off-host
-        assert!(validate_asset_url("https://github.com.evil.com/x").is_err()); // host spoof
-        assert!(validate_asset_url("https://GITHUB.COM/x").is_ok()); // case-insensitive host
+    fn sha256_metadata_is_strict() {
+        let hash = "8c6aeb2eafe1c62236dbf13baa061035de99972647be9c751edd28f8999fa352";
+        assert_eq!(normalized_sha256(hash).unwrap(), hash);
+        assert_eq!(normalized_sha256(&format!("sha256:{hash}")).unwrap(), hash);
+        assert!(normalized_sha256("sha256:abcd").is_err());
+        assert!(normalized_sha256(&"z".repeat(64)).is_err());
     }
 }

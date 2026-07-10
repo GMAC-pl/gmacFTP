@@ -12,6 +12,7 @@
 use std::cell::Cell;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, LazyLock, Mutex};
@@ -27,18 +28,18 @@ use gmacftp::model::{
     ConnectionId, ConnectionSpec, Protocol, RemoteEntry, TransferDirection, TransferId, TransferJob,
 };
 use gmacftp::net;
-use gmacftp::store::{self, CredentialStore};
+use gmacftp::store::{self, CredentialKey, CredentialStore};
 use gmacftp::transfer::{TransferEngine, TransferState, TransferUpdate};
 
 use crate::{App, ConnRow, EntryRow, LocalFavoriteRow, TransferRow};
 
 type ConnList = Arc<Mutex<Vec<ConnectionSpec>>>;
-type PasswordCache = HashMap<(String, String), Zeroizing<String>>;
+type PasswordCache = HashMap<CredentialKey, Zeroizing<String>>;
 type PendingCopy = (usize, usize, String, bool, Option<u64>);
 type PendingExternalUpload = (ConnectionSpec, PathBuf, String, String, Option<u64>, bool);
 type PendingHostKeyTrust = (net::HostKeyChallenge, usize);
 
-/// Per-session password cache: (host, user) -> password. The first read per connection
+/// Per-session password cache: complete endpoint identity -> password. The first read per connection
 /// hits the Keychain (one macOS auth prompt); every later connect/navigation/refresh in
 /// the same session uses the cached value — so you get prompted ONCE per connection,
 /// not on every folder-enter. (Without a paid Developer-ID signature, macOS can't bind
@@ -50,6 +51,18 @@ static PASSWORD_CACHE: LazyLock<Mutex<PasswordCache>> =
 
 const MAX_LOCAL_FOLDER_STAT_FILES: usize = 3_000;
 const MAX_REMOTE_FOLDER_STAT_FILES: usize = 2_000;
+/// Bounds for recursive reads of a user-selected local folder. They keep a symlink loop, a
+/// pathological tree, or a mounted volume from turning one drag/copy into an unbounded walk.
+const MAX_LOCAL_TREE_FILES: usize = 100_000;
+const MAX_LOCAL_TREE_DIRS: usize = 20_000;
+const MAX_LOCAL_TREE_DEPTH: usize = 64;
+/// Remote Finder drags are materialised locally before Finder receives them. Keep that staging
+/// area bounded; transfer-queue downloads remain the right path for larger trees.
+const MAX_DRAG_STAGING_FILES: usize = 10_000;
+const MAX_DRAG_STAGING_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const MAX_IMPORT_BYTES: u64 = 1024 * 1024;
+const MIN_SYNC_PASSPHRASE_CHARS: usize = 12;
+const MAX_SYNC_PASSPHRASE_BYTES: usize = 1024;
 
 /// A copy blocked on a name conflict, awaiting the user's choice in the overwrite dialog.
 /// (src_pane, dst_pane, name, is_dir, total)
@@ -700,9 +713,9 @@ pub fn run() {
         .expect("failed to build Tokio runtime");
     let handle = runtime.handle().clone();
 
-    // Settings → TLS policy + locale + theme.
+    // Settings → locale + theme. TLS exceptions live on each ConnectionSpec, never in a global
+    // process setting, so concurrent connections cannot inherit one server's exception.
     let settings = store::settings::load();
-    net::set_accept_invalid_tls(settings.accept_any_cert);
     crate::I18n::get(&ui).set_locale(settings.locale.clone().into());
     let theme = std::env::var("MACKFTP_THEME").unwrap_or_else(|_| settings.theme.clone());
     if matches!(theme.as_str(), "light" | "dark") {
@@ -710,14 +723,28 @@ pub fn run() {
     } else {
         crate::Tokens::get(&ui).set_theme(settings.theme.clone().into());
     }
-    ui.set_accept_any_cert(settings.accept_any_cert);
+    ui.set_accept_any_cert(false);
     refresh_local_favorites_model(&ui);
 
-    // Cross-device sync (BEFORE bootstrap loads local files): pull the newest connections.json
-    // / vault.bin from the sync folder (default iCloud Drive) into the local copies so this
-    // Mac reflects the latest state from the user's other devices — and, if the sync folder is
-    // still empty but this Mac already has servers, seed it from them (migration). No-op if
-    // sync disabled. Local files are never deleted, so existing servers are always kept.
+    // Upgrade legacy `(host, user)` credentials only for endpoints already present in the local,
+    // pre-sync metadata. Doing this before reading an unauthenticated sync-folder metadata file
+    // prevents that file from redirecting a legacy password into a new protocol or port.
+    if !settings.endpoint_credentials_migrated_v2 {
+        let migration_store = store::default_store();
+        match migrate_saved_passwords(&migration_store) {
+            Ok(n) if n > 0 => ui.set_status(
+                format!("Migrated {n} saved passwords into the encrypted vault (one-time).").into(),
+            ),
+            Ok(_) => {}
+            Err(error) => {
+                ui.set_error(format!("Could not migrate saved passwords: {error}").into())
+            }
+        }
+    }
+
+    // Cross-device sync (before the final store loads local files): pull the newest
+    // connections.json / vault.bin from the sync folder (default iCloud Drive) into the local
+    // copies. The one-time v1 migration above has already used only trusted local endpoints.
     store::cloud::bootstrap();
     // Create the store AFTER the pull so FileVault::open loads the just-pulled vault (and so
     // is_locked() reflects the post-pull state).
@@ -738,21 +765,6 @@ pub fn run() {
         };
         ui.set_passphrase_mode(mode.into());
         ui.set_passphrase_open(true);
-    }
-
-    // One-time: fold only the app's saved legacy Keychain passwords into the vault. The vault
-    // queries exact `(service, account)` pairs from connections.json; it never enumerates the
-    // user's generic Keychain entries. Gated on sync + a one-shot flag.
-    if store::cloud::enabled() && !store::settings::load().keychain_migrated_v2 {
-        let n = store.migrate_from_keychain();
-        let mut s = store::settings::load();
-        s.keychain_migrated_v2 = true;
-        store::settings::save(&s);
-        if n > 0 {
-            ui.set_status(
-                format!("Migrated {n} saved passwords into the encrypted vault (one-time).").into(),
-            );
-        }
     }
 
     let connections = if use_design_demo_connections() {
@@ -922,7 +934,7 @@ pub fn run() {
         jobs_index.clone(),
     );
     wire_toggle_locale(&ui);
-    wire_toggle_tls(&ui);
+    wire_toggle_tls(&ui, conns.clone(), sessions.clone(), panes.clone());
     wire_toggle_theme(&ui);
     wire_copy_path(&ui);
     wire_disconnect(&ui, panes.clone(), sessions.clone(), engine.clone());
@@ -973,7 +985,7 @@ pub fn run() {
     wire_misc_ui(&ui);
     wire_passphrase(&ui, store.clone(), conns.clone());
     wire_host_key_trust(&ui, &handle, store.clone(), panes.clone());
-    wire_send_sync(&ui, store.clone(), conns.clone());
+    wire_send_sync(&ui, store.clone());
     wire_overwrite(
         &ui,
         &handle,
@@ -993,11 +1005,23 @@ pub fn run() {
     // Re-assert keyboard focus on every pane/row click — Slint delivers key-pressed only to the
     // focused item, so we focus the root FocusScope whenever a pane becomes active.
     {
-        let uw = ui.as_weak();
+        let (uw, pn) = (ui.as_weak(), panes.clone());
         ui.on_activate_pane(move |_| {
             if let Some(ui) = uw.upgrade() {
                 focus_root(&ui);
                 refresh_selected_path(&ui);
+                let active = active_pane_idx(&ui);
+                let tls_exception = pn
+                    .lock()
+                    .ok()
+                    .and_then(|states| {
+                        states[active]
+                            .conn
+                            .as_ref()
+                            .map(|spec| spec.accept_invalid_tls)
+                    })
+                    .unwrap_or(false);
+                ui.set_accept_any_cert(tls_exception);
             }
         });
     }
@@ -1144,6 +1168,7 @@ fn design_demo_connections() -> Vec<ConnectionSpec> {
         user: user.to_string(),
         initial_path: String::new(),
         allow_plaintext_ftp: false,
+        accept_invalid_tls: false,
     })
     .collect()
 }
@@ -1322,18 +1347,46 @@ fn apply_design_demo_main(ui: &App, panes: &Panes, sessions: &Sessions, conns: &
 /// First-launch import: parse the a third-party file manager seed, store passwords, persist metadata.
 fn initial_seed_import(store: &Arc<dyn CredentialStore>) -> Vec<ConnectionSpec> {
     for candidate in seed_candidates() {
-        if let Ok(json) = std::fs::read_to_string(&candidate) {
+        if let Ok(json) = read_bounded_regular_utf8(&candidate, MAX_IMPORT_BYTES) {
             tracing::info!(path = %candidate.display(), "importing connection seed");
             match store::load_seed(&json, store.as_ref()) {
-                Ok(specs) => {
-                    let _ = store::save_metadata(&specs);
-                    return specs;
-                }
+                Ok(specs) => match store::save_metadata(&specs) {
+                    Ok(()) => return specs,
+                    Err(e) => tracing::warn!(error = %e, "seed metadata save failed"),
+                },
                 Err(e) => tracing::warn!(error = %e, "seed import failed"),
             }
         }
     }
     Vec::new()
+}
+
+fn read_bounded_regular_utf8(path: &Path, limit: u64) -> Result<String, String> {
+    let before = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+    if !before.file_type().is_file() || before.file_type().is_symlink() || before.len() > limit {
+        return Err("not a bounded regular file".into());
+    }
+    let mut file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let opened = file.metadata().map_err(|e| e.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if before.dev() != opened.dev() || before.ino() != opened.ino() {
+            return Err("file changed while opening".into());
+        }
+    }
+    if !opened.file_type().is_file() || opened.len() > limit {
+        return Err("file changed type or exceeds the size limit".into());
+    }
+    let mut bytes = Vec::with_capacity(opened.len() as usize);
+    file.by_ref()
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    if bytes.len() as u64 > limit {
+        return Err("file exceeds the size limit".into());
+    }
+    String::from_utf8(bytes).map_err(|_| "file is not valid UTF-8".into())
 }
 
 /// Where to look for an optional local JSON seed. The default public build never embeds
@@ -1554,6 +1607,7 @@ fn wire_window_controls(
 }
 
 fn wire_external_drag(ui: &App, handle: &Handle, store: Arc<dyn CredentialStore>, panes: Panes) {
+    cleanup_abandoned_drag_roots_in(&std::env::temp_dir());
     let (uw, handle, panes) = (ui.as_weak(), handle.clone(), panes.clone());
     ui.on_start_external_drag(move |pane_name, row| {
         let Some(ui) = uw.upgrade() else { return };
@@ -1567,12 +1621,18 @@ fn wire_external_drag(ui: &App, handle: &Handle, store: Arc<dyn CredentialStore>
         let state = panes.lock().ok().map(|p| p[pane].clone());
         let Some(state) = state else { return };
         let mut path = PathBuf::from(&state.cwd).join(entry.name.as_str());
+        let mut staging_root = None;
         if matches!(state.kind, PaneKind::Remote) {
             let Some(spec) = state.conn else { return };
             let Some(password) = password_for(&store, &spec) else {
                 return;
             };
             let remote = join_remote(PathBuf::from(&state.cwd).join(entry.name.as_str()));
+            let expected_size = TRUE_SIZE
+                .lock()
+                .ok()
+                .and_then(|sizes| sizes.get(&(pane, entry.name.to_string())).copied())
+                .or((entry.size > 0).then_some(entry.size as u64));
             match materialize_remote_drag(
                 &handle,
                 &spec,
@@ -1580,8 +1640,12 @@ fn wire_external_drag(ui: &App, handle: &Handle, store: Arc<dyn CredentialStore>
                 &remote,
                 entry.name.as_str(),
                 entry.is_dir,
+                expected_size,
             ) {
-                Ok(p) => path = p,
+                Ok(staged) => {
+                    path = staged.path;
+                    staging_root = Some(staged.root);
+                }
                 Err(e) => {
                     ui.set_error(format!("Could not prepare drag: {e}").into());
                     return;
@@ -1589,18 +1653,32 @@ fn wire_external_drag(ui: &App, handle: &Handle, store: Arc<dyn CredentialStore>
             };
         }
         let Ok(path) = std::fs::canonicalize(path) else {
+            if let Some(root) = staging_root {
+                let _ = std::fs::remove_dir_all(root);
+            }
             return;
         };
         let image = drag_preview_image().unwrap_or_else(|| drag::Image::File(path.clone()));
-        let _ = ui.window().with_winit_window(|window| {
-            let _ = drag::start_drag(
+        let cleanup_root = staging_root.clone();
+        let started = ui.window().with_winit_window(|window| {
+            drag::start_drag(
                 window,
                 drag::DragItem::Files(vec![path]),
                 image,
-                |_, _| {},
+                move |_, _| {
+                    if let Some(root) = cleanup_root.as_ref() {
+                        let _ = std::fs::remove_dir_all(root);
+                    }
+                },
                 Default::default(),
-            );
+            )
         });
+        if !matches!(started, Some(Ok(()))) {
+            if let Some(root) = staging_root {
+                let _ = std::fs::remove_dir_all(root);
+            }
+            ui.set_error("Could not start external drag.".into());
+        }
     });
 }
 
@@ -1638,20 +1716,20 @@ fn receive_external_path(
             handle.spawn(async move {
                 let result = tokio::task::spawn_blocking(move || {
                     if is_dir {
-                        fs_copy_tree(&source, &destination);
-                        Ok(())
+                        fs_copy_tree(&source, &destination)
                     } else {
-                        std::fs::copy(&source, &destination)
-                            .map(|_| ())
-                            .map_err(|_| ())
+                        copy_local_file(&source, &destination)
                     }
                 })
                 .await;
                 let _ = slint::invoke_from_event_loop(move || {
                     if let Some(u) = uw.upgrade() {
                         match result {
-                            Ok(Ok(())) => u.set_status(format!("Copied {name}").into()),
-                            _ => u.set_error(format!("Could not copy {name}").into()),
+                            Ok(Ok(count)) => {
+                                u.set_status(format!("Copied {name} ({count} file(s))").into())
+                            }
+                            Ok(Err(e)) => u.set_error(format!("Could not copy {name}: {e}").into()),
+                            Err(e) => u.set_error(format!("Could not copy {name}: {e}").into()),
                         }
                         refresh_both_panes(&h, st, pn, u.as_weak());
                     }
@@ -1737,6 +1815,187 @@ fn receive_external_path(
     }
 }
 
+struct RemoteDragStaging {
+    root: PathBuf,
+    path: PathBuf,
+}
+
+#[cfg(unix)]
+fn drag_owner_process_is_running(pid: u32) -> bool {
+    if pid == std::process::id() {
+        return true;
+    }
+    std::process::Command::new("/bin/kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(true)
+}
+
+#[cfg(not(unix))]
+fn drag_owner_process_is_running(_pid: u32) -> bool {
+    true
+}
+
+/// Remove private staging directories left behind when a previous app process crashed. Live
+/// processes are never touched, symlinks are never followed, and scanning is bounded so a crowded
+/// system temp directory cannot delay starting a drag indefinitely.
+fn cleanup_abandoned_drag_roots_in(temp_dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(temp_dir) else {
+        return;
+    };
+    for entry in entries.take(512).flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Some(owner) = name
+            .strip_prefix("gmacftp-drag-")
+            .and_then(|tail| tail.split_once('-'))
+            .and_then(|(pid, nonce)| (!nonce.is_empty()).then_some(pid))
+            .and_then(|pid| pid.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if drag_owner_process_is_running(owner) {
+            continue;
+        }
+        let path = entry.path();
+        let is_real_directory = std::fs::symlink_metadata(&path)
+            .map(|metadata| metadata.file_type().is_dir() && !metadata.file_type().is_symlink())
+            .unwrap_or(false);
+        if is_real_directory {
+            let _ = std::fs::remove_dir_all(path);
+        }
+    }
+}
+
+fn create_private_drag_root() -> Result<PathBuf, String> {
+    let temp_dir = std::env::temp_dir();
+    cleanup_abandoned_drag_roots_in(&temp_dir);
+    for _ in 0..16 {
+        let root = temp_dir.join(format!(
+            "gmacftp-drag-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let created = {
+            let mut builder = std::fs::DirBuilder::new();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                builder.mode(0o700);
+            }
+            builder.create(&root)
+        };
+        match created {
+            Ok(()) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if let Err(e) =
+                        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
+                    {
+                        let _ = std::fs::remove_dir_all(&root);
+                        return Err(format!("could not secure drag staging directory: {e}"));
+                    }
+                }
+                return Ok(root);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("could not create drag staging directory: {e}")),
+        }
+    }
+    Err("could not allocate a unique drag staging directory".into())
+}
+
+/// Download one staging file with an enforced byte ceiling. Metadata from a remote listing is
+/// only a hint, so the progress callback cancels on actual bytes as well. Both network backends
+/// remove their `.part` file when cancellation is observed.
+fn download_drag_file_bounded(
+    handle: &Handle,
+    spec: &ConnectionSpec,
+    password: &str,
+    remote: &str,
+    target: &Path,
+    max_bytes: u64,
+) -> Result<u64, String> {
+    let result = match spec.protocol {
+        Protocol::Ftp => {
+            let (spec, password, remote, target) = (
+                spec.clone(),
+                password.to_string(),
+                remote.to_string(),
+                target.to_path_buf(),
+            );
+            let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let progress_cancel = cancelled.clone();
+            let operation_cancel = cancelled.clone();
+            handle
+                .block_on(async move {
+                    tokio::task::spawn_blocking(move || {
+                        net::ftp::download(
+                            &spec,
+                            &password,
+                            &remote,
+                            &target,
+                            move |done| {
+                                if done > max_bytes {
+                                    progress_cancel
+                                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                                }
+                            },
+                            Some(operation_cancel.as_ref()),
+                        )
+                    })
+                    .await
+                })
+                .map_err(|error| error.to_string())?
+        }
+        Protocol::Sftp => {
+            let cancelled = std::sync::atomic::AtomicBool::new(false);
+            handle.block_on(net::sftp::download(
+                spec,
+                password,
+                remote,
+                target,
+                |done| {
+                    if done > max_bytes {
+                        cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                },
+                Some(&cancelled),
+            ))
+        }
+    };
+    match result {
+        Ok(bytes) if bytes <= max_bytes => Ok(bytes),
+        Ok(_) | Err(net::NetError::Cancelled) => Err(format!(
+            "drag staging is limited to {}; use the transfer queue instead",
+            fmt_size(MAX_DRAG_STAGING_BYTES)
+        )),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn validate_drag_budget(files: usize, bytes: u64) -> Result<(), String> {
+    if files > MAX_DRAG_STAGING_FILES {
+        return Err(format!(
+            "drag staging is limited to {MAX_DRAG_STAGING_FILES} files; use the transfer queue instead"
+        ));
+    }
+    if bytes > MAX_DRAG_STAGING_BYTES {
+        return Err(format!(
+            "drag staging is limited to {}; use the transfer queue instead",
+            fmt_size(MAX_DRAG_STAGING_BYTES)
+        ));
+    }
+    Ok(())
+}
+
 fn materialize_remote_drag(
     handle: &Handle,
     spec: &ConnectionSpec,
@@ -1744,39 +2003,72 @@ fn materialize_remote_drag(
     remote: &str,
     name: &str,
     is_dir: bool,
-) -> Result<PathBuf, String> {
-    let root = std::env::temp_dir()
-        .join("gmacftp-drag")
-        .join(format!("{}", rand::random::<u64>()));
-    // `name` came from the server listing. Never let an absolute path or `..` escape the
-    // private drag staging directory before handing the materialised file to Finder.
-    let target = remote_local_target(&root, name).map_err(|e| e.to_string())?;
-    std::fs::create_dir_all(if is_dir { &target } else { &root }).map_err(|e| e.to_string())?;
+    expected_size: Option<u64>,
+) -> Result<RemoteDragStaging, String> {
     if !is_dir {
-        handle
-            .block_on(net::download_file(spec, password, remote, target.clone()))
-            .map_err(|e| e.to_string())?;
-        return Ok(target);
+        validate_drag_budget(1, expected_size.unwrap_or(0))?;
     }
-    let files = handle
-        .block_on(net::walk_remote(spec, password, remote))
-        .map_err(|e| e.to_string())?;
-    for (remote_file, _) in files {
-        let rel = remote_file
-            .strip_prefix(remote)
-            .unwrap_or(&remote_file)
-            .trim_start_matches('/');
-        // A recursive listing is server-controlled too. Re-apply the containment guard for
-        // every entry, rather than relying on the top-level directory having been safe.
-        let local = remote_local_target(&target, rel).map_err(|e| e.to_string())?;
-        if let Some(parent) = local.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    let root = create_private_drag_root()?;
+    let result = (|| -> Result<PathBuf, String> {
+        // `name` came from the server listing. Never let an absolute path or `..` escape the
+        // private drag staging directory before handing the materialised file to Finder.
+        let target = remote_local_target(&root, name).map_err(|e| e.to_string())?;
+        std::fs::create_dir_all(if is_dir { &target } else { &root }).map_err(|e| e.to_string())?;
+        if !is_dir {
+            let actual = download_drag_file_bounded(
+                handle,
+                spec,
+                password,
+                remote,
+                &target,
+                MAX_DRAG_STAGING_BYTES,
+            )?;
+            validate_drag_budget(1, actual)?;
+            return Ok(target);
         }
-        handle
-            .block_on(net::download_file(spec, password, &remote_file, local))
+        let files = handle
+            .block_on(net::walk_remote(spec, password, remote))
             .map_err(|e| e.to_string())?;
+        let advertised_bytes = files.iter().try_fold(0u64, |sum, (_, size)| {
+            sum.checked_add(*size)
+                .ok_or_else(|| "drag staging size overflow".to_string())
+        })?;
+        validate_drag_budget(files.len(), advertised_bytes)?;
+        let mut actual_bytes = 0u64;
+        for (remote_file, _) in files {
+            let rel = remote_file
+                .strip_prefix(remote)
+                .unwrap_or(&remote_file)
+                .trim_start_matches('/');
+            // A recursive listing is server-controlled too. Re-apply the containment guard for
+            // every entry, rather than relying on the top-level directory having been safe.
+            let local = remote_local_target(&target, rel).map_err(|e| e.to_string())?;
+            if let Some(parent) = local.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
+            let remaining = MAX_DRAG_STAGING_BYTES.saturating_sub(actual_bytes);
+            let downloaded = download_drag_file_bounded(
+                handle,
+                spec,
+                password,
+                &remote_file,
+                &local,
+                remaining,
+            )?;
+            actual_bytes = actual_bytes
+                .checked_add(downloaded)
+                .ok_or_else(|| "drag staging size overflow".to_string())?;
+            validate_drag_budget(0, actual_bytes)?;
+        }
+        Ok(target)
+    })();
+    match result {
+        Ok(path) => Ok(RemoteDragStaging { root, path }),
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&root);
+            Err(e)
+        }
     }
-    Ok(target)
 }
 
 fn drag_preview_image() -> Option<drag::Image> {
@@ -1851,35 +2143,41 @@ fn reorder_saved_connection(ui: &App, conns: &ConnList, id: i32, drop_index: i32
         return;
     }
 
-    let mut g = conns.lock().expect("connections lock");
-    let Some(from_pos) = g.iter().position(|c| c.id.0 as i32 == id) else {
+    let current = conns.lock().expect("connections lock").clone();
+    let mut candidate = current.clone();
+    let Some(from_pos) = candidate.iter().position(|c| c.id.0 as i32 == id) else {
         return;
     };
-    let item = g.remove(from_pos);
+    let item = candidate.remove(from_pos);
 
     let insert_pos = if let Some(before_id) = before_id {
-        g.iter()
+        candidate
+            .iter()
             .position(|c| c.id.0 as i32 == before_id)
-            .unwrap_or(g.len())
+            .unwrap_or(candidate.len())
     } else {
         filtered
             .iter()
             .rev()
             .find(|row| row.id != id)
             .and_then(|row| {
-                g.iter()
+                candidate
+                    .iter()
                     .position(|c| c.id.0 as i32 == row.id)
                     .map(|pos| pos + 1)
             })
-            .unwrap_or(g.len())
+            .unwrap_or(candidate.len())
     };
 
-    let insert_pos = insert_pos.min(g.len());
-    g.insert(insert_pos, item);
-    let snapshot = g.clone();
-    drop(g);
+    let insert_pos = insert_pos.min(candidate.len());
+    candidate.insert(insert_pos, item);
 
-    let _ = store::save_metadata(&snapshot);
+    if let Err(e) = store::save_metadata(&candidate) {
+        ui.set_error(format!("Could not save server order: {e}").into());
+        ui.set_status("".into());
+        return;
+    }
+    *conns.lock().expect("connections lock") = candidate;
     refresh_connections_model(ui, conns);
     ui.set_error("".into());
     ui.set_status("Saved servers reordered.".into());
@@ -2628,6 +2926,7 @@ fn show_session_in_pane(
         } else {
             "remote".into()
         });
+        ui.set_accept_any_cert(spec.accept_invalid_tls);
         refresh_sessions_model(&ui, &sessions);
     });
     refresh_pane(handle, store, panes, ui, pane);
@@ -2714,20 +3013,20 @@ fn disconnect_session(
     conn_id: i32,
 ) {
     engine.abort(ConnectionId(conn_id as usize));
-    // Evict cached passwords for the ejected session(s): capture (host, user) BEFORE retain
+    // Evict cached passwords for the ejected session(s) before retain drops them.
     // drops them. PASSWORD_CACHE values are Zeroizing<String> (wiped on drop), and evicting
     // here bounds how long a cleartext password lives after the user ends the session — it does
     // not sit in heap until process exit. (disconnect_pane does NOT evict: the session may still
     // be alive in the background pool / another pane.)
-    // Capture (host, user) of every ejected session AND drop them from the pool in ONE critical
+    // Capture the endpoint key of every ejected session AND drop them from the pool in ONE critical
     // section, so the filter and its exact inverse `retain` stay in lockstep. (Two separate locks
     // risked leaving the password cache out of sync with the pool if a panic hit between them.)
-    let evicted: Vec<(String, String)> = {
+    let evicted: Vec<CredentialKey> = {
         let mut g = sessions.lock().expect("sessions");
         let evicted: Vec<_> = g
             .iter()
             .filter(|s| s.conn.id.0 as i32 == conn_id)
-            .map(|s| (s.conn.host.clone(), s.conn.user.clone()))
+            .filter_map(|s| CredentialKey::for_spec(&s.conn).ok())
             .collect();
         g.retain(|s| s.conn.id.0 as i32 != conn_id);
         evicted
@@ -2776,6 +3075,9 @@ fn set_pane_local(panes: Panes, ui: Weak<App>, pane: usize) {
     };
     let _ = ui.upgrade().map(|ui| {
         set_pane_kind_label(&ui, pane, &label);
+        if active_pane_idx(&ui) == pane {
+            ui.set_accept_any_cert(false);
+        }
         list_local_pane(&ui, pane, &home, &cwd);
     });
 }
@@ -2876,11 +3178,11 @@ fn effective_local_favorite_paths(settings: &store::settings::Settings) -> Vec<S
     paths
 }
 
-fn save_local_favorites(paths: Vec<String>) {
+fn save_local_favorites(paths: Vec<String>) -> Result<(), std::io::Error> {
     let mut settings = store::settings::load();
     settings.local_favorites = paths;
     settings.local_favorites_customized = true;
-    store::settings::save(&settings);
+    store::settings::try_save(&settings)
 }
 
 fn local_favorite_rows(settings: &store::settings::Settings) -> Vec<LocalFavoriteRow> {
@@ -2953,7 +3255,11 @@ fn add_local_favorite_from_pane(ui: &App, panes: Panes, source: String, index: i
     }
 
     paths.push(path.to_string_lossy().to_string());
-    save_local_favorites(paths);
+    if let Err(error) = save_local_favorites(paths) {
+        ui.set_status("".into());
+        ui.set_error(format!("Could not save Favorites: {error}").into());
+        return;
+    }
     refresh_local_favorites_model(ui);
     ui.set_error("".into());
     ui.set_status(format!("Added to Favorites: {}", local_favorite_label(&path)).into());
@@ -2983,7 +3289,11 @@ fn reorder_local_favorite(ui: &App, from: i32, to: i32) {
 
     let item = paths.remove(from);
     paths.insert(to, item);
-    save_local_favorites(paths);
+    if let Err(error) = save_local_favorites(paths) {
+        ui.set_status("".into());
+        ui.set_error(format!("Could not save Favorites order: {error}").into());
+        return;
+    }
     refresh_local_favorites_model(ui);
     ui.set_error("".into());
     ui.set_status("Favorites reordered.".into());
@@ -2996,7 +3306,11 @@ fn remove_local_favorite(ui: &App, index: i32) {
         return;
     }
     let removed = expand_local_favorite(&paths.remove(index as usize));
-    save_local_favorites(paths);
+    if let Err(error) = save_local_favorites(paths) {
+        ui.set_status("".into());
+        ui.set_error(format!("Could not remove Favorite: {error}").into());
+        return;
+    }
     refresh_local_favorites_model(ui);
     ui.set_error("".into());
     ui.set_status(format!("Removed from Favorites: {}", local_favorite_label(&removed)).into());
@@ -3204,16 +3518,20 @@ fn do_transfer(
             let (h2, st2, pn2) = (handle.clone(), store.clone(), panes.clone());
             ui.set_status("copying…".into());
             handle.spawn(async move {
-                let n = tokio::task::spawn_blocking(move || fs_copy_tree(&src2, &dst2))
-                    .await
-                    .unwrap_or(0);
+                let result = tokio::task::spawn_blocking(move || fs_copy_tree(&src2, &dst2)).await;
                 let _ = slint::invoke_from_event_loop(move || {
                     if let Some(ui) = ui_weak.upgrade() {
-                        ui.set_status(format!("copied {n} files").into());
-                        // Re-list both panes so the new file is visible immediately. Without this
-                        // the Local→Local path (e.g. a "save as new" copy in the same folder)
-                        // left the destination invisible until a manual Refresh.
-                        refresh_both_panes(&h2, st2, pn2, ui.as_weak());
+                        match result {
+                            Ok(Ok(n)) => {
+                                ui.set_status(format!("copied {n} files").into());
+                                // Re-list both panes so the new file is visible immediately. Without this
+                                // the Local→Local path (e.g. a "save as new" copy in the same folder)
+                                // left the destination invisible until a manual Refresh.
+                                refresh_both_panes(&h2, st2, pn2, ui.as_weak());
+                            }
+                            Ok(Err(e)) => ui.set_error(format!("copy failed: {e}").into()),
+                            Err(e) => ui.set_error(format!("copy failed: {e}").into()),
+                        }
                     }
                 });
             });
@@ -3540,6 +3858,16 @@ fn wire_overwrite(
 
 /// Wire the sync-passphrase dialog: "set" (first time enabling sync) wraps the master key +
 /// enables sync; "enter" (a pulled vault that's locked here) unlocks it with the passphrase.
+fn validate_new_sync_passphrase(value: &str) -> Result<(), String> {
+    if value.chars().count() < MIN_SYNC_PASSPHRASE_CHARS || value.len() > MAX_SYNC_PASSPHRASE_BYTES
+    {
+        return Err(format!(
+            "Passphrase must be at least {MIN_SYNC_PASSPHRASE_CHARS} characters and at most {MAX_SYNC_PASSPHRASE_BYTES} bytes."
+        ));
+    }
+    Ok(())
+}
+
 fn wire_passphrase(ui: &App, store: Arc<dyn CredentialStore>, conns: ConnList) {
     let (st, cn, uw) = (store.clone(), conns.clone(), ui.as_weak());
     ui.on_resolve_passphrase(move |value: slint::SharedString, confirm: slint::SharedString| {
@@ -3556,27 +3884,49 @@ fn wire_passphrase(ui: &App, store: Arc<dyn CredentialStore>, conns: ConnList) {
             return; // Cancel
         }
         if mode == "set" {
+            if let Err(error) = validate_new_sync_passphrase(&value) {
+                if let Some(ui) = uw.upgrade() {
+                    ui.set_error(error.into());
+                    ui.set_passphrase_mode("set".into());
+                    ui.set_passphrase_open(true);
+                }
+                return;
+            }
             if value != confirm {
                 if let Some(ui) = uw.upgrade() {
                     ui.set_error("Passphrases don't match.".into());
+                    ui.set_passphrase_mode("set".into());
+                    ui.set_passphrase_open(true);
                 }
                 return;
             }
             match store::vault::enable_sync_passphrase(&value) {
-                Ok(()) => {
-                    store::cloud::set_sync_enabled(true);
+                Ok(()) => match store::cloud::set_sync_enabled(true) {
+                    Ok(()) => {
                     crate::macos_menu::refresh_sync_title();
                     if let Some(ui) = uw.upgrade() {
                         ui.set_status(
                             "Sync enabled — servers + the encrypted vault will sync to your other Macs.".into(),
                         );
                     }
-                }
+                    }
+                    Err(e) => {
+                        if let Some(ui) = uw.upgrade() {
+                            ui.set_error(format!("Passphrase saved, but sync could not be enabled: {e}").into());
+                        }
+                    }
+                },
                 Err(e) => {
                     if let Some(ui) = uw.upgrade() {
                         ui.set_error(format!("Failed to set passphrase: {e}").into());
                     }
                 }
+            }
+        } else if value.len() > MAX_SYNC_PASSPHRASE_BYTES {
+            if let Some(ui) = uw.upgrade() {
+                ui.set_error(format!("Passphrase exceeds {MAX_SYNC_PASSPHRASE_BYTES} bytes.").into());
+                ui.set_passphrase_mode("enter".into());
+                ui.set_passphrase_open(true);
             }
         } else if st.unlock(&value) {
             if let Some(ui) = uw.upgrade() {
@@ -3625,31 +3975,34 @@ fn wire_host_key_trust(ui: &App, handle: &Handle, store: Arc<dyn CredentialStore
     });
 }
 
-/// Fold the app's saved legacy passwords into the vault, using exact known service/account
-/// pairs only. No-op if already migrated; it never searches unrelated Keychain entries.
-fn migrate_all_passwords(store: &Arc<dyn CredentialStore>, _conns: &ConnList) -> usize {
-    if store::settings::load().keychain_migrated_v2 {
-        return 0;
+/// Fold the app's saved legacy passwords into endpoint-bound v2 records, using only endpoints
+/// from the local metadata file. No-op once complete; it never enumerates unrelated Keychain
+/// entries and never treats a storage error as successful migration.
+fn migrate_saved_passwords(store: &dyn CredentialStore) -> Result<usize, String> {
+    if store::settings::load().endpoint_credentials_migrated_v2 {
+        return Ok(0);
     }
-    let n = store.migrate_from_keychain();
+    let n = store.migrate_from_keychain().map_err(|e| e.to_string())?;
     let mut s = store::settings::load();
-    s.keychain_migrated_v2 = true;
-    store::settings::save(&s);
-    n
+    s.endpoint_credentials_migrated_v2 = true;
+    store::settings::try_save(&s).map_err(|e| e.to_string())?;
+    Ok(n)
 }
 
 /// Wire "Send Servers to iCloud": migrate this app's known legacy passwords into the vault,
 /// then push the vault + connections.
-fn wire_send_sync(ui: &App, store: Arc<dyn CredentialStore>, conns: ConnList) {
-    let (st, cn, uw) = (store.clone(), conns.clone(), ui.as_weak());
+fn wire_send_sync(ui: &App, store: Arc<dyn CredentialStore>) {
+    let (st, uw) = (store.clone(), ui.as_weak());
     ui.on_request_send_sync(move || {
-        let migrated = migrate_all_passwords(&st, &cn);
+        let migrated = migrate_saved_passwords(st.as_ref());
         let msg = store::cloud::send_now();
         if let Some(ui) = uw.upgrade() {
-            let extra = if migrated > 0 {
-                format!(" (migrated {migrated} passwords into the vault — one-time)")
-            } else {
-                String::new()
+            let extra = match migrated {
+                Ok(n) if n > 0 => {
+                    format!(" (migrated {n} passwords into the vault — one-time)")
+                }
+                Ok(_) => String::new(),
+                Err(error) => format!(" (saved-password migration failed: {error})"),
             };
             ui.set_status(format!("{msg}{extra}").into());
         }
@@ -3751,11 +4104,27 @@ fn copy_local_to_remote(
         .upgrade()
         .map(|u| u.set_status("preparing folder upload…".into()));
     handle.spawn(async move {
-        let files = tokio::task::spawn_blocking(move || walk_local(&local_base))
-            .await
-            .unwrap_or_default();
-        let mut plans: Vec<PlannedXfer> = Vec::with_capacity(files.len());
-        for (lp, rel, size) in &files {
+        let tree = match tokio::task::spawn_blocking(move || walk_local(&local_base)).await {
+            Ok(Ok(tree)) => tree,
+            Ok(Err(e)) => {
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(ui) = uw.upgrade() {
+                        ui.set_error(format!("could not prepare folder upload: {e}").into());
+                    }
+                });
+                return;
+            }
+            Err(e) => {
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(ui) = uw.upgrade() {
+                        ui.set_error(format!("could not prepare folder upload: {e}").into());
+                    }
+                });
+                return;
+            }
+        };
+        let mut plans: Vec<PlannedXfer> = Vec::with_capacity(tree.files.len());
+        for (lp, rel, size) in &tree.files {
             let rp = join_remote(PathBuf::from(&remote_base).join(rel));
             plans.push(PlannedXfer {
                 id: fresh_xfer_id(),
@@ -4095,41 +4464,301 @@ fn copy_remote_to_remote(
     });
 }
 
-/// Recursively copy a local file/tree to a local destination. Returns file count.
-fn fs_copy_tree(src: &Path, dst: &Path) -> usize {
-    let md = match std::fs::metadata(src) {
-        Ok(m) => m,
-        Err(_) => return 0,
-    };
-    if !md.is_dir() {
-        if let Some(p) = dst.parent() {
-            let _ = std::fs::create_dir_all(p);
+#[derive(Debug, Clone, Copy)]
+struct LocalTreeLimits {
+    max_files: usize,
+    max_dirs: usize,
+    max_depth: usize,
+}
+
+const DEFAULT_LOCAL_TREE_LIMITS: LocalTreeLimits = LocalTreeLimits {
+    max_files: MAX_LOCAL_TREE_FILES,
+    max_dirs: MAX_LOCAL_TREE_DIRS,
+    max_depth: MAX_LOCAL_TREE_DEPTH,
+};
+
+#[derive(Debug)]
+struct LocalTree {
+    files: Vec<(PathBuf, String, u64)>,
+    /// Relative directories below the source root, retained so local copies preserve empty dirs.
+    dirs: Vec<String>,
+}
+
+/// Canonicalise an existing path, or the nearest existing parent followed by its missing tail.
+/// This lets us detect a destination inside its source before that destination is created.
+fn canonicalize_local_lenient(path: &Path) -> Result<PathBuf, String> {
+    let mut current = path.to_path_buf();
+    let mut tail = Vec::new();
+    loop {
+        if let Ok(canonical) = std::fs::canonicalize(&current) {
+            let mut resolved = canonical;
+            while let Some(component) = tail.pop() {
+                resolved.push(component);
+            }
+            return Ok(resolved);
         }
-        let _ = std::fs::copy(src, dst);
-        return 1;
+        let Some(parent) = current.parent() else {
+            return Err(format!("cannot resolve local path {}", path.display()));
+        };
+        let Some(name) = current.file_name() else {
+            return Err(format!("cannot resolve local path {}", path.display()));
+        };
+        tail.push(name.to_os_string());
+        current = parent.to_path_buf();
     }
-    let mut n = 0;
-    let mut stack = vec![(src.to_path_buf(), dst.to_path_buf())];
-    while let Some((s, d)) = stack.pop() {
-        let _ = std::fs::create_dir_all(&d);
-        if let Ok(rd) = std::fs::read_dir(&s) {
-            for e in rd.flatten() {
-                let path = e.path();
-                let dest = d.join(e.file_name());
-                if path.is_dir() {
-                    stack.push((path, dest));
-                } else {
-                    let _ = std::fs::copy(&path, &dest);
-                    n += 1;
+}
+
+/// Read a local tree without ever following a symlink. Canonical containment plus a visited
+/// directory identity set rejects alias/cycle tricks even on filesystems that permit unusual
+/// directory links.
+fn walk_local_with_limits(base: &Path, limits: LocalTreeLimits) -> Result<LocalTree, String> {
+    let base_metadata = std::fs::symlink_metadata(base)
+        .map_err(|e| format!("cannot inspect {}: {e}", base.display()))?;
+    if base_metadata.file_type().is_symlink() {
+        return Err(format!("refusing to traverse symlink {}", base.display()));
+    }
+    if !base_metadata.is_dir() {
+        return Err(format!("{} is not a directory", base.display()));
+    }
+    let canonical_root = std::fs::canonicalize(base)
+        .map_err(|e| format!("cannot resolve {}: {e}", base.display()))?;
+    let mut visited_paths = HashSet::new();
+    visited_paths.insert(canonical_root.clone());
+    #[cfg(unix)]
+    let mut visited_ids = {
+        use std::os::unix::fs::MetadataExt;
+        let mut ids = HashSet::new();
+        ids.insert((base_metadata.dev(), base_metadata.ino()));
+        ids
+    };
+
+    let mut tree = LocalTree {
+        files: Vec::new(),
+        dirs: Vec::new(),
+    };
+    let mut dir_count = 1usize;
+    let mut stack = vec![(base.to_path_buf(), String::new(), 0usize)];
+    while let Some((dir, relative, depth)) = stack.pop() {
+        let entries =
+            std::fs::read_dir(&dir).map_err(|e| format!("cannot read {}: {e}", dir.display()))?;
+        for entry in entries {
+            let entry =
+                entry.map_err(|e| format!("cannot read entry in {}: {e}", dir.display()))?;
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| format!("refusing non-UTF-8 filename in {}", dir.display()))?;
+            let path = entry.path();
+            let metadata = std::fs::symlink_metadata(&path)
+                .map_err(|e| format!("cannot inspect {}: {e}", path.display()))?;
+            if metadata.file_type().is_symlink() {
+                return Err(format!("refusing to traverse symlink {}", path.display()));
+            }
+            let child_relative = if relative.is_empty() {
+                name
+            } else {
+                format!("{relative}/{name}")
+            };
+            if metadata.is_dir() {
+                let child_depth = depth + 1;
+                if child_depth > limits.max_depth {
+                    return Err(format!(
+                        "local folder exceeds the maximum depth of {}",
+                        limits.max_depth
+                    ));
+                }
+                dir_count += 1;
+                if dir_count > limits.max_dirs {
+                    return Err(format!(
+                        "local folder exceeds the maximum of {} directories",
+                        limits.max_dirs
+                    ));
+                }
+                let canonical = std::fs::canonicalize(&path)
+                    .map_err(|e| format!("cannot resolve {}: {e}", path.display()))?;
+                if !canonical.starts_with(&canonical_root) {
+                    return Err(format!("directory escapes source root: {}", path.display()));
+                }
+                if !visited_paths.insert(canonical) {
+                    return Err(format!("directory cycle detected at {}", path.display()));
+                }
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    if !visited_ids.insert((metadata.dev(), metadata.ino())) {
+                        return Err(format!("directory identity repeated at {}", path.display()));
+                    }
+                }
+                tree.dirs.push(child_relative.clone());
+                stack.push((path, child_relative, child_depth));
+            } else if metadata.is_file() {
+                if tree.files.len() >= limits.max_files {
+                    return Err(format!(
+                        "local folder exceeds the maximum of {} files",
+                        limits.max_files
+                    ));
+                }
+                tree.files.push((path, child_relative, metadata.len()));
+            } else {
+                return Err(format!("unsupported special file {}", path.display()));
+            }
+        }
+    }
+    Ok(tree)
+}
+
+/// Walk a local directory recursively for upload. This is deliberately fail-closed: callers can
+/// report a readable error instead of silently uploading an incomplete tree.
+fn walk_local(base: &Path) -> Result<LocalTree, String> {
+    walk_local_with_limits(base, DEFAULT_LOCAL_TREE_LIMITS)
+}
+
+fn copy_local_file(src: &Path, dst: &Path) -> Result<usize, String> {
+    let metadata = std::fs::symlink_metadata(src)
+        .map_err(|e| format!("cannot inspect {}: {e}", src.display()))?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!("refusing to copy symlink {}", src.display()));
+    }
+    if !metadata.is_file() {
+        return Err(format!("{} is not a regular file", src.display()));
+    }
+    if let Ok(destination_metadata) = std::fs::symlink_metadata(dst) {
+        if destination_metadata.file_type().is_symlink() {
+            return Err(format!(
+                "refusing to overwrite destination symlink {}",
+                dst.display()
+            ));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if destination_metadata.dev() == metadata.dev()
+                && destination_metadata.ino() == metadata.ino()
+            {
+                return Err("refusing to copy a file onto itself or one of its hard links".into());
+            }
+        }
+    }
+    let source =
+        std::fs::canonicalize(src).map_err(|e| format!("cannot resolve {}: {e}", src.display()))?;
+    if canonicalize_local_lenient(dst)? == source {
+        return Err("refusing to copy a file onto itself".into());
+    }
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+    }
+    std::fs::copy(src, dst)
+        .map(|_| 1)
+        .map_err(|e| format!("cannot copy {}: {e}", src.display()))
+}
+
+/// Recursively copy a local file/tree to a local destination. The full source tree is verified
+/// before writing so errors and symlink encounters cannot be reported as a successful copy.
+fn fs_copy_tree(src: &Path, dst: &Path) -> Result<usize, String> {
+    let metadata = std::fs::symlink_metadata(src)
+        .map_err(|e| format!("cannot inspect {}: {e}", src.display()))?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!("refusing to copy symlink {}", src.display()));
+    }
+    if !metadata.is_dir() {
+        return copy_local_file(src, dst);
+    }
+    if std::fs::symlink_metadata(dst)
+        .map(|metadata| metadata.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return Err(format!(
+            "refusing to copy into destination symlink {}",
+            dst.display()
+        ));
+    }
+    let source =
+        std::fs::canonicalize(src).map_err(|e| format!("cannot resolve {}: {e}", src.display()))?;
+    let destination = canonicalize_local_lenient(dst)?;
+    if destination.starts_with(&source) {
+        return Err("refusing to copy a folder into itself or one of its descendants".into());
+    }
+    let tree = walk_local(src)?;
+    // Validate the complete destination tree before creating anything. This prevents a
+    // pre-existing symlink/special-file conflict halfway down the tree from leaving a copy that
+    // looks successful but is only partially materialised (or from redirecting bytes outside).
+    for relative in &tree.dirs {
+        let directory = dst.join(relative);
+        net::assert_within(dst, &directory).map_err(|error| error.to_string())?;
+        if let Ok(metadata) = std::fs::symlink_metadata(&directory) {
+            if metadata.file_type().is_symlink() {
+                return Err(format!(
+                    "refusing destination symlink {}",
+                    directory.display()
+                ));
+            }
+            if !metadata.is_dir() {
+                return Err(format!(
+                    "destination is not a directory: {}",
+                    directory.display()
+                ));
+            }
+        }
+    }
+    for (source, relative, _) in &tree.files {
+        let destination = dst.join(relative);
+        net::assert_within(dst, &destination).map_err(|error| error.to_string())?;
+        if let Ok(destination_metadata) = std::fs::symlink_metadata(&destination) {
+            if destination_metadata.file_type().is_symlink() {
+                return Err(format!(
+                    "refusing destination symlink {}",
+                    destination.display()
+                ));
+            }
+            if !destination_metadata.is_file() {
+                return Err(format!(
+                    "destination is not a regular file: {}",
+                    destination.display()
+                ));
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                let source_metadata = std::fs::symlink_metadata(source)
+                    .map_err(|e| format!("cannot inspect {}: {e}", source.display()))?;
+                if destination_metadata.dev() == source_metadata.dev()
+                    && destination_metadata.ino() == source_metadata.ino()
+                {
+                    return Err(format!(
+                        "refusing to copy {} onto one of its hard links",
+                        source.display()
+                    ));
                 }
             }
         }
     }
-    n
+
+    std::fs::create_dir_all(dst).map_err(|e| format!("cannot create {}: {e}", dst.display()))?;
+    for relative in &tree.dirs {
+        let directory = dst.join(relative);
+        std::fs::create_dir_all(&directory)
+            .map_err(|e| format!("cannot create {}: {e}", directory.display()))?;
+    }
+    for (source, relative, _) in &tree.files {
+        let destination = dst.join(relative);
+        if let Some(parent) = destination.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+        }
+        let fresh = std::fs::symlink_metadata(source)
+            .map_err(|e| format!("cannot inspect {}: {e}", source.display()))?;
+        if fresh.file_type().is_symlink() || !fresh.is_file() {
+            return Err(format!("source changed while copying {}", source.display()));
+        }
+        std::fs::copy(source, &destination)
+            .map_err(|e| format!("cannot copy {}: {e}", source.display()))?;
+    }
+    Ok(tree.files.len())
 }
 
 fn password_for(store: &Arc<dyn CredentialStore>, spec: &ConnectionSpec) -> Option<String> {
-    let key = (spec.host.clone(), spec.user.clone());
+    let key = CredentialKey::for_spec(spec).ok()?;
     if let Ok(cache) = PASSWORD_CACHE.lock() {
         if let Some(p) = cache.get(&key) {
             return Some(p.to_string()); // Zeroizing<String> derefs to String; cached → no Keychain prompt
@@ -4137,7 +4766,7 @@ fn password_for(store: &Arc<dyn CredentialStore>, spec: &ConnectionSpec) -> Opti
     }
     tracing::debug!(target: "gmacftp::creds", host = %spec.host, user = %spec.user, "credential lookup (private vault; silent — no Keychain prompt)");
     let p = store
-        .get(&spec.host, &spec.user)
+        .get_for(&key)
         .ok()
         .map(|b| String::from_utf8_lossy(&b).into_owned())?;
     if let Ok(mut cache) = PASSWORD_CACHE.lock() {
@@ -4367,17 +4996,65 @@ fn wire_nav_pane(
     }
 }
 
-/// Toolbar TLS toggle: flip accept-any-cert, apply to the net layer, persist.
-fn wire_toggle_tls(ui: &App) {
+/// Toolbar TLS toggle: update only the currently active saved connection. The connector receives
+/// the immutable policy from that `ConnectionSpec`; no process-global exception exists.
+fn wire_toggle_tls(ui: &App, conns: ConnList, sessions: Sessions, panes: Panes) {
     let ui_weak = ui.as_weak();
     ui.on_toggle_tls(move || {
         let Some(ui) = ui_weak.upgrade() else { return };
-        let next = !ui.get_accept_any_cert();
+        let pane = active_pane_idx(&ui);
+        let Some(connection_id) = panes
+            .lock()
+            .ok()
+            .and_then(|states| states[pane].conn.as_ref().map(|spec| spec.id))
+        else {
+            ui.set_accept_any_cert(false);
+            ui.set_error("Select a saved server before changing its TLS policy.".into());
+            return;
+        };
+        let mut candidate = conns.lock().expect("connections lock").clone();
+        let Some(position) = candidate.iter().position(|spec| spec.id == connection_id) else {
+            ui.set_error("The active server is no longer saved.".into());
+            return;
+        };
+        let next = !candidate[position].accept_invalid_tls;
+        candidate[position].accept_invalid_tls = next;
+        if let Err(e) = store::save_metadata(&candidate) {
+            ui.set_accept_any_cert(!next);
+            ui.set_error(format!("Could not save TLS policy: {e}").into());
+            return;
+        }
+        let updated = candidate[position].clone();
+        *conns.lock().expect("connections lock") = candidate;
+        if let Ok(mut pool) = sessions.lock() {
+            for session in pool
+                .iter_mut()
+                .filter(|session| session.conn.id == connection_id)
+            {
+                session.conn = updated.clone();
+            }
+        }
+        if let Ok(mut states) = panes.lock() {
+            for state in states.iter_mut() {
+                if state
+                    .conn
+                    .as_ref()
+                    .is_some_and(|spec| spec.id == connection_id)
+                {
+                    state.conn = Some(updated.clone());
+                }
+            }
+        }
         ui.set_accept_any_cert(next);
-        net::set_accept_invalid_tls(next);
-        let mut s = store::settings::load();
-        s.accept_any_cert = next;
-        store::settings::save(&s);
+        ui.set_error("".into());
+        ui.set_status(
+            if next {
+                "TLS certificate validation disabled for this server only."
+            } else {
+                "TLS certificate validation enabled for this server."
+            }
+            .into(),
+        );
     });
 }
 
@@ -4392,10 +5069,15 @@ fn wire_toggle_theme(ui: &App) {
         } else {
             "dark"
         };
-        g.set_theme(next.into());
         let mut s = store::settings::load();
         s.theme = next.to_string();
-        store::settings::save(&s);
+        match store::settings::try_save(&s) {
+            Ok(()) => {
+                g.set_theme(next.into());
+                ui.set_error("".into());
+            }
+            Err(error) => ui.set_error(format!("Could not save theme: {error}").into()),
+        }
     });
 }
 
@@ -5201,36 +5883,6 @@ fn wire_transfer_upload(
     });
 }
 
-/// Walk a local directory recursively → `(absolute_local_path, relative_path, size)` for
-/// every regular file. Symlinks are followed as dirs only if they resolve to a dir.
-fn walk_local(base: &Path) -> Vec<(PathBuf, String, u64)> {
-    let mut out = Vec::new();
-    fn recurse(dir: &Path, rel: &str, out: &mut Vec<(PathBuf, String, u64)>) {
-        let Ok(rd) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for entry in rd.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let path = entry.path();
-            let child_rel = if rel.is_empty() {
-                name
-            } else {
-                format!("{rel}/{name}")
-            };
-            let Ok(md) = entry.metadata() else {
-                continue;
-            };
-            if md.is_dir() {
-                recurse(&path, &child_rel, out);
-            } else {
-                out.push((path, child_rel, md.len()));
-            }
-        }
-    }
-    recurse(base, "", &mut out);
-    out
-}
-
 fn wire_toggle_locale(ui: &App) {
     let ui_weak = ui.as_weak();
     ui.on_toggle_locale(move || {
@@ -5271,9 +5923,9 @@ fn wire_edit(ui: &App, store: Arc<dyn CredentialStore>, conns: ConnList) {
             .find(|c| c.id.0 as i32 == id)
             .cloned();
         let Some(spec) = spec else { return };
-        let pw = store
-            .get(&spec.host, &spec.user)
+        let pw = CredentialKey::for_spec(&spec)
             .ok()
+            .and_then(|key| store.get_for(&key).ok())
             .map(|b| String::from_utf8_lossy(&b).into_owned())
             .unwrap_or_default();
         ui.set_editor_id(spec.id.0 as i32);
@@ -5292,19 +5944,72 @@ fn wire_delete(ui: &App, store: Arc<dyn CredentialStore>, conns: ConnList) {
     let ui_weak = ui.as_weak();
     ui.on_delete_connection(move |id| {
         let Some(ui) = ui_weak.upgrade() else { return };
-        let mut g = conns.lock().expect("connections lock");
-        if let Some(pos) = g.iter().position(|c| c.id.0 as i32 == id) {
-            let removed = g.remove(pos);
-            drop(g);
-            let _ = store.delete(&removed.host, &removed.user); // clear Keychain entry
-            if let Ok(mut c) = PASSWORD_CACHE.lock() {
-                c.remove(&(removed.host.clone(), removed.user.clone()));
+        let current = conns.lock().expect("connections lock").clone();
+        let Some(pos) = current.iter().position(|c| c.id.0 as i32 == id) else {
+            return;
+        };
+        let removed = current[pos].clone();
+        let key = match CredentialKey::for_spec(&removed) {
+            Ok(key) => key,
+            Err(e) => {
+                ui.set_manager_message(format!("invalid saved connection: {e}").into());
+                return;
             }
-            let snapshot = conns.lock().expect("connections lock").clone();
-            let _ = store::save_metadata(&snapshot);
-            refresh_connections_model(&ui, &conns);
-            ui.set_manager_message(format!("deleted “{}”", removed.name).into());
+        };
+        let mut candidate = current;
+        candidate.remove(pos);
+        // Persist the new list before changing in-memory state or deleting a secret. This makes
+        // a failed metadata write recoverable and avoids reporting a deletion that did not stick.
+        if let Err(e) = store::save_metadata(&candidate) {
+            ui.set_manager_message(format!("could not delete “{}”: {e}", removed.name).into());
+            return;
         }
+        let still_referenced = candidate
+            .iter()
+            .filter_map(|spec| CredentialKey::for_spec(spec).ok())
+            .any(|candidate_key| candidate_key == key);
+        let legacy_still_referenced = candidate.iter().any(|spec| {
+            CredentialKey::for_spec(spec).is_ok_and(|candidate_key| {
+                candidate_key.host() == key.host() && candidate_key.user() == key.user()
+            })
+        });
+        *conns.lock().expect("connections lock") = candidate;
+        if !still_referenced {
+            // The credential key can be shared by several saved connection rows. Only delete it
+            // once the last row is gone, and never let a Keychain cleanup error masquerade as a
+            // fully successful delete.
+            if let Ok(mut cache) = PASSWORD_CACHE.lock() {
+                cache.remove(&key);
+            }
+            if let Err(e) = store.delete_for(&key) {
+                refresh_connections_model(&ui, &conns);
+                ui.set_manager_message(
+                    format!(
+                        "deleted “{}” from the list, but could not remove its saved credential: {e}",
+                        removed.name
+                    )
+                    .into(),
+                );
+                return;
+            }
+        }
+        if !legacy_still_referenced {
+            // Once no saved endpoint can need the old `(host, user)` fallback, remove it too so a
+            // deleted password cannot be resurrected by lazy migration on a future re-add.
+            if let Err(e) = store.delete(key.host(), key.user()) {
+                refresh_connections_model(&ui, &conns);
+                ui.set_manager_message(
+                    format!(
+                        "deleted “{}”, but could not remove its legacy credential: {e}",
+                        removed.name
+                    )
+                    .into(),
+                );
+                return;
+            }
+        }
+        refresh_connections_model(&ui, &conns);
+        ui.set_manager_message(format!("deleted “{}”", removed.name).into());
     });
 }
 
@@ -5338,24 +6043,21 @@ fn wire_save(ui: &App, store: Arc<dyn CredentialStore>, conns: ConnList) {
             return;
         }
 
-        // Persist the password (if non-empty) into the Keychain.
-        if !password.is_empty() {
-            if let Err(e) = store.set(&host, &user, password.as_bytes()) {
-                ui.set_manager_message(format!("keychain error: {e}").into());
-                return;
+        let current = conns.lock().expect("connections lock").clone();
+        let previous = if id >= 0 {
+            match current.iter().find(|spec| spec.id.0 as i32 == id).cloned() {
+                Some(spec) => Some(spec),
+                None => {
+                    ui.set_manager_message("connection no longer exists".into());
+                    return;
+                }
             }
-            // keep the session cache in sync so the new password is used immediately
-            if let Ok(mut c) = PASSWORD_CACHE.lock() {
-                c.insert(
-                    (host.clone(), user.clone()),
-                    Zeroizing::new(password.clone()),
-                );
-            }
-        }
-
+        } else {
+            None
+        };
         let spec = ConnectionSpec {
             id: ConnectionId(if id < 0 {
-                next_id(&conns.lock().expect("lock"))
+                next_id(&current)
             } else {
                 id as usize
             }),
@@ -5366,28 +6068,136 @@ fn wire_save(ui: &App, store: Arc<dyn CredentialStore>, conns: ConnList) {
             user,
             initial_path: String::new(),
             allow_plaintext_ftp,
+            // The toolbar owns this per-server policy today; editing other fields must not
+            // silently discard a TLS exception the user explicitly approved earlier.
+            accept_invalid_tls: previous
+                .as_ref()
+                .map(|previous| previous.accept_invalid_tls)
+                .unwrap_or(false),
         };
-        {
-            let mut g = conns.lock().expect("connections lock");
-            if id >= 0 {
-                if let Some(pos) = g.iter().position(|c| c.id.0 as i32 == id) {
-                    g[pos] = spec.clone();
-                }
-            } else {
-                g.push(spec.clone());
+
+        let new_key = match CredentialKey::for_spec(&spec) {
+            Ok(key) => key,
+            Err(e) => {
+                ui.set_manager_message(format!("invalid connection endpoint: {e}").into());
+                return;
             }
-            let _ = store::save_metadata(&g);
+        };
+        // If a metadata save fails after writing a new password, restore the exact prior value
+        // (or remove the newly-created key). Refuse to proceed when the old value cannot be read:
+        // otherwise an attempted rollback could erase an unrelated/shared credential.
+        let prior_new_secret = if password.is_empty() {
+            None
+        } else {
+            match store.get_for(&new_key) {
+                Ok(secret) => Some(secret),
+                Err(store::CredentialError::NotFound) => None,
+                Err(e) => {
+                    ui.set_manager_message(format!("could not safely update credential: {e}").into());
+                    return;
+                }
+            }
+        };
+        if !password.is_empty() {
+            if let Err(e) = store.set_for(&new_key, password.as_bytes()) {
+                ui.set_manager_message(format!("credential error: {e}").into());
+                return;
+            }
+        }
+
+        let mut candidate = current;
+        if let Some(previous) = previous.as_ref() {
+            let pos = candidate
+                .iter()
+                .position(|entry| entry.id == previous.id)
+                .expect("edited connection must remain in snapshot");
+            candidate[pos] = spec.clone();
+        } else {
+            candidate.push(spec.clone());
+        }
+        if let Err(e) = store::save_metadata(&candidate) {
+            if !password.is_empty() {
+                let rollback = match prior_new_secret {
+                    Some(secret) => store.set_for(&new_key, &secret),
+                    None => store.delete_for(&new_key),
+                };
+                if let Err(rollback_error) = rollback {
+                    ui.set_manager_message(
+                        format!(
+                            "could not save connection metadata: {e}; credential rollback also failed: {rollback_error}"
+                        )
+                        .into(),
+                    );
+                    return;
+                }
+            }
+            ui.set_manager_message(format!("could not save connection metadata: {e}").into());
+            return;
+        }
+
+        // Commit observable app state only after durable metadata succeeds.
+        *conns.lock().expect("connections lock") = candidate.clone();
+        if !password.is_empty() {
+            if let Ok(mut cache) = PASSWORD_CACHE.lock() {
+                cache.insert(new_key.clone(), Zeroizing::new(password.clone()));
+            }
+        }
+        let mut cleanup_error = None;
+        if let Some(previous) = previous {
+            let old_key = match CredentialKey::for_spec(&previous) {
+                Ok(key) => key,
+                Err(e) => {
+                    refresh_connections_model(&ui, &conns);
+                    ui.set_editor_open(false);
+                    ui.set_manager_message(
+                        format!(
+                            "saved “{}”, but could not identify the old credential: {e}",
+                            spec.name
+                        )
+                        .into(),
+                    );
+                    return;
+                }
+            };
+            let old_key_still_referenced = candidate
+                .iter()
+                .filter_map(|entry| CredentialKey::for_spec(entry).ok())
+                .any(|candidate_key| candidate_key == old_key);
+            if old_key != new_key && !old_key_still_referenced {
+                // Metadata and the replacement credential are both durable now. Only now may we
+                // erase the old key, and only when no other connection still uses it.
+                if let Ok(mut cache) = PASSWORD_CACHE.lock() {
+                    cache.remove(&old_key);
+                }
+                if let Err(e) = store.delete_for(&old_key) {
+                    cleanup_error = Some(e.to_string());
+                }
+            }
+            let legacy_old_key_still_referenced = candidate.iter().any(|entry| {
+                CredentialKey::for_spec(entry).is_ok_and(|candidate_key| {
+                    candidate_key.host() == old_key.host()
+                        && candidate_key.user() == old_key.user()
+                })
+            });
+            if old_key != new_key && !legacy_old_key_still_referenced {
+                if let Err(e) = store.delete(old_key.host(), old_key.user()) {
+                    cleanup_error = Some(format!("legacy credential cleanup failed: {e}"));
+                }
+            }
         }
         refresh_connections_model(&ui, &conns);
         ui.set_editor_open(false);
-        ui.set_manager_message(
-            if id < 0 {
-                format!("added “{}”", spec.name)
-            } else {
-                format!("saved “{}”", spec.name)
-            }
-            .into(),
-        );
+        let message = if let Some(error) = cleanup_error {
+            format!(
+                "saved “{}”, but could not remove the old credential: {error}",
+                spec.name
+            )
+        } else if id < 0 {
+            format!("added “{}”", spec.name)
+        } else {
+            format!("saved “{}”", spec.name)
+        };
+        ui.set_manager_message(message.into());
     });
 }
 
@@ -5437,37 +6247,53 @@ fn wire_import(ui: &App, handle: &Handle, store: Arc<dyn CredentialStore>, conns
 }
 
 /// Merge `specs` into the connection list, skipping (host, user) pairs already present.
-/// Assigns fresh stable ids and persists metadata. Returns the number actually added.
-fn merge_new(conns: &ConnList, specs: Vec<ConnectionSpec>) -> usize {
-    let mut g = conns.lock().expect("connections lock");
-    let mut next = next_id(&g);
+/// Metadata is persisted before the in-memory model changes, so callers never report an import
+/// as successful when `connections.json` could not be updated.
+fn merge_new(conns: &ConnList, specs: Vec<ConnectionSpec>) -> Result<usize, String> {
+    let current = conns.lock().expect("connections lock").clone();
+    let mut candidate = current;
+    let mut next = next_id(&candidate);
     let mut count = 0;
     for s in specs {
-        let key = (s.host.clone(), s.user.clone());
-        if g.iter().any(|c| (c.host.clone(), c.user.clone()) == key) {
+        let key = CredentialKey::for_spec(&s).map_err(|e| e.to_string())?;
+        if candidate.iter().any(|c| {
+            CredentialKey::for_spec(c)
+                .map(|candidate_key| candidate_key == key)
+                .unwrap_or(false)
+        }) {
             continue;
         }
-        g.push(ConnectionSpec {
+        candidate.push(ConnectionSpec {
             id: ConnectionId(next),
             ..s
         });
         next += 1;
         count += 1;
     }
-    let _ = store::save_metadata(&g);
-    count
+    if count == 0 {
+        return Ok(0);
+    }
+    store::save_metadata(&candidate).map_err(|e| e.to_string())?;
+    *conns.lock().expect("connections lock") = candidate;
+    Ok(count)
 }
 
 /// Import from a user-picked file. Detects the format (FileZilla `sitemanager.xml` vs the
 /// a third-party file manager JSON seed) by extension, then by content sniff, loads it, stores passwords in the
-/// vault, and merges new (host, user) pairs. Returns a status line for the manager dialog.
+/// vault, and merges new complete endpoints. Returns a status line for the manager dialog.
 fn import_from_path(path: &Path, conns: &ConnList, store: &Arc<dyn CredentialStore>) -> String {
     let label = path
         .file_name()
         .map(|f| f.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.display().to_string());
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return format!("could not read {label}");
+    let text = match read_bounded_regular_utf8(path, MAX_IMPORT_BYTES) {
+        Ok(text) => text,
+        Err(e) => {
+            return format!(
+                "could not read {label} ({} limit): {e}",
+                fmt_size(MAX_IMPORT_BYTES)
+            )
+        }
     };
     let ext_is = |e: &str| {
         path.extension()
@@ -5486,14 +6312,16 @@ fn import_from_path(path: &Path, conns: &ConnList, store: &Arc<dyn CredentialSto
         return format!("unrecognized file format: {label} (use FileZilla .xml or .json)");
     };
     match result {
-        Ok(specs) => {
-            let n = merge_new(conns, specs);
-            if n > 0 {
-                format!("imported {n} connection(s) from {label}")
-            } else {
-                format!("no new connections from {label} (all already present)")
+        Ok(specs) => match merge_new(conns, specs) {
+            Ok(n) => {
+                if n > 0 {
+                    format!("imported {n} connection(s) from {label}")
+                } else {
+                    format!("no new connections from {label} (all already present)")
+                }
             }
-        }
+            Err(e) => format!("import failed ({label}): could not save metadata: {e}"),
+        },
         Err(e) => format!("import failed ({label}): {e}"),
     }
 }
@@ -5834,6 +6662,121 @@ mod path_safety_tests {
         std::os::unix::fs::symlink(&outside, root.join("escape")).unwrap();
         assert!(remote_local_target(&root, "escape/payload").is_err());
 
+        let _ = std::fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn local_tree_refuses_symlinks_and_honours_file_limit() {
+        let temp = scratch_dir();
+        let root = temp.join("source");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("one.txt"), b"one").unwrap();
+        let outside = temp.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("escape")).unwrap();
+        assert!(
+            walk_local(&root).is_err(),
+            "a source symlink must fail closed"
+        );
+
+        std::fs::remove_file(root.join("escape")).unwrap();
+        std::fs::write(root.join("two.txt"), b"two").unwrap();
+        assert!(walk_local_with_limits(
+            &root,
+            LocalTreeLimits {
+                max_files: 1,
+                max_dirs: 10,
+                max_depth: 10,
+            },
+        )
+        .is_err());
+
+        let _ = std::fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn local_copy_rejects_own_descendant_before_writing() {
+        let temp = scratch_dir();
+        let source = temp.join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("document.txt"), b"contents").unwrap();
+        let destination = source.join("nested-copy");
+        assert!(fs_copy_tree(&source, &destination).is_err());
+        assert!(!destination.exists());
+        let _ = std::fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn local_copy_refuses_destination_symlink_and_hard_link() {
+        let temp = scratch_dir();
+        let source = temp.join("source");
+        let destination = temp.join("destination");
+        let outside = temp.join("outside");
+        std::fs::create_dir_all(source.join("nested")).unwrap();
+        std::fs::create_dir_all(&destination).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(source.join("nested/document.txt"), b"contents").unwrap();
+        std::os::unix::fs::symlink(&outside, destination.join("nested")).unwrap();
+        assert!(fs_copy_tree(&source, &destination).is_err());
+        assert!(!outside.join("document.txt").exists());
+
+        let file = temp.join("file.txt");
+        let hard_link = temp.join("same-file.txt");
+        std::fs::write(&file, b"preserve me").unwrap();
+        std::fs::hard_link(&file, &hard_link).unwrap();
+        assert!(copy_local_file(&file, &hard_link).is_err());
+        assert_eq!(std::fs::read(&file).unwrap(), b"preserve me");
+        let _ = std::fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn drag_budget_and_staging_permissions_are_bounded() {
+        assert!(validate_drag_budget(MAX_DRAG_STAGING_FILES + 1, 0).is_err());
+        assert!(validate_drag_budget(1, MAX_DRAG_STAGING_BYTES + 1).is_err());
+        assert!(validate_drag_budget(1, MAX_DRAG_STAGING_BYTES).is_ok());
+
+        let root = create_private_drag_root().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn abandoned_drag_roots_are_cleaned_without_touching_live_ones() {
+        let temp = scratch_dir();
+        let stale = temp.join("gmacftp-drag-2147483647-stale");
+        let live = temp.join(format!("gmacftp-drag-{}-live", std::process::id()));
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::create_dir_all(&live).unwrap();
+        cleanup_abandoned_drag_roots_in(&temp);
+        assert!(!stale.exists());
+        assert!(live.exists());
+        let _ = std::fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn new_sync_passphrase_has_a_reasonable_bound() {
+        assert!(validate_new_sync_passphrase("short").is_err());
+        assert!(validate_new_sync_passphrase(&"x".repeat(MAX_SYNC_PASSPHRASE_BYTES + 1)).is_err());
+        assert!(validate_new_sync_passphrase("correct horse battery staple").is_ok());
+    }
+
+    #[test]
+    fn oversized_import_is_rejected_before_reading() {
+        let temp = scratch_dir();
+        let path = temp.join("oversized.json");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(MAX_IMPORT_BYTES + 1).unwrap();
+        let conns: ConnList = Arc::new(Mutex::new(Vec::new()));
+        let store: Arc<dyn CredentialStore> = Arc::new(store::InMemoryStore::default());
+        let result = import_from_path(&path, &conns, &store);
+        assert!(result.contains("limit"));
         let _ = std::fs::remove_dir_all(temp);
     }
 }
