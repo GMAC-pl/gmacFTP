@@ -12,6 +12,10 @@ pub enum TransferDirection {
 #[derive(Debug, Clone)]
 pub struct TransferJob {
     pub id: TransferId,
+    /// Groups files started by one user action so an error can stop only that copy batch.
+    pub batch_id: usize,
+    /// Pause this batch on failure and ask whether to skip or stop. Disabled for a lone file.
+    pub pause_on_error: bool,
     pub direction: TransferDirection,
     pub local_path: String,
     pub remote_path: String,

@@ -2668,7 +2668,7 @@ dependencies = [
 
 [[package]]
 name = "gmacftp"
-version = "0.0.19"
+version = "0.0.20"
 dependencies = [
  "aes-gcm",
  "anyhow",
