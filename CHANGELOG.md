@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Updated `ureq` to 3.3, `sha2` to 0.11, `directories` to 6, and `roxmltree` to 0.21.
+- Hardened the in-app updater so every intermediate redirect must remain HTTPS and on the explicit
+  GitHub host allowlist before any response body is accepted.
+- Corrected Homebrew documentation to reference the maintained gmacFTP tap.
+
 ## 0.1.0 — 2026-07-11
 
 The first feature-complete preview: faster browsing and transfers, resumable queues, native file

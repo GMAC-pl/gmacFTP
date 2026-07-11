@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use sha2::{Digest, Sha256};
+use ureq::ResponseExt;
 
 const REPO: &str = "GMAC-pl/gmacftp";
 pub const CURRENT: &str = env!("CARGO_PKG_VERSION");
@@ -77,6 +78,28 @@ fn normalized_sha256(digest: &str) -> Result<String, String> {
     }
 }
 
+fn encode_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
+fn validate_response_hosts(
+    response: &ureq::http::Response<ureq::Body>,
+    allowed: &[&str],
+) -> Result<(), String> {
+    if let Some(history) = response.get_redirect_history() {
+        for uri in history {
+            validate_url_host(&uri.to_string(), allowed)?;
+        }
+    }
+    validate_url_host(&response.get_uri().to_string(), allowed)
+}
+
 #[derive(Debug, Clone)]
 pub struct LatestUpdate {
     pub version: String,
@@ -91,19 +114,25 @@ pub fn check() -> Result<Option<LatestUpdate>, String> {
     let url = format!("https://{GH_API_HOST}/repos/{REPO}/releases/latest");
     validate_url_host(&url, &[GH_API_HOST])?;
     let response = ureq::get(&url)
-        .set("User-Agent", "gmacFTP-updater")
-        .set("Accept", "application/vnd.github+json")
+        .header("User-Agent", "gmacFTP-updater")
+        .header("Accept", "application/vnd.github+json")
+        .config()
+        .https_only(true)
+        .save_redirect_history(true)
+        .build()
         .call()
         .map_err(|e| format!("GitHub request failed: {e}"))?;
+    validate_response_hosts(&response, &[GH_API_HOST])?;
     if response
-        .header("Content-Length")
-        .and_then(|v| v.parse::<u64>().ok())
+        .body()
+        .content_length()
         .is_some_and(|n| n > MAX_API_BYTES)
     {
         return Err("GitHub release response is unexpectedly large".into());
     }
     let mut api_bytes = Vec::new();
     response
+        .into_body()
         .into_reader()
         .take(MAX_API_BYTES.saturating_add(1))
         .read_to_end(&mut api_bytes)
@@ -201,18 +230,22 @@ pub fn download(
 
     let result = (|| -> Result<(), String> {
         let response = ureq::get(url)
-            .set("User-Agent", "gmacFTP-updater")
+            .header("User-Agent", "gmacFTP-updater")
+            .config()
+            .https_only(true)
+            .save_redirect_history(true)
+            .build()
             .call()
             .map_err(|e| format!("download failed: {e}"))?;
-        validate_url_host(response.get_url(), GH_REDIRECT_HOSTS)?;
+        validate_response_hosts(&response, GH_REDIRECT_HOSTS)?;
         if response
-            .header("Content-Length")
-            .and_then(|v| v.parse::<u64>().ok())
+            .body()
+            .content_length()
             .is_some_and(|n| n != expected_size || n > MAX_DMG_BYTES)
         {
             return Err("release Content-Length does not match GitHub metadata".into());
         }
-        let mut reader = response.into_reader();
+        let mut reader = response.into_body().into_reader();
         let mut file = crate::store::vault::create_exclusive(&part)
             .map_err(|e| format!("could not create {}: {e}", part.display()))?;
         let mut hasher = Sha256::new();
@@ -238,7 +271,7 @@ pub fn download(
                 "release size mismatch: expected {expected_size}, received {done}"
             ));
         }
-        let actual = format!("{:x}", hasher.finalize());
+        let actual = encode_hex(&hasher.finalize());
         if actual != expected_sha256 {
             return Err("release SHA-256 mismatch".into());
         }
@@ -352,5 +385,6 @@ mod tests {
         assert_eq!(normalized_sha256(&format!("sha256:{hash}")).unwrap(), hash);
         assert!(normalized_sha256("sha256:abcd").is_err());
         assert!(normalized_sha256(&"z".repeat(64)).is_err());
+        assert_eq!(encode_hex(&[0x00, 0x0f, 0xa5, 0xff]), "000fa5ff");
     }
 }
