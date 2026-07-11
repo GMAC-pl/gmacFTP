@@ -28,7 +28,7 @@ files — quickly and safely.
 brew install --cask gmac-pl/gmacftp/gmacftp
 ```
 
-The same signed + Apple-notarized app as the DMG. (The bare `brew install --cask gmacftp` will work once [the official cask PR](https://github.com/Homebrew/homebrew-cask/pull/272665) is merged.)
+The same signed + Apple-notarized app as the DMG. Use the fully qualified command above so Homebrew selects the official gmacFTP tap.
 
 Signed with an **Apple Developer ID** and **notarized by Apple** — opens cleanly with no warnings.
 
@@ -196,7 +196,7 @@ która po prostu przenosi Twoje pliki — szybko i bezpiecznie.
 brew install --cask gmac-pl/gmacftp/gmacftp
 ```
 
-Ta sama, podpisana i zanotaryzowana przez Apple apka co DMG. (Gołe `brew install --cask gmacftp` zadziała po [scaleniu oficjalnego PR-a caska](https://github.com/Homebrew/homebrew-cask/pull/272665).)
+Ta sama, podpisana i zanotaryzowana przez Apple apka co DMG. Użyj pełnej komendy powyżej, aby Homebrew wybrał oficjalny tap gmacFTP.
 
 Podpisana **Apple Developer ID** i **zanotaryzowana przez Apple** — uruchamia się czysto, bez ostrzeżeń.
 
