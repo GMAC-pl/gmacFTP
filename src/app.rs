@@ -35,7 +35,12 @@ use crate::{App, ConnRow, EntryRow, LocalFavoriteRow, TransferRow};
 
 type ConnList = Arc<Mutex<Vec<ConnectionSpec>>>;
 type PasswordCache = HashMap<CredentialKey, Zeroizing<String>>;
-type PendingCopy = (usize, usize, String, bool, Option<u64>);
+#[derive(Debug, Clone, Copy)]
+struct TransferBatch {
+    id: usize,
+    pause_on_error: bool,
+}
+type PendingCopy = (usize, usize, String, bool, Option<u64>, TransferBatch);
 type PendingExternalUpload = (ConnectionSpec, PathBuf, String, String, Option<u64>, bool);
 type PendingHostKeyTrust = (net::HostKeyChallenge, usize);
 
@@ -64,9 +69,12 @@ const MAX_IMPORT_BYTES: u64 = 1024 * 1024;
 const MIN_SYNC_PASSPHRASE_CHARS: usize = 12;
 const MAX_SYNC_PASSPHRASE_BYTES: usize = 1024;
 
-/// A copy blocked on a name conflict, awaiting the user's choice in the overwrite dialog.
-/// (src_pane, dst_pane, name, is_dir, total)
-static PENDING_COPY: LazyLock<Mutex<Option<PendingCopy>>> = LazyLock::new(|| Mutex::new(None));
+/// Copies blocked on name conflicts, awaiting the user's choices in the overwrite dialog.
+/// A batch selected with Command-A can contain several conflicts, so keep a FIFO instead of
+/// replacing the previous pending item. The batch policy is retained across the dialog so a
+/// later I/O error still pauses the correct group. (src_pane, dst_pane, name, is_dir, total, batch)
+static PENDING_COPY: LazyLock<Mutex<VecDeque<PendingCopy>>> =
+    LazyLock::new(|| Mutex::new(VecDeque::new()));
 
 /// Finder→server uploads blocked on the overwrite-conflict dialog (the external-drag twin of
 /// PENDING_COPY). A FIFO queue: a multi-file drop may contain several conflicting names, confirmed
@@ -197,8 +205,16 @@ fn update_transfer_summary(ui: &App) {
 /// Monotonic transfer id shared by single-file (`enqueue`), folder-batch, and relay rows so two
 /// transfers can never collide on the same panel-row id (the forwarder matches updates by id).
 static XFER_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+static XFER_BATCH_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
 fn fresh_xfer_id() -> usize {
     XFER_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+fn fresh_batch(pause_on_error: bool) -> TransferBatch {
+    TransferBatch {
+        id: XFER_BATCH_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        pause_on_error,
+    }
 }
 
 fn next_xfer_id() -> i32 {
@@ -445,12 +461,146 @@ fn pane_selected(ui: &App, pane: usize) -> i32 {
         ui.get_remote_selected()
     }
 }
+
+fn clear_range_selection(ui: &App, pane: usize) {
+    if pane == 0 {
+        ui.set_local_range_selected(false);
+        ui.set_local_selection_anchor(-1);
+        ui.set_local_selection_end(-1);
+    } else {
+        ui.set_remote_range_selected(false);
+        ui.set_remote_selection_anchor(-1);
+        ui.set_remote_selection_end(-1);
+    }
+}
+
+fn pane_selection(ui: &App, pane: usize) -> ModelRc<bool> {
+    if pane == 0 {
+        ui.get_local_selection()
+    } else {
+        ui.get_remote_selection()
+    }
+}
+
+fn selection_flags(ui: &App, pane: usize, count: usize) -> Vec<bool> {
+    let model = pane_selection(ui, pane);
+    (0..count)
+        .map(|i| model.row_data(i).unwrap_or(false))
+        .collect()
+}
+
+fn set_selection_flags(ui: &App, pane: usize, flags: Vec<bool>) {
+    let all = !flags.is_empty() && flags.iter().all(|selected| *selected);
+    let model = ModelRc::from(Rc::new(VecModel::from(flags)));
+    if pane == 0 {
+        ui.set_local_selection(model);
+        ui.set_local_all_selected(all);
+    } else {
+        ui.set_remote_selection(model);
+        ui.set_remote_all_selected(all);
+    }
+}
+
+fn select_all_entries(ui: &App, pane: usize, selected: bool) {
+    let count = pane_entries(ui, pane).row_count();
+    set_selection_flags(ui, pane, vec![selected; count]);
+    clear_range_selection(ui, pane);
+    let cursor = if selected && count > 0 { 0 } else { -1 };
+    if pane == 0 {
+        ui.set_local_selected(cursor);
+        ui.set_local_selection_anchor(cursor);
+        ui.set_local_selection_end(cursor);
+    } else {
+        ui.set_remote_selected(cursor);
+        ui.set_remote_selection_anchor(cursor);
+        ui.set_remote_selection_end(cursor);
+    }
+}
+
+fn select_entry(ui: &App, pane: usize, index: i32, extend: bool, toggle: bool) {
+    let count = pane_entries(ui, pane).row_count();
+    if index < 0 || index as usize >= count {
+        return;
+    }
+    let mut flags = selection_flags(ui, pane, count);
+    let previous = pane_selected(ui, pane);
+    let cursor;
+    if toggle {
+        flags[index as usize] = !flags[index as usize];
+        clear_range_selection(ui, pane);
+        if pane == 0 {
+            ui.set_local_selection_anchor(index);
+            ui.set_local_selection_end(index);
+        } else {
+            ui.set_remote_selection_anchor(index);
+            ui.set_remote_selection_end(index);
+        }
+        cursor = if flags[index as usize] {
+            index
+        } else {
+            flags
+                .iter()
+                .enumerate()
+                .find_map(|(i, selected)| selected.then_some(i as i32))
+                .unwrap_or(-1)
+        };
+    } else if extend && previous >= 0 {
+        let anchor = if pane == 0 {
+            ui.get_local_selection_anchor()
+        } else {
+            ui.get_remote_selection_anchor()
+        };
+        let anchor = if anchor >= 0 { anchor } else { previous };
+        flags.fill(false);
+        let start = anchor.min(index).max(0) as usize;
+        let end = anchor.max(index).min(count.saturating_sub(1) as i32) as usize;
+        for selected in &mut flags[start..=end] {
+            *selected = true;
+        }
+        if pane == 0 {
+            ui.set_local_selection_anchor(anchor);
+            ui.set_local_selection_end(index);
+            ui.set_local_range_selected(true);
+        } else {
+            ui.set_remote_selection_anchor(anchor);
+            ui.set_remote_selection_end(index);
+            ui.set_remote_range_selected(true);
+        }
+        cursor = index;
+    } else {
+        flags.fill(false);
+        flags[index as usize] = true;
+        clear_range_selection(ui, pane);
+        if pane == 0 {
+            ui.set_local_selection_anchor(index);
+            ui.set_local_selection_end(index);
+        } else {
+            ui.set_remote_selection_anchor(index);
+            ui.set_remote_selection_end(index);
+        }
+        cursor = index;
+    }
+    set_selection_flags(ui, pane, flags);
+    if pane == 0 {
+        ui.set_local_selected(cursor);
+    } else {
+        ui.set_remote_selected(cursor);
+    }
+}
+
 fn pane_entries(ui: &App, pane: usize) -> ModelRc<EntryRow> {
     if pane == 0 {
         ui.get_local_entries()
     } else {
         ui.get_remote_entries()
     }
+}
+
+fn selected_transfer_rows(entries: &ModelRc<EntryRow>, selection: &ModelRc<bool>) -> Vec<EntryRow> {
+    (0..entries.row_count())
+        .filter(|i| selection.row_data(*i).unwrap_or(false))
+        .filter_map(|i| entries.row_data(i))
+        .collect()
 }
 
 /// Apply the current view (hidden-files filter + sort) of a pane's FULL list to its UI model.
@@ -547,10 +697,14 @@ fn apply_view_pane(ui: &App, pane: usize) {
         ui.set_local_entries(model);
         ui.set_local_count(count);
         ui.set_local_selected(-1);
+        set_selection_flags(ui, pane, vec![false; count as usize]);
+        clear_range_selection(ui, pane);
     } else {
         ui.set_remote_entries(model);
         ui.set_remote_count(count);
         ui.set_remote_selected(-1);
+        set_selection_flags(ui, pane, vec![false; count as usize]);
+        clear_range_selection(ui, pane);
     }
 }
 
@@ -963,6 +1117,7 @@ pub fn run() {
     wire_clear_finished(&ui, jobs_index.clone());
     wire_dismiss_transfer(&ui, jobs_index.clone());
     wire_set_transfers_paused(&ui, engine.clone());
+    wire_resolve_transfer_error(&ui, engine.clone());
     wire_window_controls(
         &ui,
         &handle,
@@ -1196,6 +1351,10 @@ fn set_exact_pane(ui: &App, pane: usize, cwd: &str, rows: Vec<EntryRow>, selecte
     let count = rows.len() as i32;
     let full = ModelRc::from(Rc::new(VecModel::from(rows.clone())));
     let visible = ModelRc::from(Rc::new(VecModel::from(rows)));
+    let mut selection = vec![false; count as usize];
+    if selected >= 0 && selected < count {
+        selection[selected as usize] = true;
+    }
     if pane == 0 {
         ui.set_local_full(full);
         ui.set_local_entries(visible);
@@ -1203,6 +1362,8 @@ fn set_exact_pane(ui: &App, pane: usize, cwd: &str, rows: Vec<EntryRow>, selecte
         ui.set_local_path_display(display_path(cwd).into());
         ui.set_local_count(count);
         ui.set_local_selected(selected);
+        set_selection_flags(ui, pane, selection);
+        clear_range_selection(ui, pane);
     } else {
         ui.set_remote_full(full);
         ui.set_remote_entries(visible);
@@ -1210,6 +1371,8 @@ fn set_exact_pane(ui: &App, pane: usize, cwd: &str, rows: Vec<EntryRow>, selecte
         ui.set_remote_path_display(display_path(cwd).into());
         ui.set_remote_count(count);
         ui.set_remote_selected(selected);
+        set_selection_flags(ui, pane, selection);
+        clear_range_selection(ui, pane);
     }
 }
 
@@ -2278,6 +2441,8 @@ fn clear_pane_view(ui: &App, pane: usize, cwd: &str) {
         ui.set_local_entries(empty);
         ui.set_local_count(0);
         ui.set_local_selected(-1);
+        set_selection_flags(ui, pane, Vec::new());
+        clear_range_selection(ui, pane);
         ui.set_local_cwd(cwd.into());
         ui.set_local_path_display(display_path(cwd).into());
     } else {
@@ -2285,6 +2450,8 @@ fn clear_pane_view(ui: &App, pane: usize, cwd: &str) {
         ui.set_remote_entries(empty);
         ui.set_remote_count(0);
         ui.set_remote_selected(-1);
+        set_selection_flags(ui, pane, Vec::new());
+        clear_range_selection(ui, pane);
         ui.set_remote_cwd(cwd.into());
         ui.set_remote_path_display(display_path(cwd).into());
     }
@@ -3316,8 +3483,8 @@ fn remove_local_favorite(ui: &App, index: i32) {
     ui.set_status(format!("Removed from Favorites: {}", local_favorite_label(&removed)).into());
 }
 
-/// Copy the selected entry from `src_pane` to `dst_pane`. Reads the selection, then for a single
-/// file checks the destination for a clash and asks before overwriting (folders merge silently).
+/// Copy the selected entry (or every visible entry after Command-A) from `src_pane` to `dst_pane`.
+/// Every item follows the same conflict and path-safety checks as a normal single-item transfer.
 fn transfer(
     handle: &Handle,
     store: Arc<dyn CredentialStore>,
@@ -3329,35 +3496,39 @@ fn transfer(
     dst_pane: usize,
 ) {
     let Some(ui) = ui.upgrade() else { return };
-    let sel = pane_selected(&ui, src_pane);
-    if sel < 0 {
+    let entries = pane_entries(&ui, src_pane);
+    let rows = selected_transfer_rows(&entries, &pane_selection(&ui, src_pane));
+    if rows.is_empty() {
         return;
     }
-    let Some(row) = pane_entries(&ui, src_pane).row_data(sel as usize) else {
-        return;
-    };
-    let name = row.name.to_string();
-    let is_dir = row.is_dir;
-    // Use the true u64 size from the sidecar (EntryRow.size is i32 and truncates >2 GiB);
-    // fall back to the i32 field only if the sidecar missed it.
-    let total = TRUE_SIZE
-        .lock()
-        .ok()
-        .and_then(|g| g.get(&(src_pane, name.clone())).copied())
-        .or((row.size > 0).then_some(row.size as u64));
-    start_transfer(
-        handle,
-        store,
-        panes,
-        engine,
-        idx,
-        ui.as_weak(),
-        src_pane,
-        dst_pane,
-        name,
-        is_dir,
-        total,
-    );
+    let batch = fresh_batch(rows.len() > 1);
+    if rows.len() > 1 {
+        ui.set_status(format!("copying {} selected items…", rows.len()).into());
+    }
+    for row in rows {
+        let name = row.name.to_string();
+        // Use the true u64 size from the sidecar (EntryRow.size is i32 and truncates >2 GiB);
+        // fall back to the i32 field only if the sidecar missed it.
+        let total = TRUE_SIZE
+            .lock()
+            .ok()
+            .and_then(|g| g.get(&(src_pane, name.clone())).copied())
+            .or((row.size > 0).then_some(row.size as u64));
+        start_transfer(
+            handle,
+            store.clone(),
+            panes.clone(),
+            engine.clone(),
+            idx.clone(),
+            ui.as_weak(),
+            src_pane,
+            dst_pane,
+            name,
+            row.is_dir,
+            total,
+            batch,
+        );
+    }
 }
 
 /// Start a copy: check the destination for a name clash and open the overwrite dialog if there is
@@ -3375,6 +3546,7 @@ fn start_transfer(
     name: String,
     is_dir: bool,
     total: Option<u64>,
+    batch: TransferBatch,
 ) {
     let (src_kind, dst_kind, dst_conn, dst_cwd) = {
         let p = panes.lock().expect("panes");
@@ -3430,11 +3602,12 @@ fn start_transfer(
             let uw = ui.clone();
             let _ = slint::invoke_from_event_loop(move || {
                 if let Ok(mut g) = PENDING_COPY.lock() {
-                    *g = Some((src_pane, dst_pane, nm.clone(), is_dir, total));
+                    g.push_back((src_pane, dst_pane, nm.clone(), is_dir, total, batch));
                 }
                 if let Some(ui) = uw.upgrade() {
-                    ui.set_overwrite_name(nm.into());
-                    ui.set_overwrite_open(true);
+                    if !ui.get_overwrite_open() {
+                        show_next_overwrite(&ui);
+                    }
                 }
             });
         } else {
@@ -3452,6 +3625,7 @@ fn start_transfer(
                     name,
                     is_dir,
                     total,
+                    batch,
                 );
             });
         }
@@ -3479,6 +3653,7 @@ fn do_transfer(
     dst_name: String,
     is_dir: bool,
     total: Option<u64>,
+    batch: TransferBatch,
 ) {
     let Some(ui) = ui.upgrade() else { return };
     let (src_kind, src_conn, src_cwd) = {
@@ -3549,9 +3724,12 @@ fn do_transfer(
                     dst_remote,
                     &dst_name,
                     total,
+                    batch,
                 );
             } else {
-                copy_local_to_remote(handle, engine, idx, ui_weak, spec, src_local, dst_remote);
+                copy_local_to_remote(
+                    handle, engine, idx, ui_weak, spec, src_local, dst_remote, batch,
+                );
             }
         }
         (PaneKind::Remote, PaneKind::Local) => {
@@ -3567,10 +3745,11 @@ fn do_transfer(
                     src_remote,
                     &dst_name,
                     total,
+                    batch,
                 );
             } else {
                 copy_remote_to_local(
-                    handle, store, engine, idx, ui_weak, spec, src_remote, dst_local,
+                    handle, store, engine, idx, ui_weak, spec, src_remote, dst_local, batch,
                 );
             }
         }
@@ -3593,6 +3772,7 @@ fn do_transfer(
                 dst_name.clone(),
                 is_dir,
                 total.unwrap_or(0),
+                batch,
             );
         }
     }
@@ -3612,8 +3792,9 @@ fn do_external_upload(
     size: Option<u64>,
     is_dir: bool,
 ) {
+    let batch = fresh_batch(false);
     if is_dir {
-        copy_local_to_remote(handle, engine, idx, ui, spec, source, remote);
+        copy_local_to_remote(handle, engine, idx, ui, spec, source, remote, batch);
     } else if let Some(u) = ui.upgrade() {
         enqueue(
             &engine,
@@ -3625,7 +3806,29 @@ fn do_external_upload(
             remote,
             &name,
             size,
+            batch,
         );
+    }
+}
+
+/// Show the oldest queued overwrite conflict. Finder-drop conflicts retain priority because an
+/// already visible dialog can belong to that queue; Command-A conflicts follow in FIFO order.
+fn show_next_overwrite(ui: &App) {
+    let next = PENDING_EXTERNAL_UPLOAD
+        .lock()
+        .ok()
+        .and_then(|g| g.front().map(|item| item.3.clone()))
+        .or_else(|| {
+            PENDING_COPY
+                .lock()
+                .ok()
+                .and_then(|g| g.front().map(|item| item.2.clone()))
+        });
+    if let Some(name) = next {
+        ui.set_overwrite_name(name.into());
+        ui.set_overwrite_open(true);
+    } else {
+        ui.set_overwrite_open(false);
     }
 }
 
@@ -3696,24 +3899,17 @@ fn resolve_overwrite(
                 }
             } // 0 = cancel
         }
-        // show the next queued conflict, if any (tuple field index 3 == name)
-        if let Some(next) = PENDING_EXTERNAL_UPLOAD
-            .lock()
-            .ok()
-            .and_then(|g| g.front().cloned())
-        {
-            if let Some(u) = ui.upgrade() {
-                u.set_overwrite_name(next.3.into());
-                u.set_overwrite_open(true);
-            }
+        if let Some(u) = ui.upgrade() {
+            show_next_overwrite(&u);
         }
         return;
     }
     // in-app copy
-    let pending = PENDING_COPY.lock().ok().and_then(|mut g| g.take());
-    let Some((src_pane, dst_pane, name, is_dir, total)) = pending else {
+    let pending = PENDING_COPY.lock().ok().and_then(|mut g| g.pop_front());
+    let Some((src_pane, dst_pane, name, is_dir, total, batch)) = pending else {
         return;
     };
+    let next_ui = ui.clone();
     match decision {
         1 => do_transfer(
             handle,
@@ -3728,6 +3924,7 @@ fn resolve_overwrite(
             name,
             is_dir,
             total,
+            batch,
         ),
         2 => {
             let (dst_kind, dst_conn, dst_cwd) = {
@@ -3747,7 +3944,7 @@ fn resolve_overwrite(
                 let _ = slint::invoke_from_event_loop(move || {
                     do_transfer(
                         &h, store2, panes, engine, idx, ui, src_pane, dst_pane, src_name, new_name,
-                        is_dir, total,
+                        is_dir, total, batch,
                     );
                 });
             });
@@ -3757,6 +3954,9 @@ fn resolve_overwrite(
                 ui.set_status("cancelled".into());
             }
         } // 0 = cancel
+    }
+    if let Some(ui) = next_ui.upgrade() {
+        show_next_overwrite(&ui);
     }
 }
 
@@ -4034,7 +4234,9 @@ async fn stream_folder_transfers(
     host: String,
     plans: Vec<PlannedXfer>,
     status_msg: String,
+    batch: TransferBatch,
 ) {
+    let pause_on_error = batch.pause_on_error || plans.len() > 1;
     let dir_s: &'static str = match direction {
         TransferDirection::Download => "download",
         TransferDirection::Upload => "upload",
@@ -4079,6 +4281,8 @@ async fn stream_folder_transfers(
     for p in plans {
         let job = TransferJob {
             id: TransferId(p.id),
+            batch_id: batch.id,
+            pause_on_error,
             direction,
             local_path: p.local_path,
             remote_path: p.remote_path,
@@ -4097,6 +4301,7 @@ fn copy_local_to_remote(
     spec: ConnectionSpec,
     local_base: PathBuf,
     remote_base: String,
+    batch: TransferBatch,
 ) {
     let (engine2, idx2, uw) = (engine.clone(), idx.clone(), ui.clone());
     let host = spec.host.clone();
@@ -4152,6 +4357,7 @@ fn copy_local_to_remote(
             host,
             plans,
             format!("uploading {n} files…"),
+            batch,
         )
         .await;
     });
@@ -4167,6 +4373,7 @@ fn copy_remote_to_local(
     spec: ConnectionSpec,
     remote_base: String,
     local_base: PathBuf,
+    batch: TransferBatch,
 ) {
     let Some(password) = password_for(&store, &spec) else {
         set_err(&ui, "missing credential");
@@ -4255,6 +4462,7 @@ fn copy_remote_to_local(
             host,
             plans,
             status_msg,
+            batch,
         )
         .await;
     });
@@ -4389,6 +4597,7 @@ fn copy_remote_to_remote(
     name: String,
     is_dir: bool,
     size: u64,
+    _batch: TransferBatch,
 ) {
     let Some(pw_src) = password_for(&store, &src_spec) else {
         set_err(&ui, "missing src credential");
@@ -5238,8 +5447,9 @@ fn wire_confirm_delete(ui: &App, handle: &Handle, store: Arc<dyn CredentialStore
 
 // ── keyboard control + sidebar eject ──────────────────────────────────────────
 
-/// Arrow up/down: move the active pane's selection by `delta` (clamped to the list).
-fn move_selection(ui: &App, delta: i32) {
+/// Arrow up/down: move the active pane's selection by `delta` (clamped to the list). With Shift,
+/// preserve the original anchor and extend or shrink the contiguous range like Finder does.
+fn move_selection(ui: &App, delta: i32, extend: bool) {
     let pane = active_pane_idx(ui);
     let count = if pane == 0 {
         ui.get_local_count()
@@ -5259,11 +5469,7 @@ fn move_selection(ui: &App, delta: i32) {
     } else {
         (cur + delta).max(0).min(count - 1)
     };
-    if pane == 0 {
-        ui.set_local_selected(next);
-    } else {
-        ui.set_remote_selected(next);
-    }
+    select_entry(ui, pane, next, extend, false);
     refresh_selected_path(ui);
 }
 
@@ -5280,11 +5486,7 @@ fn type_ahead(ui: &App, letter: &str) {
     for i in 0..entries.row_count() {
         if let Some(row) = entries.row_data(i) {
             if row.name.to_string().to_lowercase().starts_with(c) {
-                if pane == 0 {
-                    ui.set_local_selected(i as i32);
-                } else {
-                    ui.set_remote_selected(i as i32);
-                }
+                select_entry(ui, pane, i as i32, false, false);
                 return;
             }
         }
@@ -5414,15 +5616,22 @@ fn refresh_selected_path(ui: &App) {
 
 fn current_selected_path(ui: &App) -> String {
     let pane = active_pane_idx(ui);
-    let sel = pane_selected(ui, pane);
+    let entries = pane_entries(ui, pane);
+    let selection = pane_selection(ui, pane);
+    let selected: Vec<usize> = (0..entries.row_count())
+        .filter(|i| selection.row_data(*i).unwrap_or(false))
+        .collect();
+    if selected.len() > 1 {
+        return format!("{} items selected", selected.len());
+    }
     let cwd = if pane == 0 {
         ui.get_local_cwd().to_string()
     } else {
         ui.get_remote_cwd().to_string()
     };
-    if sel >= 0 {
-        pane_entries(ui, pane)
-            .row_data(sel as usize)
+    if let Some(sel) = selected.first() {
+        entries
+            .row_data(*sel)
             .map(|r| {
                 let n = r.name.to_string();
                 if pane == 0 {
@@ -5435,6 +5644,35 @@ fn current_selected_path(ui: &App) -> String {
     } else {
         cwd
     }
+}
+
+/// Clipboard companion to the compact bottom-bar label. For a range/all selection, copy every
+/// concrete path separated by newlines instead of the display-only "N items selected" text.
+fn selected_paths_for_clipboard(ui: &App) -> String {
+    let pane = active_pane_idx(ui);
+    let entries = pane_entries(ui, pane);
+    let rows = selected_transfer_rows(&entries, &pane_selection(ui, pane));
+    if rows.is_empty() {
+        return current_selected_path(ui);
+    }
+    let cwd = if pane == 0 {
+        ui.get_local_cwd().to_string()
+    } else {
+        ui.get_remote_cwd().to_string()
+    };
+    rows.into_iter()
+        .map(|row| {
+            if pane == 0 {
+                PathBuf::from(&cwd)
+                    .join(row.name.as_str())
+                    .to_string_lossy()
+                    .into_owned()
+            } else {
+                join_remote(PathBuf::from(&cwd).join(row.name.as_str()))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Copy `text` to the macOS clipboard (pbcopy). Best-effort.
@@ -5499,8 +5737,8 @@ fn wire_misc_ui(ui: &App) {
         let uw = ui.as_weak();
         ui.on_copy_selected_path(move || {
             if let Some(ui) = uw.upgrade() {
-                let p = current_selected_path(&ui);
-                ui.set_selected_path(p.clone().into());
+                let p = selected_paths_for_clipboard(&ui);
+                refresh_selected_path(&ui);
                 if !p.is_empty() && copy_to_clipboard(&p) {
                     ui.set_status("copied to clipboard".into());
                     ui.set_error("".into());
@@ -5540,9 +5778,27 @@ fn wire_keyboard(
 ) {
     {
         let ui_weak = ui.as_weak();
-        ui.on_move_selection(move |delta| {
+        ui.on_select_entry(move |pane, index, extend, toggle| {
             if let Some(ui) = ui_weak.upgrade() {
-                move_selection(&ui, delta);
+                let pane = usize::from(pane.as_str() == "remote");
+                select_entry(&ui, pane, index, extend, toggle);
+            }
+        });
+    }
+    {
+        let ui_weak = ui.as_weak();
+        ui.on_select_all(move |pane, selected| {
+            if let Some(ui) = ui_weak.upgrade() {
+                let pane = usize::from(pane.as_str() == "remote");
+                select_all_entries(&ui, pane, selected);
+            }
+        });
+    }
+    {
+        let ui_weak = ui.as_weak();
+        ui.on_move_selection(move |delta, extend| {
+            if let Some(ui) = ui_weak.upgrade() {
+                move_selection(&ui, delta, extend);
             }
         });
     }
@@ -5686,6 +5942,25 @@ fn wire_dismiss_transfer(ui: &App, idx: Arc<Mutex<HashMap<i32, usize>>>) {
 fn wire_set_transfers_paused(ui: &App, engine: TransferEngine) {
     ui.on_set_transfers_paused(move |paused| {
         engine.set_paused(paused);
+    });
+}
+
+fn wire_resolve_transfer_error(ui: &App, engine: TransferEngine) {
+    let ui_weak = ui.as_weak();
+    ui.on_resolve_transfer_error(move |should_continue| {
+        let Some(ui) = ui_weak.upgrade() else { return };
+        let Ok(batch_id) = ui.get_transfer_error_batch().parse::<usize>() else {
+            return;
+        };
+        ui.set_transfer_error_open(false);
+        ui.set_transfer_error_needs_decision(false);
+        ui.set_transfer_error_batch("".into());
+        engine.resolve_batch_failure(batch_id, should_continue);
+        if should_continue {
+            ui.set_status("failed file skipped — continuing batch".into());
+        } else {
+            ui.set_status("stopping remaining files in this batch…".into());
+        }
     });
 }
 
@@ -6336,6 +6611,7 @@ fn enqueue(
     remote_path: String,
     label_name: &str,
     bytes_total: Option<u64>,
+    batch: TransferBatch,
 ) {
     let id = TransferId(fresh_xfer_id());
     let dir_s = match direction {
@@ -6383,6 +6659,8 @@ fn enqueue(
 
     let job = TransferJob {
         id,
+        batch_id: batch.id,
+        pause_on_error: batch.pause_on_error,
         direction,
         local_path: local_path.to_string_lossy().to_string(),
         remote_path,
@@ -6431,6 +6709,7 @@ fn spawn_progress_forwarder(
             let _ = slint::invoke_from_event_loop(move || {
                 let Some(ui) = ui.upgrade() else { return };
                 let total = u.bytes_total.unwrap_or(0);
+                let mut failed_name = String::new();
 
                 // update the matching transfer-panel row (UI-thread model via thread-local)
                 TRANSFER_JOBS.with(|jm| {
@@ -6468,6 +6747,11 @@ fn spawn_progress_forwarder(
                         TransferState::Failed(msg) => {
                             row.state = "failed".into();
                             row.message = msg.clone().into();
+                            failed_name = row.name.to_string();
+                        }
+                        TransferState::Skipped(msg) => {
+                            row.state = "failed".into();
+                            row.message = format!("skipped — {msg}").into();
                         }
                     }
                     jobs.set_row_data(i, row);
@@ -6544,7 +6828,23 @@ fn spawn_progress_forwarder(
                     }
                     TransferState::Failed(msg) => {
                         ui.set_transfer_active(false);
-                        ui.set_error(msg.clone().into());
+                        ui.set_transfer_error_name(failed_name.into());
+                        ui.set_transfer_error_message(msg.clone().into());
+                        ui.set_transfer_error_needs_decision(u.requires_decision);
+                        ui.set_transfer_error_open(true);
+                        if u.requires_decision {
+                            ui.set_transfer_error_batch(u.batch_id.to_string().into());
+                            ui.set_status("copy paused after a file error".into());
+                            ui.set_error("".into());
+                        } else {
+                            ui.set_transfer_error_batch("".into());
+                            ui.set_status("file transfer failed".into());
+                            ui.set_error(msg.clone().into());
+                        }
+                    }
+                    TransferState::Skipped(_) => {
+                        ui.set_transfer_active(false);
+                        ui.set_status("remaining item skipped — batch stopped".into());
                     }
                 }
             });
@@ -6642,6 +6942,44 @@ mod path_safety_tests {
         ));
         std::fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn selection_mask_collects_all_range_and_disjoint_entries() {
+        let rows = vec![
+            demo_entry("folder", true, "", "—", 0, 0),
+            demo_entry("file.txt", false, "", "3 B", 3, 0),
+            demo_entry("photo.jpg", false, "", "4 B", 4, 0),
+        ];
+        let model = ModelRc::from(Rc::new(VecModel::from(rows)));
+
+        let all_selection = ModelRc::from(Rc::new(VecModel::from(vec![true, true, true])));
+        let all = selected_transfer_rows(&model, &all_selection);
+        assert_eq!(all.len(), 3);
+        assert!(all[0].is_dir);
+        assert!(!all[1].is_dir);
+
+        let one_selection = ModelRc::from(Rc::new(VecModel::from(vec![false, true, false])));
+        let one = selected_transfer_rows(&model, &one_selection);
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].name.as_str(), "file.txt");
+
+        let range_selection = ModelRc::from(Rc::new(VecModel::from(vec![true, true, false])));
+        let range = selected_transfer_rows(&model, &range_selection);
+        assert_eq!(range.len(), 2);
+
+        let disjoint_selection = ModelRc::from(Rc::new(VecModel::from(vec![true, false, true])));
+        let disjoint = selected_transfer_rows(&model, &disjoint_selection);
+        assert_eq!(
+            disjoint
+                .iter()
+                .map(|row| row.name.as_str())
+                .collect::<Vec<_>>(),
+            ["folder", "photo.jpg"]
+        );
+
+        let none = ModelRc::from(Rc::new(VecModel::from(vec![false; 3])));
+        assert!(selected_transfer_rows(&model, &none).is_empty());
     }
 
     #[test]

@@ -23,8 +23,8 @@ enum Cmd {
     Run(TransferJob, ConnectionSpec),
 }
 
-/// `(conn_id, cancel_flag)` of the job the worker is currently running.
-type InFlight = (usize, Arc<AtomicBool>);
+/// `(conn_id, batch_id, cancel_flag)` of the job the worker is currently running.
+type InFlight = (usize, usize, Arc<AtomicBool>);
 
 /// `try_enqueue` rejection reason: the bounded worker channel was full, so the job was NOT
 /// accepted (it must be marked failed by the caller rather than left on "queued" forever).
@@ -47,6 +47,8 @@ pub struct TransferEngine {
     /// Pause-all toggle (transfer panel): when set, the worker holds a freshly dequeued job
     /// without starting it until cleared. An in-flight transfer finishes normally first.
     paused: Arc<AtomicBool>,
+    /// User decision for a batch paused after a failed file: true=skip/continue, false=stop batch.
+    failure_decision: mpsc::UnboundedSender<(usize, bool)>,
 }
 
 impl TransferEngine {
@@ -57,18 +59,35 @@ impl TransferEngine {
         // in-flight single-file job never overflows try_send. 8192 covers large folders (a web
         // build with thousands of hashed assets); a Cmd is ~200 bytes so the buffer is ~1.6 MB.
         let (tx, mut rx) = mpsc::channel::<Cmd>(8192);
+        let (failure_decision, mut failure_rx) = mpsc::unbounded_channel::<(usize, bool)>();
         let aborted_conns: Arc<Mutex<HashSet<usize>>> = Arc::new(Mutex::new(HashSet::new()));
         let current: Arc<Mutex<Option<InFlight>>> = Arc::new(Mutex::new(None));
         let paused = Arc::new(AtomicBool::new(false));
         let (aborted_w, current_w, paused_w) =
             (aborted_conns.clone(), current.clone(), paused.clone());
         tokio::spawn(async move {
+            let mut stopped_batches = HashSet::new();
             while let Some(Cmd::Run(job, spec)) = rx.recv().await {
                 // Pause-all: hold the dequeued job without starting it until cleared.
                 while paused_w.load(Ordering::Relaxed) {
                     tokio::time::sleep(Duration::from_millis(50)).await;
                 }
                 let cid = spec.id.0;
+                if stopped_batches.contains(&job.batch_id) {
+                    let _ = updates
+                        .send(TransferUpdate {
+                            id: job.id,
+                            batch_id: job.batch_id,
+                            requires_decision: false,
+                            bytes_done: 0,
+                            bytes_total: job.bytes_total,
+                            state: TransferState::Skipped(
+                                "batch stopped after an earlier file error".into(),
+                            ),
+                        })
+                        .await;
+                    continue;
+                }
                 // Skip jobs whose connection was disconnected while still queued.
                 let skipped = aborted_w.lock().map(|g| g.contains(&cid)).unwrap_or(false);
                 if skipped {
@@ -77,11 +96,24 @@ impl TransferEngine {
                 // Run with a fresh per-job cancel flag, remembered as the in-flight job.
                 let flag = Arc::new(AtomicBool::new(false));
                 if let Ok(mut g) = current_w.lock() {
-                    *g = Some((cid, flag.clone()));
+                    *g = Some((cid, job.batch_id, flag.clone()));
                 }
-                run_one(&store, &updates, job, spec, &flag).await;
+                let batch_id = job.batch_id;
+                let pause_on_error = job.pause_on_error;
+                let failed = run_one(&store, &updates, job, spec, &flag).await;
                 if let Ok(mut g) = current_w.lock() {
                     *g = None;
+                }
+                if failed && pause_on_error {
+                    while let Some((decision_batch, should_continue)) = failure_rx.recv().await {
+                        if decision_batch != batch_id {
+                            continue;
+                        }
+                        if !should_continue {
+                            stopped_batches.insert(batch_id);
+                        }
+                        break;
+                    }
                 }
             }
         });
@@ -90,6 +122,7 @@ impl TransferEngine {
             aborted_conns,
             current,
             paused,
+            failure_decision,
         }
     }
 
@@ -120,9 +153,10 @@ impl TransferEngine {
             g.insert(cid);
         }
         if let Ok(g) = self.current.lock() {
-            if let Some((c, flag)) = g.as_ref() {
+            if let Some((c, batch_id, flag)) = g.as_ref() {
                 if *c == cid {
                     flag.store(true, Ordering::Relaxed);
+                    let _ = self.failure_decision.send((*batch_id, false));
                 }
             }
         }
@@ -133,6 +167,11 @@ impl TransferEngine {
     pub fn set_paused(&self, paused: bool) {
         self.paused.store(paused, Ordering::Relaxed);
     }
+
+    /// Resolve the modal shown after one file in a multi-file batch fails.
+    pub fn resolve_batch_failure(&self, batch_id: usize, should_continue: bool) {
+        let _ = self.failure_decision.send((batch_id, should_continue));
+    }
 }
 
 async fn run_one(
@@ -141,8 +180,10 @@ async fn run_one(
     job: TransferJob,
     spec: ConnectionSpec,
     flag: &Arc<AtomicBool>,
-) {
+) -> bool {
     let id = job.id;
+    let batch_id = job.batch_id;
+    let pause_on_error = job.pause_on_error;
     let total = job.bytes_total;
     let credential_key = match CredentialKey::for_spec(&spec) {
         Ok(key) => key,
@@ -150,12 +191,14 @@ async fn run_one(
             let _ = updates
                 .send(TransferUpdate {
                     id,
+                    batch_id,
+                    requires_decision: pause_on_error,
                     bytes_done: 0,
                     bytes_total: None,
                     state: TransferState::Failed(error.to_string()),
                 })
                 .await;
-            return;
+            return true;
         }
     };
     let password = match store.get_for(&credential_key) {
@@ -164,12 +207,14 @@ async fn run_one(
             let _ = updates
                 .send(TransferUpdate {
                     id,
+                    batch_id,
+                    requires_decision: pause_on_error,
                     bytes_done: 0,
                     bytes_total: None,
                     state: TransferState::Failed("missing credential".into()),
                 })
                 .await;
-            return;
+            return true;
         }
     };
 
@@ -181,7 +226,7 @@ async fn run_one(
                 job.remote_path.clone(),
                 std::path::PathBuf::from(&job.local_path),
             );
-            let progress = throttled(updates.clone(), id, total);
+            let progress = throttled(updates.clone(), id, batch_id, total);
             let flag = flag.clone(); // Arc clone for the 'static spawn_blocking closure (M1)
             tokio::task::spawn_blocking(move || {
                 ftp::download(&spec, &password, &remote, &local, progress, Some(&*flag))
@@ -197,7 +242,7 @@ async fn run_one(
                 job.remote_path.clone(),
                 std::path::PathBuf::from(&job.local_path),
             );
-            let progress = throttled(updates.clone(), id, total);
+            let progress = throttled(updates.clone(), id, batch_id, total);
             let flag = flag.clone(); // M1
             tokio::task::spawn_blocking(move || {
                 ftp::upload(&spec, &password, &local, &remote, progress, Some(&*flag))
@@ -207,7 +252,7 @@ async fn run_one(
             .and_then(|r| r.map(|_| ()).map_err(|e| e.to_string()))
         }
         (TransferDirection::Download, Protocol::Sftp) => {
-            let progress = throttled(updates.clone(), id, total);
+            let progress = throttled(updates.clone(), id, batch_id, total);
             let local = std::path::PathBuf::from(&job.local_path);
             sftp::download(
                 &spec,
@@ -222,7 +267,7 @@ async fn run_one(
             .map_err(|e| e.to_string())
         }
         (TransferDirection::Upload, Protocol::Sftp) => {
-            let progress = throttled(updates.clone(), id, total);
+            let progress = throttled(updates.clone(), id, batch_id, total);
             let local = std::path::PathBuf::from(&job.local_path);
             sftp::upload(
                 &spec,
@@ -242,11 +287,14 @@ async fn run_one(
     // outcome — it would read as a confusing "transfer complete" / "Operation timed out"
     // over a dead session. `flag` is this job's own cancel flag (set by abort(conn_id)).
     if flag.load(Ordering::Relaxed) {
-        return;
+        return false;
     }
+    let failed = result.is_err();
     let _ = updates
         .send(TransferUpdate {
             id,
+            batch_id,
+            requires_decision: failed && pause_on_error,
             bytes_done: 0,
             bytes_total: total,
             state: match result {
@@ -255,12 +303,14 @@ async fn run_one(
             },
         })
         .await;
+    failed
 }
 
 /// Build a progress callback that emits at most ~30×/s to avoid flooding the UI.
 fn throttled(
     updates: mpsc::Sender<TransferUpdate>,
     id: TransferId,
+    batch_id: usize,
     total: Option<u64>,
 ) -> impl Fn(u64) + Send + Sync + 'static {
     let last = Arc::new(std::sync::Mutex::new(
@@ -282,10 +332,80 @@ fn throttled(
         if should_emit {
             let _ = updates.try_send(TransferUpdate {
                 id,
+                batch_id,
+                requires_decision: false,
                 bytes_done: done,
                 bytes_total: total,
                 state: TransferState::Active,
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod batch_failure_tests {
+    use super::*;
+    use crate::model::{ConnectionId, Protocol};
+    use crate::store::memory::InMemoryStore;
+
+    fn spec() -> ConnectionSpec {
+        ConnectionSpec {
+            id: ConnectionId(77),
+            name: "test".into(),
+            protocol: Protocol::Sftp,
+            host: "example.invalid".into(),
+            port: 22,
+            user: "nobody".into(),
+            initial_path: String::new(),
+            allow_plaintext_ftp: false,
+            accept_invalid_tls: false,
+        }
+    }
+
+    fn job(id: usize, batch_id: usize, pause_on_error: bool) -> TransferJob {
+        TransferJob {
+            id: TransferId(id),
+            batch_id,
+            pause_on_error,
+            direction: TransferDirection::Upload,
+            local_path: "/missing".into(),
+            remote_path: "/missing".into(),
+            bytes_total: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn stop_marks_remaining_batch_jobs_as_skipped() {
+        let (updates, mut rx) = mpsc::channel(8);
+        let engine = TransferEngine::start(Arc::new(InMemoryStore::default()), updates);
+        engine.enqueue(job(1, 42, true), spec()).await;
+        engine.enqueue(job(2, 42, true), spec()).await;
+
+        let failed = rx.recv().await.expect("first failure");
+        assert!(matches!(failed.state, TransferState::Failed(_)));
+        assert!(failed.requires_decision);
+        engine.resolve_batch_failure(42, false);
+
+        let skipped = rx.recv().await.expect("skipped remaining job");
+        assert_eq!(skipped.id, TransferId(2));
+        assert!(matches!(skipped.state, TransferState::Skipped(_)));
+        assert!(!skipped.requires_decision);
+    }
+
+    #[tokio::test]
+    async fn skip_failed_file_allows_the_next_batch_job_to_run() {
+        let (updates, mut rx) = mpsc::channel(8);
+        let engine = TransferEngine::start(Arc::new(InMemoryStore::default()), updates);
+        engine.enqueue(job(1, 43, true), spec()).await;
+        engine.enqueue(job(2, 43, false), spec()).await;
+
+        let failed = rx.recv().await.expect("first failure");
+        assert!(matches!(failed.state, TransferState::Failed(_)));
+        engine.resolve_batch_failure(43, true);
+
+        let next = rx.recv().await.expect("next job result");
+        assert_eq!(next.id, TransferId(2));
+        assert!(matches!(next.state, TransferState::Failed(_)));
+        assert!(!next.requires_decision);
     }
 }

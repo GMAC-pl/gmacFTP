@@ -299,6 +299,22 @@ component Icon inherits Rectangle {
     }
 }
 
+// Header checkbox for selecting/deselecting every visible file and folder in a pane.
+component SelectAllBox inherits Rectangle {
+    in property <bool> checked: false;
+    callback toggled();
+    width: 16px; height: 16px;
+    background: root.checked ? Tokens.accent : transparent;
+    border-width: 1px;
+    border-color: root.checked ? Tokens.accent : (ta.has-hover ? Tokens.text-sec : Tokens.border-strong);
+    border-radius: 4px;
+    if root.checked : Icon {
+        kind: "check"; width: 11px; height: 11px; fg: #FFFFFF;
+        x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
+    }
+    ta := TouchArea { mouse-cursor: pointer; clicked => { root.toggled(); } }
+}
+
 // square icon button (Apple toolbar style) wrapping an Icon.
 component IconButton inherits Rectangle {
     in property <string> icon;
@@ -791,6 +807,21 @@ export component App inherits Window {
     }
     in-out property <int> local-selected: -1;
     in-out property <int> remote-selected: -1;
+    // Command-A selects every visible entry in the active pane. Keep this separate from the
+    // keyboard cursor (`*-selected`) so arrows, type-ahead and the existing context menu can
+    // continue to operate on one row without changing their behaviour.
+    in-out property <bool> local-all-selected: false;
+    in-out property <bool> remote-all-selected: false;
+    in-out property <int> local-selection-anchor: -1;
+    in-out property <int> remote-selection-anchor: -1;
+    in-out property <int> local-selection-end: -1;
+    in-out property <int> remote-selection-end: -1;
+    in-out property <bool> local-range-selected: false;
+    in-out property <bool> remote-range-selected: false;
+    in-out property <[bool]> local-selection;
+    in-out property <[bool]> remote-selection;
+    property <bool> selection-shift: false;
+    property <bool> selection-command: false;
     in-out property <bool> transfer-active: false;
     in-out property <int> transfer-done: 0;
     in-out property <int> transfer-total: 0;
@@ -822,6 +853,11 @@ export component App inherits Window {
     in-out property <string> selected-path: "";      // full path of the active pane's selected entry (bottom bar, copyable)
     in-out property <bool> overwrite-open: false;    // overwrite-conflict dialog open?
     in-out property <string> overwrite-name: "";     // name of the clashing file (shown in the dialog)
+    in-out property <bool> transfer-error-open: false;
+    in-out property <bool> transfer-error-needs-decision: false;
+    in-out property <string> transfer-error-batch: "";
+    in-out property <string> transfer-error-name: "";
+    in-out property <string> transfer-error-message: "";
     in-out property <bool> passphrase-open: false;   // sync-passphrase dialog open?
     in-out property <string> passphrase-mode: "set"; // "set" (first enable) | "enter" (unlock a pulled vault)
     in-out property <string> passphrase-value: "";
@@ -946,6 +982,7 @@ export component App inherits Window {
     callback apply-sort-field(string);    // set the sort-pane's sort key + re-apply the view
     callback toggle-sort-dir();           // toggle the sort-pane's asc/desc + re-apply
     callback resolve-overwrite(int);      // overwrite dialog: 0=cancel, 1=overwrite, 2=save-as-new
+    callback resolve-transfer-error(bool); // true=skip failed file and continue, false=stop batch
     callback resolve-passphrase(string, string); // passphrase dialog: (value, confirm); empty value = cancel
     callback resolve-host-key-trust(bool);       // true only after user verified the displayed fingerprint
     callback request-send-sync();             // menu "Send Servers to iCloud" → migrate all passwords into the vault, then sync
@@ -966,7 +1003,9 @@ export component App inherits Window {
     callback reorder-local-favorite(int, int); // from index, insertion index
     callback remove-local-favorite(int);       // remove from Favorites only; never deletes disk folder
     callback reorder-saved-connection(int, int); // connection id, insertion index in current Saved view
-    callback move-selection(int);          // keyboard: move active-pane selection by ±1 (arrows)
+    callback select-entry(string, int, bool, bool); // pane, row, extend-range (Shift), toggle (Command)
+    callback select-all(string, bool);        // pane, selected
+    callback move-selection(int, bool);    // keyboard: move by ±1, optionally extending with Shift
     callback type-ahead(string);           // keyboard: jump to first entry starting with letter
     callback pane-preview();               // keyboard: Quick Look (space)
     callback pane-enter();                 // keyboard: copy selected to the other pane (enter)
@@ -984,11 +1023,16 @@ export component App inherits Window {
             if (e.modifiers.control && (e.text == "k" || e.text == "K")) { root.palette-open = true; accept }
             else if (e.modifiers.control && (e.text == "n" || e.text == "N")) { root.new-connection(); accept }
             else if (e.modifiers.control && (e.text == "t" || e.text == "T")) { root.toggle-theme(); accept }
-            else if (e.text == Key.Escape) { root.palette-open = false; root.manager-open = false; root.editor-open = false; root.ctx-open = false; root.sort-open = false; root.delete-open = false; root.drag-active = false; root.drag-pressed = false; accept }
+            else if (e.text == Key.Escape) { root.palette-open = false; root.manager-open = false; root.editor-open = false; root.ctx-open = false; root.sort-open = false; root.delete-open = false; root.drag-active = false; root.drag-pressed = false; root.selection-shift = false; root.selection-command = false; accept }
             // keyboard control of the active file pane (only when no overlay/input is open)
             else if (!root.palette-open && !root.manager-open && !root.editor-open && !root.ctx-open) {
-                if (e.text == Key.UpArrow) { root.move-selection(-1); accept }
-                else if (e.text == Key.DownArrow) { root.move-selection(1); accept }
+                if (e.modifiers.control && (e.text == "a" || e.text == "A")) {
+                    root.select-all(root.active-pane, true);
+                    root.update-selected-path();
+                    accept
+                }
+                else if (e.text == Key.UpArrow) { root.move-selection(-1, e.modifiers.shift); accept }
+                else if (e.text == Key.DownArrow) { root.move-selection(1, e.modifiers.shift); accept }
                 else if (e.text == Key.Return) { root.pane-enter(); accept }
                 else if (e.text == Key.Delete || e.text == Key.Backspace) { root.pane-delete(); accept }
                 else if (e.text == Key.Space || e.text == " ") { root.pane-preview(); accept }
@@ -1354,7 +1398,18 @@ export component App inherits Window {
                         Rectangle {
                             height: 24px; background: Tokens.bg;
                             HorizontalLayout { padding-left: 14px; padding-right: 14px; spacing: 10px; alignment: center;
-                                Rectangle { width: 20px; }
+                                Rectangle {
+                                    width: 20px;
+                                    SelectAllBox {
+                                        checked: root.local-all-selected;
+                                        x: 2px; y: (parent.height - self.height) / 2;
+                                        toggled => {
+                                            root.active-pane = "local"; root.activate-pane("local");
+                                            root.select-all("local", !root.local-all-selected);
+                                            root.update-selected-path();
+                                        }
+                                    }
+                                }
                                 SortHeader { horizontal-stretch: 1; label: "NAME"; key: "name"; active-key: root.local-sort-key; active-dir: root.local-sort-dir; clicked-with(k) => { root.sort-local(k); } }
                                 SortHeader { width: 84px; label: "MODIFIED"; key: "date"; active-key: root.local-sort-key; active-dir: root.local-sort-dir; right-align: true; clicked-with(k) => { root.sort-local(k); } }
                                 SortHeader { width: 52px; label: "SIZE"; key: "size"; active-key: root.local-sort-key; active-dir: root.local-sort-dir; right-align: true; clicked-with(k) => { root.sort-local(k); } }
@@ -1372,24 +1427,31 @@ export component App inherits Window {
                                 width: parent.width; height: parent.height;
                                 VerticalLayout {
                                     spacing: 0px;
-                                    for e[i] in root.local-entries : Rectangle {
+                                    for e[i] in root.local-entries : l_row := Rectangle {
+                                        property <bool> row-selected: i < root.local-selection.length && root.local-selection[i];
                                         height: 30px;
-                                        background: i == root.local-selected
+                                        background: l_row.row-selected
                                             ? (root.active-pane == "local" ? Tokens.selection : Tokens.row-hover)
                                             : (l_touch.has-hover ? Tokens.row-hover : transparent);
                                         l_touch := TouchArea {
                                             mouse-cursor: pointer;
-                                            clicked => { root.local-selected = i; root.active-pane = "local"; root.activate-pane("local"); root.update-selected-path(); }
+                                            clicked => { root.select-entry("local", i, root.selection-shift, root.selection-command); root.selection-shift = false; root.selection-command = false; root.active-pane = "local"; root.activate-pane("local"); root.update-selected-path(); }
                                             double-clicked => { if (e.is-dir) { root.navigate-local(e.name); } }
                                             pointer-event(pe) => {
                                                 if (pe.button == PointerEventButton.right && pe.kind == PointerEventKind.down) {
-                                                    root.local-selected = i;
+                                                    root.select-entry("local", i, false, false);
                                                     root.ctx-pane = "local"; root.ctx-index = i; root.ctx-name = e.name; root.ctx-is-dir = e.is-dir;
                                                     root.ctx-x = self.absolute-position.x + self.mouse-x;
                                                     root.ctx-y = self.absolute-position.y + self.mouse-y;
                                                     root.ctx-open = true;
                                                 } else if (pe.button == PointerEventButton.left || pe.kind == PointerEventKind.move || pe.kind == PointerEventKind.up) {
                                                     if (pe.kind == PointerEventKind.down) {
+                                                        root.selection-shift = pe.modifiers.shift;
+                                                        root.selection-command = pe.modifiers.control;
+                                                        if (!root.selection-shift && !root.selection-command && !l_row.row-selected) {
+                                                            root.select-entry("local", i, false, false);
+                                                            root.update-selected-path();
+                                                        }
                                                         root.drag-source = "local"; root.drag-index = i; root.drag-name = e.name;
                                                         root.drag-is-dir = e.is-dir;
                                                         root.drag-pressed = true; root.drag-active = false;
@@ -1426,13 +1488,13 @@ export component App inherits Window {
                                             }
                                         }
                                         HorizontalLayout { padding-left: 14px; padding-right: 14px; spacing: 10px;
-                                            FileIcon { is-dir: e.is-dir; selected: i == root.local-selected && root.active-pane == "local"; }
-                                            Text { text: e.name; color: i == root.local-selected && root.active-pane == "local" ? Tokens.selection-text : Tokens.text; font-size: 13px; font-weight: i == root.local-selected ? 600 : 400; horizontal-stretch: 1; vertical-alignment: center; overflow: elide; }
-                                            Text { text: e.date; color: i == root.local-selected && root.active-pane == "local" ? #FFFFFFCC : Tokens.text-sec; font-family: "JetBrains Mono"; font-size: 10px; width: 84px; vertical-alignment: center; horizontal-alignment: right; }
+                                            FileIcon { is-dir: e.is-dir; selected: l_row.row-selected && root.active-pane == "local"; }
+                                            Text { text: e.name; color: l_row.row-selected && root.active-pane == "local" ? Tokens.selection-text : Tokens.text; font-size: 13px; font-weight: l_row.row-selected ? 600 : 400; horizontal-stretch: 1; vertical-alignment: center; overflow: elide; }
+                                            Text { text: e.date; color: l_row.row-selected && root.active-pane == "local" ? #FFFFFFCC : Tokens.text-sec; font-family: "JetBrains Mono"; font-size: 10px; width: 84px; vertical-alignment: center; horizontal-alignment: right; }
                                             MetadataSizeCell {
                                                 text: e.size-text;
                                                 state: e.metadata-state;
-                                                selected: i == root.local-selected && root.active-pane == "local";
+                                                selected: l_row.row-selected && root.active-pane == "local";
                                                 pulse: root.metadata-pulse;
                                             }
                                         }
@@ -1494,7 +1556,18 @@ export component App inherits Window {
                         Rectangle {
                             height: 24px; background: Tokens.bg;
                             HorizontalLayout { padding-left: 14px; padding-right: 14px; spacing: 10px; alignment: center;
-                                Rectangle { width: 20px; }
+                                Rectangle {
+                                    width: 20px;
+                                    SelectAllBox {
+                                        checked: root.remote-all-selected;
+                                        x: 2px; y: (parent.height - self.height) / 2;
+                                        toggled => {
+                                            root.active-pane = "remote"; root.activate-pane("remote");
+                                            root.select-all("remote", !root.remote-all-selected);
+                                            root.update-selected-path();
+                                        }
+                                    }
+                                }
                                 SortHeader { horizontal-stretch: 1; label: "NAME"; key: "name"; active-key: root.remote-sort-key; active-dir: root.remote-sort-dir; clicked-with(k) => { root.sort-remote(k); } }
                                 SortHeader { width: 84px; label: "MODIFIED"; key: "date"; active-key: root.remote-sort-key; active-dir: root.remote-sort-dir; right-align: true; clicked-with(k) => { root.sort-remote(k); } }
                                 SortHeader { width: 52px; label: "SIZE"; key: "size"; active-key: root.remote-sort-key; active-dir: root.remote-sort-dir; right-align: true; clicked-with(k) => { root.sort-remote(k); } }
@@ -1512,24 +1585,31 @@ export component App inherits Window {
                                 width: parent.width; height: parent.height;
                                 VerticalLayout {
                                     spacing: 0px;
-                                    for e[i] in root.remote-entries : Rectangle {
+                                    for e[i] in root.remote-entries : r_row := Rectangle {
+                                        property <bool> row-selected: i < root.remote-selection.length && root.remote-selection[i];
                                         height: 30px;
-                                        background: i == root.remote-selected
+                                        background: r_row.row-selected
                                             ? (root.active-pane == "remote" ? Tokens.selection : Tokens.row-hover)
                                             : (r_touch.has-hover ? Tokens.row-hover : transparent);
                                         r_touch := TouchArea {
                                             mouse-cursor: pointer;
-                                            clicked => { root.remote-selected = i; root.active-pane = "remote"; root.activate-pane("remote"); root.update-selected-path(); }
+                                            clicked => { root.select-entry("remote", i, root.selection-shift, root.selection-command); root.selection-shift = false; root.selection-command = false; root.active-pane = "remote"; root.activate-pane("remote"); root.update-selected-path(); }
                                             double-clicked => { if (e.is-dir) { root.navigate-remote(e.name); } }
                                             pointer-event(pe) => {
                                                 if (pe.button == PointerEventButton.right && pe.kind == PointerEventKind.down) {
-                                                    root.remote-selected = i;
+                                                    root.select-entry("remote", i, false, false);
                                                     root.ctx-pane = "remote"; root.ctx-index = i; root.ctx-name = e.name; root.ctx-is-dir = e.is-dir;
                                                     root.ctx-x = self.absolute-position.x + self.mouse-x;
                                                     root.ctx-y = self.absolute-position.y + self.mouse-y;
                                                     root.ctx-open = true;
                                                 } else if (pe.button == PointerEventButton.left || pe.kind == PointerEventKind.move || pe.kind == PointerEventKind.up) {
                                                     if (pe.kind == PointerEventKind.down) {
+                                                        root.selection-shift = pe.modifiers.shift;
+                                                        root.selection-command = pe.modifiers.control;
+                                                        if (!root.selection-shift && !root.selection-command && !r_row.row-selected) {
+                                                            root.select-entry("remote", i, false, false);
+                                                            root.update-selected-path();
+                                                        }
                                                         root.drag-source = "remote"; root.drag-index = i; root.drag-name = e.name;
                                                         root.drag-is-dir = e.is-dir;
                                                         root.drag-pressed = true; root.drag-active = false;
@@ -1566,13 +1646,13 @@ export component App inherits Window {
                                             }
                                         }
                                         HorizontalLayout { padding-left: 14px; padding-right: 14px; spacing: 10px;
-                                            FileIcon { is-dir: e.is-dir; selected: i == root.remote-selected && root.active-pane == "remote"; }
-                                            Text { text: e.name; color: i == root.remote-selected && root.active-pane == "remote" ? Tokens.selection-text : Tokens.text; font-size: 13px; font-weight: i == root.remote-selected ? 600 : 400; horizontal-stretch: 1; vertical-alignment: center; overflow: elide; }
-                                            Text { text: e.date; color: i == root.remote-selected && root.active-pane == "remote" ? #FFFFFFCC : Tokens.text-sec; font-family: "JetBrains Mono"; font-size: 10px; width: 84px; vertical-alignment: center; horizontal-alignment: right; }
+                                            FileIcon { is-dir: e.is-dir; selected: r_row.row-selected && root.active-pane == "remote"; }
+                                            Text { text: e.name; color: r_row.row-selected && root.active-pane == "remote" ? Tokens.selection-text : Tokens.text; font-size: 13px; font-weight: r_row.row-selected ? 600 : 400; horizontal-stretch: 1; vertical-alignment: center; overflow: elide; }
+                                            Text { text: e.date; color: r_row.row-selected && root.active-pane == "remote" ? #FFFFFFCC : Tokens.text-sec; font-family: "JetBrains Mono"; font-size: 10px; width: 84px; vertical-alignment: center; horizontal-alignment: right; }
                                             MetadataSizeCell {
                                                 text: e.size-text;
                                                 state: e.metadata-state;
-                                                selected: i == root.remote-selected && root.active-pane == "remote";
+                                                selected: r_row.row-selected && root.active-pane == "remote";
                                                 pulse: root.metadata-pulse;
                                             }
                                         }
@@ -1758,6 +1838,67 @@ export component App inherits Window {
                             Icon { kind: "trash"; width: 15px; height: 15px; fg: #FFFFFF; x: 16px; y: 8px; }
                             Text { text: I18n.del-cap; color: #FFFFFF; font-size: 12px; font-weight: 600; x: 37px; y: 0px; width: 44px; height: 32px; vertical-alignment: center; horizontal-alignment: left; }
                             del_ok := TouchArea { mouse-cursor: pointer; clicked => { root.confirm-delete(); } }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── failed file in a multi-file copy: pause the batch until the user decides ──
+        if root.transfer-error-open : Rectangle {
+            background: Tokens.scrim;
+            TouchArea { clicked => { } }
+            Rectangle {
+                x: (root.width - self.width) / 2;
+                y: (root.height - self.height) / 2;
+                width: 440px; height: 270px; background: Tokens.card;
+                border-radius: 14px; border-width: 1px; border-color: Tokens.border-strong;
+                drop-shadow-blur: 60px; drop-shadow-offset-y: 24px; drop-shadow-color: #00000066;
+                TouchArea { clicked => { } }
+                VerticalLayout { padding: 24px; spacing: 14px;
+                    Rectangle {
+                        width: 44px; height: 44px; border-radius: 22px; background: Tokens.danger-soft;
+                        Icon { kind: "x"; fg: Tokens.danger; width: 21px; height: 21px; x: 11.5px; y: 11.5px; }
+                    }
+                    Text {
+                        text: I18n.locale == "pl" ? "Nie udało się skopiować pliku" : "A file could not be copied";
+                        color: Tokens.text; font-size: 16px; font-weight: 700; height: 20px;
+                    }
+                    Text {
+                        text: root.transfer-error-name;
+                        color: Tokens.text; font-family: "JetBrains Mono"; font-size: 11px;
+                        height: 18px; overflow: elide;
+                    }
+                    Text {
+                        text: root.transfer-error-message;
+                        color: Tokens.danger-text; font-size: 11px; height: 32px;
+                        wrap: word-wrap; overflow: elide;
+                    }
+                    Text {
+                        text: root.transfer-error-needs-decision
+                            ? (I18n.locale == "pl" ? "Czy pominąć ten plik i kontynuować, czy przerwać całą partię?" : "Skip this file and continue, or stop the entire batch?")
+                            : (I18n.locale == "pl" ? "Transfer tego pliku został zatrzymany. Pozostałe szczegóły są widoczne w panelu transferów." : "This file transfer was stopped. Details remain available in the transfer panel.");
+                        color: Tokens.text-sec; font-size: 12px; height: 32px; wrap: word-wrap;
+                    }
+                    Rectangle { height: 0px; vertical-stretch: 1; }
+                    HorizontalLayout { spacing: 10px; alignment: end;
+                        if root.transfer-error-needs-decision : Rectangle {
+                            width: 142px; height: 32px; border-radius: 6px;
+                            background: stop_batch.has-hover ? Tokens.danger-fill-hover : Tokens.danger-fill;
+                            Text { text: I18n.locale == "pl" ? "Przerwij partię" : "Stop batch"; color: #FFFFFF; font-size: 12px; font-weight: 600; horizontal-alignment: center; vertical-alignment: center; }
+                            stop_batch := TouchArea { mouse-cursor: pointer; clicked => { root.resolve-transfer-error(false); } }
+                        }
+                        if root.transfer-error-needs-decision : Rectangle {
+                            width: 164px; height: 32px; border-radius: 6px;
+                            background: skip_file.has-hover ? Tokens.primary-fill-hover : Tokens.primary-fill;
+                            Text { text: I18n.locale == "pl" ? "Pomiń i kontynuuj" : "Skip and continue"; color: #FFFFFF; font-size: 12px; font-weight: 600; horizontal-alignment: center; vertical-alignment: center; }
+                            skip_file := TouchArea { mouse-cursor: pointer; clicked => { root.resolve-transfer-error(true); } }
+                        }
+                        if !root.transfer-error-needs-decision : Rectangle {
+                            width: 82px; height: 32px; border-radius: 6px;
+                            background: dismiss_error.has-hover ? Tokens.primary-fill-hover : Tokens.primary-fill;
+                            Text { text: "OK"; color: #FFFFFF; font-size: 12px; font-weight: 600; horizontal-alignment: center; vertical-alignment: center; }
+                            dismiss_error := TouchArea { mouse-cursor: pointer; clicked => { root.transfer-error-open = false; root.transfer-error-message = ""; root.transfer-error-name = ""; } }
                         }
                     }
                 }

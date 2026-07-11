@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.0.20 — 2026-07-11
+
+Multi-selection and resilient batch-transfer release.
+
+- **Native macOS-style selection.** Command-A and the header checkbox select every visible entry;
+  Shift-click / Shift-arrow select a contiguous range; Command-click adds or removes arbitrary
+  individual files and folders without losing the rest of the selection.
+- **Copy mixed selections together.** Files and folders selected by any of the above methods are
+  copied as one batch with Enter, the transfer arrows, or an in-app drag. Copying selected paths
+  places every concrete path on the clipboard, one per line.
+- **No lost overwrite decisions.** Multiple name conflicts are retained in a FIFO queue, so one
+  overwrite dialog can never replace another pending item from the same batch.
+- **Recover from a bad or locked file.** A failed file in a multi-file FTP/FTPS/SFTP transfer pauses
+  the batch before the next file. The user can skip that file and continue or stop only the
+  remaining files in that batch; unrelated batches are not cancelled.
+- **Visible single-file failures.** A lone failed transfer shows the file name and concrete error in
+  a modal message, while the transfer panel retains the diagnostic details.
+- **Regression coverage.** Automated tests cover all/range/disjoint selection and both batch-error
+  decisions (continue and stop).
+
 ## 0.0.19 — 2026-07-10
 
 Security and data-integrity release following a full code, dependency, build, and release audit.
