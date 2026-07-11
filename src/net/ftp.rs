@@ -5,7 +5,7 @@
 //! FTP remains available only after a deliberate, application-level opt-in for a legacy host;
 //! a refused `AUTH TLS` can never silently downgrade an authenticated session.
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 
 use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::str::FromStr;
@@ -16,8 +16,9 @@ use suppaftp::{FtpError, FtpStream, NativeTlsConnector, NativeTlsFtpStream, Stat
 
 use crate::model::{ConnectionSpec, RemoteEntry};
 use crate::net::error::NetError;
-use crate::net::safe::validate_ftp_path;
-use crate::net::RemoteTreeStats;
+use crate::net::partial::open_download_part;
+use crate::net::safe::{validate_ftp_path, validate_remote_component};
+use crate::net::{DownloadResume, RemoteTreeStats};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Whether this exact saved connection has explicitly disabled TLS certificate verification.
@@ -39,15 +40,18 @@ pub fn allow_plaintext_ftp(spec: &ConnectionSpec) -> bool {
 
 /// The FTP methods gmacFTP uses, abstracted so a secured (FTPS) and a plain stream are
 /// interchangeable behind `Box<dyn FtpConn>`.
-trait FtpConn {
+trait FtpConn: Send {
     fn cwd(&mut self, path: &str) -> Result<(), FtpError>;
     fn list_bounded(&mut self, path: Option<&str>) -> Result<Listing, FtpError>;
     fn make_dir(&mut self, path: &str) -> Result<(), FtpError>;
     fn remove_file(&mut self, path: &str) -> Result<(), FtpError>;
     fn remove_dir(&mut self, path: &str) -> Result<(), FtpError>;
+    fn rename_path(&mut self, from: &str, to: &str) -> Result<(), FtpError>;
+    fn chmod(&mut self, path: &str, mode: u32) -> Result<(), FtpError>;
     fn quit(&mut self) -> Result<(), FtpError>;
     fn retr_stream(&mut self, path: &str) -> Result<Box<dyn Read>, FtpError>;
     fn finalize_retr(&mut self, stream: Box<dyn Read>) -> Result<(), FtpError>;
+    fn resume_transfer(&mut self, offset: usize) -> Result<(), FtpError>;
     fn put_stream(&mut self, path: &str) -> Result<Box<dyn Write>, FtpError>;
     fn finalize_put(&mut self, writer: Box<dyn Write>) -> Result<(), FtpError>;
     /// Whether this is an unencrypted (plaintext) FTP stream — `true` for the plaintext
@@ -83,6 +87,12 @@ macro_rules! impl_ftp_conn {
             fn remove_dir(&mut self, path: &str) -> Result<(), FtpError> {
                 self.rmdir(path)
             }
+            fn rename_path(&mut self, from: &str, to: &str) -> Result<(), FtpError> {
+                self.rename(from, to)
+            }
+            fn chmod(&mut self, path: &str, mode: u32) -> Result<(), FtpError> {
+                self.site(format!("CHMOD {mode:03o} {path}")).map(|_| ())
+            }
             fn quit(&mut self) -> Result<(), FtpError> {
                 self.quit()
             }
@@ -97,6 +107,9 @@ macro_rules! impl_ftp_conn {
             }
             fn finalize_retr(&mut self, stream: Box<dyn Read>) -> Result<(), FtpError> {
                 self.finalize_retr_stream(stream)
+            }
+            fn resume_transfer(&mut self, offset: usize) -> Result<(), FtpError> {
+                self.resume_transfer(offset)
             }
             fn put_stream(&mut self, path: &str) -> Result<Box<dyn Write>, FtpError> {
                 self.put_with_stream(path).and_then(|s| {
@@ -235,16 +248,15 @@ fn read_listing_line<R: BufRead>(
     Ok(Some(Some(String::from_utf8_lossy(&line).into_owned())))
 }
 
-/// Create a remote directory and all missing ancestors (mkdir -p). Replies for already-
-/// existing segments (550) are ignored, so this is safe to call on existing trees.
-fn mkdirs(c: &mut dyn FtpConn, remote_dir: &str) {
+/// Create a remote directory and all missing ancestors (mkdir -p). FTP commonly reports an
+/// already-existing directory as 550; only that protocol response is tolerated. Transport and
+/// timeout errors must stop before STOR so they are not hidden behind a later, misleading error.
+fn mkdirs(c: &mut dyn FtpConn, remote_dir: &str) -> Result<(), NetError> {
     // NETW-4: refuse CR/LF/NUL anywhere in the remote dir before any segment reaches MKD.
-    if validate_ftp_path(remote_dir).is_err() {
-        return;
-    }
+    validate_ftp_path(remote_dir)?;
     let clean = remote_dir.trim_matches('/');
     if clean.is_empty() {
-        return;
+        return Ok(());
     }
     let mut acc = String::new();
     for seg in clean.split('/') {
@@ -257,8 +269,13 @@ fn mkdirs(c: &mut dyn FtpConn, remote_dir: &str) {
             acc.push('/');
             acc.push_str(seg);
         }
-        let _ = c.make_dir(&acc);
+        match c.make_dir(&acc) {
+            Ok(()) => {}
+            Err(FtpError::UnexpectedResponse(response)) if response.status.code() == 550 => {}
+            Err(error) => return Err(NetError::from_ftp(error)),
+        }
     }
+    Ok(())
 }
 
 /// Parent directory of a remote path, absolute ("/a/b/c.txt" -> "/a/b"; "/c.txt" -> "/").
@@ -391,6 +408,67 @@ fn connect_with_retry(spec: &ConnectionSpec, password: &str) -> Result<Box<dyn F
     Err(last.expect("retry loop runs at least once before returning"))
 }
 
+/// Authenticated FTP/FTPS control connection reusable by the transfer scheduler. Data streams
+/// remain per-file, while repeated files avoid TLS negotiation and USER/PASS round-trips.
+pub struct TransferSession {
+    connection: Box<dyn FtpConn>,
+}
+
+impl TransferSession {
+    pub fn connect(spec: &ConnectionSpec, password: &str) -> Result<Self, NetError> {
+        connect_with_retry(spec, password).map(|connection| Self { connection })
+    }
+
+    pub fn download(
+        &mut self,
+        remote_path: &str,
+        local_path: &std::path::Path,
+        progress: impl Fn(u64),
+        cancel: Option<&AtomicBool>,
+    ) -> Result<u64, NetError> {
+        self.download_resumable(remote_path, local_path, progress, cancel, None)
+    }
+
+    pub fn download_resumable(
+        &mut self,
+        remote_path: &str,
+        local_path: &std::path::Path,
+        progress: impl Fn(u64),
+        cancel: Option<&AtomicBool>,
+        resume: Option<DownloadResume>,
+    ) -> Result<u64, NetError> {
+        download_with_session(
+            self.connection.as_mut(),
+            remote_path,
+            local_path,
+            progress,
+            cancel,
+            resume,
+        )
+    }
+
+    pub fn upload(
+        &mut self,
+        local_path: &std::path::Path,
+        remote_path: &str,
+        progress: impl Fn(u64),
+        cancel: Option<&AtomicBool>,
+    ) -> Result<u64, NetError> {
+        let file = std::fs::File::open(local_path)?;
+        upload_with_session(
+            self.connection.as_mut(),
+            file,
+            remote_path,
+            progress,
+            cancel,
+        )
+    }
+
+    pub fn close(mut self) {
+        let _ = self.connection.quit();
+    }
+}
+
 /// Per-operation socket I/O timeout. suppaftp's control + data-channel reads are blocking
 /// syscalls with no internal timeout; without this, a server that stalls mid-LIST/RETR/STOR
 /// (or stops replying on the control channel) hangs the blocking pool thread AND the
@@ -479,7 +557,7 @@ fn map_login(res: Result<(), FtpError>) -> Result<(), NetError> {
     }
 }
 
-fn parse_lines(lines: Vec<String>) -> Vec<RemoteEntry> {
+fn parse_lines(lines: Vec<String>) -> Result<Vec<RemoteEntry>, NetError> {
     let mut out = Vec::with_capacity(lines.len().min(MAX_LISTING_ENTRIES));
     for line in lines {
         if out.len() >= MAX_LISTING_ENTRIES {
@@ -497,6 +575,7 @@ fn parse_lines(lines: Vec<String>) -> Vec<RemoteEntry> {
             if name == "." || name == ".." {
                 continue;
             }
+            validate_remote_component(&name)?;
             out.push(RemoteEntry {
                 name,
                 is_dir: f.is_directory(),
@@ -510,7 +589,7 @@ fn parse_lines(lines: Vec<String>) -> Vec<RemoteEntry> {
         }
     }
     crate::model::sort_entries(&mut out);
-    out
+    Ok(out)
 }
 
 /// Connect, optionally cwd into the initial path, list the directory.
@@ -534,7 +613,7 @@ pub fn connect_and_list(
     if listing.truncated {
         tracing::warn!("FTP initial directory listing truncated by safety limit");
     }
-    Ok((parse_lines(listing.lines), c.is_plaintext()))
+    Ok((parse_lines(listing.lines)?, c.is_plaintext()))
 }
 
 /// Recursively collect every FILE under `root_dir` as `(absolute_remote_path, size)`.
@@ -621,7 +700,7 @@ fn tree_stats_inner(
     validate_ftp_path(dir)?; // NETW-4: server-controlled recursion path
     c.cwd(dir).map_err(NetError::from_ftp)?;
     let listing = c.list_bounded(None).map_err(NetError::from_ftp)?;
-    let entries = parse_lines(listing.lines);
+    let entries = parse_lines(listing.lines)?;
     let listing_truncated = listing.truncated;
     for e in entries {
         if stats.truncated {
@@ -670,7 +749,7 @@ fn walk_inner(
     validate_ftp_path(dir)?; // NETW-4: server-controlled recursion path
     c.cwd(dir).map_err(NetError::from_ftp)?;
     let listing = c.list_bounded(None).map_err(NetError::from_ftp)?;
-    let entries = parse_lines(listing.lines);
+    let entries = parse_lines(listing.lines)?;
     let listing_truncated = listing.truncated;
     for e in entries {
         if out.len() >= MAX_REMOTE_FILES {
@@ -710,16 +789,59 @@ pub fn download(
     progress: impl Fn(u64),
     cancel: Option<&AtomicBool>, // M1: cooperative cancel so abort() stops an in-flight transfer
 ) -> Result<u64, NetError> {
+    let mut session = TransferSession::connect(spec, password)?;
+    let result = session.download(remote_path, local_path, progress, cancel);
+    session.close();
+    result
+}
+
+fn download_with_session(
+    connection: &mut dyn FtpConn,
+    remote_path: &str,
+    local_path: &std::path::Path,
+    progress: impl Fn(u64),
+    cancel: Option<&AtomicBool>,
+    resume: Option<DownloadResume>,
+) -> Result<u64, NetError> {
     validate_ftp_path(remote_path)?; // NETW-4: CRLF/NUL command-smuggling guard
-    let mut c = connect_with_retry(spec, password)?;
     if let Some(parent) = local_path.parent() {
-        let _ = std::fs::create_dir_all(parent); // supports folder downloads
+        std::fs::create_dir_all(parent)?; // supports folder downloads
     }
-    let (part, mut file) = create_unique_part(local_path)?;
+    let part = open_download_part(local_path, resume)?;
+    let part_path = part.path;
+    let keep_on_error = part.keep_on_error;
+    let mut file = part.file;
+    let mut offset = part.offset;
+    file.seek(SeekFrom::Start(offset))?;
     let result: Result<u64, NetError> = (|| {
-        let mut stream = c.retr_stream(remote_path).map_err(NetError::from_ftp)?;
+        if offset > 0 {
+            let platform_offset = usize::try_from(offset).map_err(|_| {
+                NetError::Ftp("download resume offset does not fit this platform".into())
+            })?;
+            match connection.resume_transfer(platform_offset) {
+                Ok(()) => {}
+                // REST is optional. A server explicitly rejecting it falls back to a clean
+                // restart; transport errors still fail so a broken session is never reused.
+                Err(FtpError::UnexpectedResponse(response)) if response.status.code() >= 500 => {
+                    tracing::info!(
+                        code = response.status.code(),
+                        "FTP server does not support resume; restarting download from zero"
+                    );
+                    file.set_len(0)?;
+                    file.seek(SeekFrom::Start(0))?;
+                    offset = 0;
+                }
+                Err(error) => return Err(NetError::from_ftp(error)),
+            }
+        }
+        let mut stream = connection
+            .retr_stream(remote_path)
+            .map_err(NetError::from_ftp)?;
         let mut buf = [0u8; 64 * 1024];
-        let mut done: u64 = 0;
+        let mut done = offset;
+        if done > 0 {
+            progress(done);
+        }
         loop {
             if let Some(f) = cancel {
                 if f.load(Ordering::Relaxed) {
@@ -734,52 +856,27 @@ pub fn download(
             done += n as u64;
             progress(done);
         }
-        c.finalize_retr(stream).map_err(NetError::from_ftp)?; // #1 suppaftp footgun
+        connection
+            .finalize_retr(stream)
+            .map_err(NetError::from_ftp)?; // #1 suppaftp footgun
         file.sync_all()?;
         Ok(done)
     })();
-    let _ = c.quit();
     match result {
-        Ok(done) => match std::fs::rename(&part, local_path) {
+        Ok(done) => match std::fs::rename(&part_path, local_path) {
             Ok(()) => Ok(done),
             Err(error) => {
-                let _ = std::fs::remove_file(&part);
+                let _ = std::fs::remove_file(&part_path);
                 Err(error.into())
             }
         },
         Err(e) => {
-            let _ = std::fs::remove_file(&part); // no partial artifact
+            if !keep_on_error {
+                let _ = std::fs::remove_file(&part_path);
+            }
             Err(e)
         }
     }
-}
-
-fn part_path_with_nonce(p: &std::path::Path, pid: u32, nonce: u64) -> std::path::PathBuf {
-    let parent = p.parent().unwrap_or_else(|| std::path::Path::new("."));
-    let mut name = std::ffi::OsString::from(".");
-    name.push(
-        p.file_name()
-            .unwrap_or_else(|| std::ffi::OsStr::new("download")),
-    );
-    name.push(format!(".gmacftp-{pid}-{nonce}.part"));
-    parent.join(name)
-}
-
-fn create_unique_part(
-    destination: &std::path::Path,
-) -> Result<(std::path::PathBuf, std::fs::File), std::io::Error> {
-    for _ in 0..16 {
-        let path = part_path_with_nonce(destination, std::process::id(), rand::random::<u64>());
-        match crate::store::vault::create_exclusive(&path) {
-            Ok(file) => return Ok((path, file)),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(error),
-        }
-    }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::AlreadyExists,
-        "could not allocate a unique download temp file",
-    ))
 }
 
 /// Upload `local_path` to `remote_path`, reporting cumulative bytes via `progress`.
@@ -792,36 +889,132 @@ pub fn upload(
     progress: impl Fn(u64),
     cancel: Option<&AtomicBool>, // M1
 ) -> Result<u64, NetError> {
+    // Verify/read the source before authentication or STOR can truncate a remote destination.
+    let file = std::fs::File::open(local_path)?;
+    let mut session = TransferSession::connect(spec, password)?;
+    let result = upload_with_session(
+        session.connection.as_mut(),
+        file,
+        remote_path,
+        progress,
+        cancel,
+    );
+    session.close();
+    result
+}
+
+fn upload_with_session(
+    connection: &mut dyn FtpConn,
+    mut file: std::fs::File,
+    remote_path: &str,
+    progress: impl Fn(u64),
+    cancel: Option<&AtomicBool>,
+) -> Result<u64, NetError> {
     validate_ftp_path(remote_path)?; // NETW-4
-    let mut c = connect_with_retry(spec, password)?;
     if let Some(parent) = parent_remote(remote_path) {
-        mkdirs(c.as_mut(), &parent); // supports folder uploads (mkdir -p ancestors)
+        mkdirs(connection, &parent)?; // supports folder uploads (mkdir -p ancestors)
     }
-    let mut writer = c.put_stream(remote_path).map_err(NetError::from_ftp)?;
-    let mut file = std::fs::File::open(local_path)?;
+    let mut writer = connection
+        .put_stream(remote_path)
+        .map_err(NetError::from_ftp)?;
     let mut buf = [0u8; 64 * 1024];
     let mut done: u64 = 0;
-    loop {
-        if let Some(f) = cancel {
-            if f.load(Ordering::Relaxed) {
-                return Err(NetError::Cancelled);
+    let result: Result<u64, NetError> = (|| {
+        loop {
+            if let Some(f) = cancel {
+                if f.load(Ordering::Relaxed) {
+                    return Err(NetError::Cancelled);
+                }
             }
+            let n = file.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            writer.write_all(&buf[..n])?;
+            done += n as u64;
+            progress(done);
         }
-        let n = file.read(&mut buf)?;
-        if n == 0 {
-            break;
+        Ok(done)
+    })();
+    match result {
+        Ok(done) => {
+            connection
+                .finalize_put(writer)
+                .map_err(NetError::from_ftp)?;
+            Ok(done)
         }
-        writer.write_all(&buf[..n])?;
-        done += n as u64;
-        progress(done);
+        Err(error) => Err(error),
     }
-    c.finalize_put(writer).map_err(NetError::from_ftp)?;
-    let _ = c.quit();
-    Ok(done)
+}
+
+pub fn rename(spec: &ConnectionSpec, password: &str, from: &str, to: &str) -> Result<(), NetError> {
+    validate_ftp_path(from)?;
+    validate_ftp_path(to)?;
+    let mut connection = connect(spec, password)?;
+    let result = connection.rename_path(from, to).map_err(NetError::from_ftp);
+    let _ = connection.quit();
+    result
+}
+
+pub fn create_dir(spec: &ConnectionSpec, password: &str, path: &str) -> Result<(), NetError> {
+    validate_ftp_path(path)?;
+    let mut connection = connect(spec, password)?;
+    let result = connection.make_dir(path).map_err(NetError::from_ftp);
+    let _ = connection.quit();
+    result
+}
+
+pub fn chmod(spec: &ConnectionSpec, password: &str, path: &str, mode: u32) -> Result<(), NetError> {
+    validate_ftp_path(path)?;
+    if mode > 0o777 {
+        return Err(NetError::InvalidPath("invalid permission mode".into()));
+    }
+    let mut connection = connect(spec, password)?;
+    let result = connection.chmod(path, mode).map_err(NetError::from_ftp);
+    let _ = connection.quit();
+    result
+}
+
+fn collect_delete_tree(
+    connection: &mut dyn FtpConn,
+    path: &str,
+    out: &mut Vec<(String, bool)>,
+    depth: usize,
+    directories: &mut usize,
+) -> Result<(), NetError> {
+    if depth >= MAX_RECURSION_DEPTH || *directories >= MAX_REMOTE_DIRECTORIES {
+        return Err(NetError::Ftp(
+            "remote folder exceeds recursive-delete safety limits".into(),
+        ));
+    }
+    *directories += 1;
+    validate_ftp_path(path)?;
+    connection.cwd(path).map_err(NetError::from_ftp)?;
+    let listing = connection.list_bounded(None).map_err(NetError::from_ftp)?;
+    if listing.truncated {
+        return Err(NetError::Ftp(
+            "remote folder listing was truncated; refusing incomplete delete".into(),
+        ));
+    }
+    for entry in parse_lines(listing.lines)? {
+        if out.len() >= MAX_REMOTE_FILES + MAX_REMOTE_DIRECTORIES {
+            return Err(NetError::Ftp(
+                "remote folder exceeds recursive-delete safety limits".into(),
+            ));
+        }
+        let child = join_remote_path(path, &entry.name);
+        if entry.is_dir {
+            collect_delete_tree(connection, &child, out, depth + 1, directories)?;
+        } else {
+            out.push((child, false));
+        }
+    }
+    out.push((path.to_string(), true));
+    Ok(())
 }
 
 /// Delete a remote file (DELE) or an empty remote directory (RMD). A non-empty directory
-/// will fail with a server error — callers should walk + delete contents first if needed.
+/// is preflighted recursively and then removed deepest-first.
 pub fn delete(
     spec: &ConnectionSpec,
     password: &str,
@@ -830,20 +1023,95 @@ pub fn delete(
 ) -> Result<(), NetError> {
     validate_ftp_path(remote_path)?; // NETW-4
     let mut c = connect(spec, password)?;
-    let r = if is_dir {
-        c.remove_dir(remote_path)
-    } else {
-        c.remove_file(remote_path)
-    };
-    r.map_err(NetError::from_ftp)?;
+    let result: Result<(), NetError> = (|| {
+        if is_dir {
+            let mut paths = Vec::new();
+            let mut directories = 0;
+            collect_delete_tree(c.as_mut(), remote_path, &mut paths, 0, &mut directories)?;
+            paths.into_iter().try_for_each(|(path, directory)| {
+                if directory {
+                    c.remove_dir(&path)
+                } else {
+                    c.remove_file(&path)
+                }
+                .map_err(NetError::from_ftp)
+            })
+        } else {
+            c.remove_file(remote_path).map_err(NetError::from_ftp)
+        }
+    })();
     let _ = c.quit();
-    Ok(())
+    result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::{ConnectionId, Protocol};
+    use std::sync::Arc;
+
+    struct NoRemoteTouch {
+        put_called: Arc<AtomicBool>,
+    }
+
+    impl FtpConn for NoRemoteTouch {
+        fn cwd(&mut self, _path: &str) -> Result<(), FtpError> {
+            panic!("remote connection must not be touched")
+        }
+
+        fn list_bounded(&mut self, _path: Option<&str>) -> Result<Listing, FtpError> {
+            panic!("remote connection must not be touched")
+        }
+
+        fn make_dir(&mut self, _path: &str) -> Result<(), FtpError> {
+            panic!("remote connection must not be touched")
+        }
+
+        fn remove_file(&mut self, _path: &str) -> Result<(), FtpError> {
+            panic!("remote connection must not be touched")
+        }
+
+        fn remove_dir(&mut self, _path: &str) -> Result<(), FtpError> {
+            panic!("remote connection must not be touched")
+        }
+
+        fn rename_path(&mut self, _from: &str, _to: &str) -> Result<(), FtpError> {
+            panic!("remote connection must not be touched")
+        }
+
+        fn chmod(&mut self, _path: &str, _mode: u32) -> Result<(), FtpError> {
+            panic!("remote connection must not be touched")
+        }
+
+        fn quit(&mut self) -> Result<(), FtpError> {
+            Ok(())
+        }
+
+        fn retr_stream(&mut self, _path: &str) -> Result<Box<dyn Read>, FtpError> {
+            panic!("remote connection must not be touched")
+        }
+
+        fn finalize_retr(&mut self, _stream: Box<dyn Read>) -> Result<(), FtpError> {
+            panic!("remote connection must not be touched")
+        }
+
+        fn resume_transfer(&mut self, _offset: usize) -> Result<(), FtpError> {
+            panic!("remote connection must not be touched")
+        }
+
+        fn put_stream(&mut self, _path: &str) -> Result<Box<dyn Write>, FtpError> {
+            self.put_called.store(true, Ordering::Relaxed);
+            panic!("STOR must not run for an unreadable local source")
+        }
+
+        fn finalize_put(&mut self, _writer: Box<dyn Write>) -> Result<(), FtpError> {
+            panic!("remote connection must not be touched")
+        }
+
+        fn is_plaintext(&self) -> bool {
+            false
+        }
+    }
 
     fn spec(allow_plaintext_ftp: bool) -> ConnectionSpec {
         ConnectionSpec {
@@ -856,6 +1124,8 @@ mod tests {
             initial_path: String::new(),
             allow_plaintext_ftp,
             accept_invalid_tls: false,
+            sftp_auth: Default::default(),
+            sftp_private_key: None,
         }
     }
 
@@ -866,6 +1136,26 @@ mod tests {
         // This is deliberately not global state: approving one legacy server cannot enable a
         // downgrade for another server in the same process.
         assert!(!allow_plaintext_ftp(&spec(false)));
+    }
+
+    #[test]
+    fn upload_checks_local_source_before_remote_stor() {
+        let put_called = Arc::new(AtomicBool::new(false));
+        let mut session = TransferSession {
+            connection: Box::new(NoRemoteTouch {
+                put_called: put_called.clone(),
+            }),
+        };
+        let missing = std::env::temp_dir().join(format!(
+            "gmacftp-definitely-missing-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+
+        assert!(session
+            .upload(&missing, "/destination.bin", |_| {}, None)
+            .is_err());
+        assert!(!put_called.load(Ordering::Relaxed));
     }
 
     #[test]
@@ -916,15 +1206,5 @@ mod tests {
             Err(FtpError::ConnectionError(error))
                 if error.kind() == std::io::ErrorKind::TimedOut
         ));
-    }
-
-    #[test]
-    fn download_temp_name_is_unique_and_does_not_claim_dot_part() {
-        let destination = std::path::Path::new("/tmp/report.pdf");
-        let first = part_path_with_nonce(destination, 42, 1);
-        let second = part_path_with_nonce(destination, 42, 2);
-        assert_ne!(first, second);
-        assert_ne!(first, std::path::PathBuf::from("/tmp/report.pdf.part"));
-        assert_eq!(first.file_name().unwrap(), ".report.pdf.gmacftp-42-1.part");
     }
 }

@@ -16,7 +16,7 @@ files — quickly and safely.
 
 ## ⬇️ Download & install
 
-**[↓ Download gmacFTP for Mac — gmacFTP-0.0.20.dmg](https://github.com/GMAC-pl/gmacftp/releases/download/v0.0.20/gmacFTP-0.0.20.dmg)** · macOS 11+, Apple Silicon (M-series)
+**[↓ Download gmacFTP for Mac — gmacFTP-0.1.0.dmg](https://github.com/GMAC-pl/gmacftp/releases/download/v0.1.0/gmacFTP-0.1.0.dmg)** · macOS 11+, Apple Silicon (M-series)
 
 1. Download the `.dmg`.
 2. Open it and **drag gmacFTP into the Applications folder** (a shortcut is inside).
@@ -54,17 +54,21 @@ Signed with an **Apple Developer ID** and **notarized by Apple** — opens clean
 
 ### Download
 
-**[⬇ gmacFTP-0.0.20.dmg](https://github.com/GMAC-pl/gmacftp/releases/download/v0.0.20/gmacFTP-0.0.20.dmg)** — install steps are at the top of this page.
+**[⬇ gmacFTP-0.1.0.dmg](https://github.com/GMAC-pl/gmacftp/releases/download/v0.1.0/gmacFTP-0.1.0.dmg)** — install steps are at the top of this page.
 
 Prefer to build it yourself? See [Build](#build).
 
 ### Features
 
 - **Dual-pane** browser — independent left/right panes (local, remote, or two servers at once)
-- **FTP**, **explicit-TLS FTPS**, and **SFTP** (pure-Rust SSH stack)
-- Upload / download / pane-to-pane transfers + a live **transfer queue**
+- **FTP**, **explicit-TLS FTPS**, and **SFTP** (pure-Rust SSH stack; password, private key, or SSH Agent)
+- Pipelined SFTP, reused per-server sessions, parallel endpoints, and a live **transfer queue**
+- Resumable downloads plus per-file cancel and resume/retry controls
 - Finder-style multi-selection: **Command-A**, **Shift-click**, and **Command-click** for mixed file/folder batches
 - Batch error recovery: skip a failed/locked file and continue, or stop only that copy batch
+- Create folders, rename, recursively delete, and edit Unix permissions locally or remotely
+- Open a remote file in its default macOS editor with concurrent-change protection
+- One-way **folder sync** with exclusions, mandatory dry-run, revalidation, and no automatic deletion
 - **macOS Keychain** secret storage (master key never on disk)
 - Optional **iCloud sync** of saved servers across your Macs (toggle in the app menu; if two Macs edit at once, the newest change wins)
 - Connection manager, FileZilla `sitemanager.xml` + JSON import
@@ -125,8 +129,8 @@ More in [`docs/PRIVACY.md`](docs/PRIVACY.md) and [`SECURITY.md`](SECURITY.md).
 
 ### Status
 
-gmacFTP is a **development preview (pre-1.0)**. Near-term: more automated UI coverage and hardened
-import/migration.
+gmacFTP is a **development preview (pre-1.0)**. Version 0.1 adds the complete everyday file and
+transfer workflow; feedback now focuses on compatibility and UI polish before 1.0.
 
 ### Support gmacFTP
 
@@ -180,7 +184,7 @@ która po prostu przenosi Twoje pliki — szybko i bezpiecznie.
 
 ### Pobranie i instalacja
 
-**[⬇ Pobierz gmacFTP dla Maca — gmacFTP-0.0.20.dmg](https://github.com/GMAC-pl/gmacftp/releases/download/v0.0.20/gmacFTP-0.0.20.dmg)** · macOS 11+, Apple Silicon (M-series)
+**[⬇ Pobierz gmacFTP dla Maca — gmacFTP-0.1.0.dmg](https://github.com/GMAC-pl/gmacftp/releases/download/v0.1.0/gmacFTP-0.1.0.dmg)** · macOS 11+, Apple Silicon (M-series)
 
 1. Pobierz plik `.dmg`.
 2. Otwórz go i **przeciągnij gmacFTP do folderu Aplikacje** (skrót jest w środku).
@@ -199,10 +203,14 @@ Podpisana **Apple Developer ID** i **zanotaryzowana przez Apple** — uruchamia 
 ### Funkcje
 
 - **Dwupanelowa** przeglądarka — niezależne panele (lokalny, zdalny albo dwa serwery naraz)
-- **FTP**, **FTPS** (explicit TLS) i **SFTP** (SSH w czystym Ruście)
-- Transfery upload / download / panel-do-panelu + live **kolejka transferów**
+- **FTP**, **FTPS** (explicit TLS) i **SFTP** (SSH w czystym Ruście; hasło, klucz prywatny lub SSH Agent)
+- Potokowe SFTP, współdzielone sesje per serwer, równoległe endpointy i live **kolejka transferów**
+- Wznawianie pobierania oraz anulowanie i ponawianie pojedynczego pliku
 - Zaznaczanie jak w Finderze: **Command-A**, **Shift+klik** i **Command+klik** dla mieszanych partii plików i folderów
 - Obsługa błędów partii: pominięcie uszkodzonego/zablokowanego pliku albo przerwanie tylko tej partii
+- Tworzenie folderów, zmiana nazw, rekursywne usuwanie i edycja uprawnień lokalnie oraz zdalnie
+- Otwieranie zdalnego pliku w domyślnej aplikacji z ochroną przed równoczesną zmianą na serwerze
+- Jednokierunkowa **synchronizacja folderów** z wykluczeniami, obowiązkowym dry-run i bez automatycznego usuwania
 - Sekrety w **macOS Keychain** (klucz główny nigdy na dysku)
 - Opcjonalna **synchronizacja iCloud** zapisanych serwerów między Macami (przełącznik w menu; przy jednoczesnej edycji na dwóch Macach wygrywa najnowsza zmiana)
 - Menedżer połączeń, import z FileZilla `sitemanager.xml` + JSON
@@ -258,7 +266,8 @@ Więcej: [`docs/PRIVACY.md`](docs/PRIVACY.md) oraz [`SECURITY.md`](SECURITY.md).
 
 ### Status
 
-gmacFTP to **wersja rozwojowa (pre-1.0)**. W planach: więcej testów UI i utwardzenie importu/migracji.
+gmacFTP to **wersja rozwojowa (pre-1.0)**. Wersja 0.1 obejmuje kompletny codzienny workflow;
+przed 1.0 skupiamy się na kompatybilności i dopracowaniu UI.
 
 ### Wesprzyj gmacFTP
 

@@ -6,142 +6,361 @@ pub mod progress;
 
 pub use progress::{TransferState, TransferUpdate};
 
-use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 
 use crate::model::{
-    ConnectionId, ConnectionSpec, Protocol, TransferDirection, TransferId, TransferJob,
+    ConnectionId, ConnectionSpec, Protocol, SftpAuth, TransferDirection, TransferId, TransferJob,
 };
 use crate::net::{ftp, sftp};
 use crate::store::{CredentialKey, CredentialStore};
 
-enum Cmd {
-    Run(TransferJob, ConnectionSpec),
+const MAX_QUEUED_TRANSFERS: usize = 8_192;
+pub const MIN_ENDPOINT_CONCURRENCY: usize = crate::store::settings::MIN_TRANSFER_CONCURRENCY;
+pub const MAX_ENDPOINT_CONCURRENCY: usize = crate::store::settings::MAX_TRANSFER_CONCURRENCY;
+pub const DEFAULT_ENDPOINT_CONCURRENCY: usize =
+    crate::store::settings::DEFAULT_TRANSFER_CONCURRENCY;
+const TRANSFER_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+struct QueuedTransfer {
+    job: TransferJob,
+    spec: ConnectionSpec,
+    epoch: u64,
 }
 
-/// `(conn_id, batch_id, cancel_flag)` of the job the worker is currently running.
-type InFlight = (usize, usize, Arc<AtomicBool>);
+enum Cmd {
+    Run(Box<QueuedTransfer>),
+    Abort(ConnectionId),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionIdentity {
+    credential: CredentialKey,
+    allow_plaintext_ftp: bool,
+    accept_invalid_tls: bool,
+    sftp_auth: SftpAuth,
+    sftp_private_key: Option<String>,
+}
+
+impl SessionIdentity {
+    fn for_spec(spec: &ConnectionSpec) -> Result<Self, crate::store::CredentialError> {
+        Ok(Self {
+            credential: CredentialKey::for_spec(spec)?,
+            allow_plaintext_ftp: spec.allow_plaintext_ftp,
+            accept_invalid_tls: spec.accept_invalid_tls,
+            sftp_auth: spec.sftp_auth,
+            sftp_private_key: spec.sftp_private_key.clone(),
+        })
+    }
+}
+
+enum ActiveTransferSession {
+    Ftp(SessionIdentity, ftp::TransferSession),
+    Sftp(SessionIdentity, sftp::TransferSession),
+}
+
+impl ActiveTransferSession {
+    fn identity(&self) -> &SessionIdentity {
+        match self {
+            Self::Ftp(identity, _) | Self::Sftp(identity, _) => identity,
+        }
+    }
+
+    async fn close(self) {
+        match self {
+            Self::Ftp(_, session) => {
+                let _ = tokio::task::spawn_blocking(move || session.close()).await;
+            }
+            Self::Sftp(_, session) => session.close("transfer-session-closed").await,
+        }
+    }
+}
+
+/// `(job_id, batch_id, cancel_flag)` of one endpoint worker's currently running job.
+type InFlight = (TransferId, usize, Arc<AtomicBool>);
+
+enum JobOutcome {
+    Done,
+    Failed(String),
+    Suppressed,
+}
+
+#[derive(Default)]
+struct FailureDecisions {
+    values: Mutex<HashMap<usize, bool>>,
+    notify: Notify,
+}
+
+impl FailureDecisions {
+    fn resolve(&self, batch_id: usize, should_continue: bool) {
+        if let Ok(mut values) = self.values.lock() {
+            values.insert(batch_id, should_continue);
+        }
+        self.notify.notify_waiters();
+    }
+
+    async fn wait(&self, batch_id: usize) -> bool {
+        loop {
+            // Register before checking the map so a decision arriving between the check and await
+            // cannot be lost.
+            let notified = self.notify.notified();
+            if let Ok(mut values) = self.values.lock() {
+                if let Some(decision) = values.remove(&batch_id) {
+                    return decision;
+                }
+            }
+            notified.await;
+        }
+    }
+}
+
+struct OutstandingGuard(Arc<AtomicUsize>);
+
+impl Drop for OutstandingGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+struct EndpointLimiter {
+    limit: AtomicUsize,
+    active: AtomicUsize,
+    notify: Notify,
+}
+
+impl EndpointLimiter {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit: AtomicUsize::new(
+                limit.clamp(MIN_ENDPOINT_CONCURRENCY, MAX_ENDPOINT_CONCURRENCY),
+            ),
+            active: AtomicUsize::new(0),
+            notify: Notify::new(),
+        }
+    }
+
+    fn set_limit(&self, limit: usize) -> usize {
+        let limit = limit.clamp(MIN_ENDPOINT_CONCURRENCY, MAX_ENDPOINT_CONCURRENCY);
+        self.limit.store(limit, Ordering::Relaxed);
+        self.notify.notify_waiters();
+        limit
+    }
+
+    async fn acquire(self: &Arc<Self>) -> EndpointPermit {
+        loop {
+            let notified = self.notify.notified();
+            let active = self.active.load(Ordering::Relaxed);
+            let limit = self.limit.load(Ordering::Relaxed);
+            if active < limit
+                && self
+                    .active
+                    .compare_exchange_weak(active, active + 1, Ordering::Acquire, Ordering::Relaxed)
+                    .is_ok()
+            {
+                return EndpointPermit(self.clone());
+            }
+            notified.await;
+        }
+    }
+}
+
+struct EndpointPermit(Arc<EndpointLimiter>);
+
+impl Drop for EndpointPermit {
+    fn drop(&mut self) {
+        self.0.active.fetch_sub(1, Ordering::Release);
+        self.0.notify.notify_one();
+    }
+}
+
+#[derive(Clone)]
+struct EndpointWorkerContext {
+    store: Arc<dyn CredentialStore>,
+    updates: mpsc::Sender<TransferUpdate>,
+    connection_epochs: Arc<Mutex<HashMap<usize, u64>>>,
+    current: Arc<Mutex<HashMap<usize, InFlight>>>,
+    paused: Arc<AtomicBool>,
+    failure_decisions: Arc<FailureDecisions>,
+    stopped_batches: Arc<Mutex<HashSet<usize>>>,
+    cancelled_jobs: Arc<Mutex<HashSet<usize>>>,
+    outstanding: Arc<AtomicUsize>,
+    endpoint_limiter: Arc<EndpointLimiter>,
+}
 
 /// `try_enqueue` rejection reason: the bounded worker channel was full, so the job was NOT
 /// accepted (it must be marked failed by the caller rather than left on "queued" forever).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QueueFull;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryError {
+    NotFound,
+    QueueFull,
+}
+
 /// Owns the queue. Cheap to clone-share via the returned handle.
 #[derive(Clone)]
 pub struct TransferEngine {
     tx: mpsc::Sender<Cmd>,
-    /// Connection ids whose pending jobs should be skipped (set by `abort(conn_id)` on
-    /// disconnect). Scoped per-connection so ejecting ONE server no longer cancels the
-    /// transfers of every other session. Cleared for a conn when a new job for it is
-    /// enqueued, so reconnecting the same server resumes its transfers.
-    aborted_conns: Arc<Mutex<HashSet<usize>>>,
-    /// The currently in-flight job's `(conn_id, cancel_flag)`. `abort(conn_id)` sets the flag
-    /// when it matches, so the orphan's terminal update is suppressed — independent of the
-    /// pending-skip set, which avoids the abort/re-enqueue race the global flag had.
-    current: Arc<Mutex<Option<InFlight>>>,
+    /// Disconnect increments one endpoint's epoch. Already queued jobs carry the previous value
+    /// and can never resume accidentally if the user reconnects quickly.
+    connection_epochs: Arc<Mutex<HashMap<usize, u64>>>,
+    /// One in-flight job per endpoint. Separate workers allow unrelated servers to progress in
+    /// parallel while preserving ordered, session-reusing transfers on each individual server.
+    current: Arc<Mutex<HashMap<usize, InFlight>>>,
     /// Pause-all toggle (transfer panel): when set, the worker holds a freshly dequeued job
     /// without starting it until cleared. An in-flight transfer finishes normally first.
     paused: Arc<AtomicBool>,
-    /// User decision for a batch paused after a failed file: true=skip/continue, false=stop batch.
-    failure_decision: mpsc::UnboundedSender<(usize, bool)>,
+    /// User decisions are shared because any endpoint worker may be waiting for its batch.
+    failure_decisions: Arc<FailureDecisions>,
+    /// The dispatcher drains quickly into endpoint queues, so a separate global counter keeps the
+    /// original hard memory bound meaningful.
+    outstanding: Arc<AtomicUsize>,
+    endpoint_limiter: Arc<EndpointLimiter>,
+    cancelled_jobs: Arc<Mutex<HashSet<usize>>>,
+    jobs: Arc<Mutex<HashMap<usize, (TransferJob, ConnectionSpec)>>>,
+    retry_sequence: Arc<AtomicUsize>,
 }
 
 impl TransferEngine {
-    /// Spawn the worker. Must be called from within a Tokio runtime.
+    /// Spawn the dispatcher and endpoint workers. Must be called from within a Tokio runtime.
     /// `updates` is where progress/final events land — the UI reads the other end.
     pub fn start(store: Arc<dyn CredentialStore>, updates: mpsc::Sender<TransferUpdate>) -> Self {
-        // CONC-1: capacity large enough that a folder transfer (one Cmd per file) plus any
-        // in-flight single-file job never overflows try_send. 8192 covers large folders (a web
-        // build with thousands of hashed assets); a Cmd is ~200 bytes so the buffer is ~1.6 MB.
-        let (tx, mut rx) = mpsc::channel::<Cmd>(8192);
-        let (failure_decision, mut failure_rx) = mpsc::unbounded_channel::<(usize, bool)>();
-        let aborted_conns: Arc<Mutex<HashSet<usize>>> = Arc::new(Mutex::new(HashSet::new()));
-        let current: Arc<Mutex<Option<InFlight>>> = Arc::new(Mutex::new(None));
+        let (tx, mut rx) = mpsc::channel::<Cmd>(MAX_QUEUED_TRANSFERS);
+        let connection_epochs = Arc::new(Mutex::new(HashMap::new()));
+        let current = Arc::new(Mutex::new(HashMap::new()));
         let paused = Arc::new(AtomicBool::new(false));
-        let (aborted_w, current_w, paused_w) =
-            (aborted_conns.clone(), current.clone(), paused.clone());
+        let failure_decisions = Arc::new(FailureDecisions::default());
+        let stopped_batches = Arc::new(Mutex::new(HashSet::new()));
+        let cancelled_jobs = Arc::new(Mutex::new(HashSet::new()));
+        let jobs = Arc::new(Mutex::new(HashMap::new()));
+        let retry_sequence = Arc::new(AtomicUsize::new(0));
+        let outstanding = Arc::new(AtomicUsize::new(0));
+        let endpoint_limiter = Arc::new(EndpointLimiter::new(
+            crate::store::settings::load().transfer_concurrency,
+        ));
+        let worker_context = EndpointWorkerContext {
+            store,
+            updates: updates.clone(),
+            connection_epochs: connection_epochs.clone(),
+            current: current.clone(),
+            paused: paused.clone(),
+            failure_decisions: failure_decisions.clone(),
+            stopped_batches,
+            cancelled_jobs: cancelled_jobs.clone(),
+            outstanding: outstanding.clone(),
+            endpoint_limiter: endpoint_limiter.clone(),
+        };
         tokio::spawn(async move {
-            let mut stopped_batches = HashSet::new();
-            while let Some(Cmd::Run(job, spec)) = rx.recv().await {
-                // Pause-all: hold the dequeued job without starting it until cleared.
-                while paused_w.load(Ordering::Relaxed) {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
-                let cid = spec.id.0;
-                if stopped_batches.contains(&job.batch_id) {
-                    let _ = updates
-                        .send(TransferUpdate {
-                            id: job.id,
-                            batch_id: job.batch_id,
-                            requires_decision: false,
-                            bytes_done: 0,
-                            bytes_total: job.bytes_total,
-                            state: TransferState::Skipped(
-                                "batch stopped after an earlier file error".into(),
-                            ),
-                        })
-                        .await;
-                    continue;
-                }
-                // Skip jobs whose connection was disconnected while still queued.
-                let skipped = aborted_w.lock().map(|g| g.contains(&cid)).unwrap_or(false);
-                if skipped {
-                    continue;
-                }
-                // Run with a fresh per-job cancel flag, remembered as the in-flight job.
-                let flag = Arc::new(AtomicBool::new(false));
-                if let Ok(mut g) = current_w.lock() {
-                    *g = Some((cid, job.batch_id, flag.clone()));
-                }
-                let batch_id = job.batch_id;
-                let pause_on_error = job.pause_on_error;
-                let failed = run_one(&store, &updates, job, spec, &flag).await;
-                if let Ok(mut g) = current_w.lock() {
-                    *g = None;
-                }
-                if failed && pause_on_error {
-                    while let Some((decision_batch, should_continue)) = failure_rx.recv().await {
-                        if decision_batch != batch_id {
-                            continue;
-                        }
-                        if !should_continue {
-                            stopped_batches.insert(batch_id);
-                        }
-                        break;
+            let mut workers: HashMap<usize, mpsc::UnboundedSender<Cmd>> = HashMap::new();
+            while let Some(command) = rx.recv().await {
+                let cid = match &command {
+                    Cmd::Run(queued) => queued.spec.id.0,
+                    Cmd::Abort(connection_id) => connection_id.0,
+                };
+                let worker = workers
+                    .entry(cid)
+                    .or_insert_with(|| spawn_endpoint_worker(worker_context.clone()));
+                if let Err(error) = worker.send(command) {
+                    workers.remove(&cid);
+                    if let Cmd::Run(queued) = error.0 {
+                        let job = queued.job;
+                        worker_context.outstanding.fetch_sub(1, Ordering::Relaxed);
+                        let _ = updates
+                            .send(TransferUpdate {
+                                id: job.id,
+                                batch_id: job.batch_id,
+                                requires_decision: job.pause_on_error,
+                                bytes_done: 0,
+                                bytes_total: job.bytes_total,
+                                state: TransferState::Failed(
+                                    "endpoint transfer worker stopped unexpectedly".into(),
+                                ),
+                            })
+                            .await;
                     }
                 }
             }
         });
         Self {
             tx,
-            aborted_conns,
+            connection_epochs,
             current,
             paused,
-            failure_decision,
+            failure_decisions,
+            outstanding,
+            endpoint_limiter,
+            cancelled_jobs,
+            jobs,
+            retry_sequence,
         }
     }
 
-    /// Sync enqueue — safe to call from a UI callback (no .await). Returns Err(()) only
-    /// if the worker channel is full (the job was not accepted). A fresh job for a connection
-    /// clears any stale per-conn abort for it (reconnect resumes transfers). This does NOT
-    /// touch an in-flight orphan's per-job flag, so there is no abort/re-enqueue race.
+    fn reserve_queue_slot(&self) -> bool {
+        self.outstanding
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                (count < MAX_QUEUED_TRANSFERS).then_some(count + 1)
+            })
+            .is_ok()
+    }
+
+    fn connection_epoch(&self, connection_id: ConnectionId) -> u64 {
+        self.connection_epochs
+            .lock()
+            .ok()
+            .and_then(|epochs| epochs.get(&connection_id.0).copied())
+            .unwrap_or(0)
+    }
+
+    /// Sync enqueue — safe to call from a UI callback (no .await). The global counter preserves
+    /// the 8192-job memory bound even though the dispatcher has independent endpoint queues.
     pub fn try_enqueue(&self, job: TransferJob, spec: ConnectionSpec) -> Result<(), QueueFull> {
-        if let Ok(mut g) = self.aborted_conns.lock() {
-            g.remove(&spec.id.0);
+        if !self.reserve_queue_slot() {
+            return Err(QueueFull);
         }
-        self.tx.try_send(Cmd::Run(job, spec)).map_err(|_| QueueFull)
+        let job_id = job.id.0;
+        if let Ok(mut jobs) = self.jobs.lock() {
+            jobs.insert(job_id, (job.clone(), spec.clone()));
+        }
+        let epoch = self.connection_epoch(spec.id);
+        if self
+            .tx
+            .try_send(Cmd::Run(Box::new(QueuedTransfer { job, spec, epoch })))
+            .is_err()
+        {
+            self.outstanding.fetch_sub(1, Ordering::Relaxed);
+            if let Ok(mut jobs) = self.jobs.lock() {
+                jobs.remove(&job_id);
+            }
+            return Err(QueueFull);
+        }
+        Ok(())
     }
 
     pub async fn enqueue(&self, job: TransferJob, spec: ConnectionSpec) {
-        if let Ok(mut g) = self.aborted_conns.lock() {
-            g.remove(&spec.id.0);
+        while !self.reserve_queue_slot() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        let _ = self.tx.send(Cmd::Run(job, spec)).await;
+        let job_id = job.id.0;
+        if let Ok(mut jobs) = self.jobs.lock() {
+            jobs.insert(job_id, (job.clone(), spec.clone()));
+        }
+        let epoch = self.connection_epoch(spec.id);
+        if self
+            .tx
+            .send(Cmd::Run(Box::new(QueuedTransfer { job, spec, epoch })))
+            .await
+            .is_err()
+        {
+            self.outstanding.fetch_sub(1, Ordering::Relaxed);
+            if let Ok(mut jobs) = self.jobs.lock() {
+                jobs.remove(&job_id);
+            }
+        }
     }
 
     /// Abort a single connection's transfers: its pending jobs are skipped, and its in-flight
@@ -149,17 +368,17 @@ impl TransferEngine {
     /// surfaces as a confusing "Operation timed out"). Other sessions are left untouched.
     pub fn abort(&self, conn_id: ConnectionId) {
         let cid = conn_id.0;
-        if let Ok(mut g) = self.aborted_conns.lock() {
-            g.insert(cid);
+        if let Ok(mut epochs) = self.connection_epochs.lock() {
+            let epoch = epochs.entry(cid).or_default();
+            *epoch = epoch.saturating_add(1);
         }
         if let Ok(g) = self.current.lock() {
-            if let Some((c, batch_id, flag)) = g.as_ref() {
-                if *c == cid {
-                    flag.store(true, Ordering::Relaxed);
-                    let _ = self.failure_decision.send((*batch_id, false));
-                }
+            if let Some((_, batch_id, flag)) = g.get(&cid) {
+                flag.store(true, Ordering::Relaxed);
+                self.failure_decisions.resolve(*batch_id, false);
             }
         }
+        let _ = self.tx.try_send(Cmd::Abort(conn_id));
     }
 
     /// Pause/resume dequeue of new transfers (the transfer-panel "Pause all" toggle). An
@@ -168,10 +387,280 @@ impl TransferEngine {
         self.paused.store(paused, Ordering::Relaxed);
     }
 
+    /// Change the number of endpoints allowed to transfer at once. Lowering the value never
+    /// interrupts active files; it takes effect as their permits are released.
+    pub fn set_endpoint_concurrency(&self, limit: usize) -> usize {
+        self.endpoint_limiter.set_limit(limit)
+    }
+
+    pub fn cancel_job(&self, id: TransferId) {
+        if let Ok(mut cancelled) = self.cancelled_jobs.lock() {
+            cancelled.insert(id.0);
+        }
+        if let Ok(current) = self.current.lock() {
+            for (job_id, _, flag) in current.values() {
+                if *job_id == id {
+                    flag.store(true, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
+    pub fn retry_job(&self, id: TransferId) -> Result<(), RetryError> {
+        let (mut job, spec) = self
+            .jobs
+            .lock()
+            .ok()
+            .and_then(|jobs| jobs.get(&id.0).cloned())
+            .ok_or(RetryError::NotFound)?;
+        if !self.reserve_queue_slot() {
+            return Err(RetryError::QueueFull);
+        }
+        if let Ok(mut cancelled) = self.cancelled_jobs.lock() {
+            cancelled.remove(&id.0);
+        }
+        let sequence = self.retry_sequence.fetch_add(1, Ordering::Relaxed);
+        job.batch_id = usize::MAX.saturating_sub(sequence);
+        job.pause_on_error = false;
+        let epoch = self.connection_epoch(spec.id);
+        if self
+            .tx
+            .try_send(Cmd::Run(Box::new(QueuedTransfer { job, spec, epoch })))
+            .is_err()
+        {
+            self.outstanding.fetch_sub(1, Ordering::Relaxed);
+            return Err(RetryError::QueueFull);
+        }
+        Ok(())
+    }
+
+    pub fn forget_job(&self, id: TransferId) {
+        let removed = self
+            .jobs
+            .lock()
+            .ok()
+            .and_then(|mut jobs| jobs.remove(&id.0));
+        if let Some((job, _)) = removed {
+            if job.direction == TransferDirection::Download && job.resume_token != 0 {
+                crate::net::discard_download_fragment(
+                    std::path::Path::new(&job.local_path),
+                    job.resume_token,
+                );
+            }
+        }
+        if let Ok(mut cancelled) = self.cancelled_jobs.lock() {
+            cancelled.remove(&id.0);
+        }
+    }
+
     /// Resolve the modal shown after one file in a multi-file batch fails.
     pub fn resolve_batch_failure(&self, batch_id: usize, should_continue: bool) {
-        let _ = self.failure_decision.send((batch_id, should_continue));
+        self.failure_decisions.resolve(batch_id, should_continue);
     }
+}
+
+fn connection_epoch_is_current(
+    epochs: &Mutex<HashMap<usize, u64>>,
+    connection_id: usize,
+    expected: u64,
+) -> bool {
+    epochs
+        .lock()
+        .map(|epochs| epochs.get(&connection_id).copied().unwrap_or(0) == expected)
+        .unwrap_or(false)
+}
+
+async fn report_skipped(
+    updates: &mpsc::Sender<TransferUpdate>,
+    job: &TransferJob,
+    reason: &'static str,
+) {
+    let _ = updates
+        .send(TransferUpdate {
+            id: job.id,
+            batch_id: job.batch_id,
+            requires_decision: false,
+            bytes_done: 0,
+            bytes_total: job.bytes_total,
+            state: TransferState::Skipped(reason.into()),
+        })
+        .await;
+}
+
+fn take_cancelled(cancelled_jobs: &Mutex<HashSet<usize>>, id: TransferId) -> bool {
+    cancelled_jobs
+        .lock()
+        .map(|mut cancelled| cancelled.remove(&id.0))
+        .unwrap_or(false)
+}
+
+async fn report_cancelled(updates: &mpsc::Sender<TransferUpdate>, job: &TransferJob) {
+    let _ = updates
+        .send(TransferUpdate {
+            id: job.id,
+            batch_id: job.batch_id,
+            requires_decision: false,
+            bytes_done: 0,
+            bytes_total: job.bytes_total,
+            state: TransferState::Cancelled,
+        })
+        .await;
+}
+
+fn spawn_endpoint_worker(context: EndpointWorkerContext) -> mpsc::UnboundedSender<Cmd> {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        let mut active_session: Option<ActiveTransferSession> = None;
+        loop {
+            let command = if active_session.is_some() {
+                match tokio::time::timeout(TRANSFER_SESSION_IDLE_TIMEOUT, rx.recv()).await {
+                    Ok(command) => command,
+                    Err(_) => {
+                        if let Some(session) = active_session.take() {
+                            session.close().await;
+                        }
+                        continue;
+                    }
+                }
+            } else {
+                rx.recv().await
+            };
+            let Some(command) = command else {
+                break;
+            };
+
+            let (job, spec, epoch) = match command {
+                Cmd::Abort(_) => {
+                    if let Some(session) = active_session.take() {
+                        session.close().await;
+                    }
+                    continue;
+                }
+                Cmd::Run(queued) => (queued.job, queued.spec, queued.epoch),
+            };
+            let _outstanding = OutstandingGuard(context.outstanding.clone());
+            let connection_id = spec.id.0;
+
+            if take_cancelled(&context.cancelled_jobs, job.id) {
+                report_cancelled(&context.updates, &job).await;
+                continue;
+            }
+
+            let batch_stopped = context
+                .stopped_batches
+                .lock()
+                .map(|stopped| stopped.contains(&job.batch_id))
+                .unwrap_or(true);
+            if batch_stopped {
+                report_skipped(
+                    &context.updates,
+                    &job,
+                    "batch stopped after an earlier file error",
+                )
+                .await;
+                continue;
+            }
+
+            if !connection_epoch_is_current(&context.connection_epochs, connection_id, epoch) {
+                if let Some(session) = active_session.take() {
+                    session.close().await;
+                }
+                report_skipped(&context.updates, &job, "connection was disconnected").await;
+                continue;
+            }
+
+            // Pause-all holds only jobs that have not started. Other endpoint workers and an
+            // already active operation are unaffected until their current file completes.
+            while context.paused.load(Ordering::Relaxed) {
+                if !connection_epoch_is_current(&context.connection_epochs, connection_id, epoch) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            if !connection_epoch_is_current(&context.connection_epochs, connection_id, epoch) {
+                if let Some(session) = active_session.take() {
+                    session.close().await;
+                }
+                report_skipped(&context.updates, &job, "connection was disconnected").await;
+                continue;
+            }
+
+            let permit = context.endpoint_limiter.acquire().await;
+            // An abort can arrive while this endpoint waits for the global concurrency slot.
+            if !connection_epoch_is_current(&context.connection_epochs, connection_id, epoch) {
+                drop(permit);
+                if let Some(session) = active_session.take() {
+                    session.close().await;
+                }
+                report_skipped(&context.updates, &job, "connection was disconnected").await;
+                continue;
+            }
+            if take_cancelled(&context.cancelled_jobs, job.id) {
+                drop(permit);
+                report_cancelled(&context.updates, &job).await;
+                continue;
+            }
+
+            let flag = Arc::new(AtomicBool::new(false));
+            if let Ok(mut current) = context.current.lock() {
+                current.insert(connection_id, (job.id, job.batch_id, flag.clone()));
+            }
+            let job_for_update = job.clone();
+            let batch_id = job.batch_id;
+            let pause_on_error = job.pause_on_error;
+            let outcome = run_one(
+                &context.store,
+                &context.updates,
+                job,
+                spec,
+                &flag,
+                &mut active_session,
+            )
+            .await;
+            if let Ok(mut current) = context.current.lock() {
+                current.remove(&connection_id);
+            }
+            drop(permit);
+
+            let individually_cancelled = take_cancelled(&context.cancelled_jobs, job_for_update.id);
+            let failed = matches!(outcome, JobOutcome::Failed(_)) && !individually_cancelled;
+            if individually_cancelled {
+                report_cancelled(&context.updates, &job_for_update).await;
+            } else {
+                let state = match outcome {
+                    JobOutcome::Done => Some(TransferState::Done),
+                    JobOutcome::Failed(error) => Some(TransferState::Failed(error)),
+                    JobOutcome::Suppressed => None,
+                };
+                if let Some(state) = state {
+                    let _ = context
+                        .updates
+                        .send(TransferUpdate {
+                            id: job_for_update.id,
+                            batch_id,
+                            requires_decision: failed && pause_on_error,
+                            bytes_done: 0,
+                            bytes_total: job_for_update.bytes_total,
+                            state,
+                        })
+                        .await;
+                }
+            }
+
+            if failed && pause_on_error {
+                let should_continue = context.failure_decisions.wait(batch_id).await;
+                if !should_continue {
+                    if let Ok(mut stopped) = context.stopped_batches.lock() {
+                        stopped.insert(batch_id);
+                    }
+                }
+            }
+        }
+        if let Some(session) = active_session.take() {
+            session.close().await;
+        }
+    });
+    tx
 }
 
 async fn run_one(
@@ -180,130 +669,220 @@ async fn run_one(
     job: TransferJob,
     spec: ConnectionSpec,
     flag: &Arc<AtomicBool>,
-) -> bool {
-    let id = job.id;
-    let batch_id = job.batch_id;
-    let pause_on_error = job.pause_on_error;
-    let total = job.bytes_total;
-    let credential_key = match CredentialKey::for_spec(&spec) {
-        Ok(key) => key,
-        Err(error) => {
-            let _ = updates
-                .send(TransferUpdate {
-                    id,
-                    batch_id,
-                    requires_decision: pause_on_error,
-                    bytes_done: 0,
-                    bytes_total: None,
-                    state: TransferState::Failed(error.to_string()),
-                })
-                .await;
-            return true;
-        }
+    active_session: &mut Option<ActiveTransferSession>,
+) -> JobOutcome {
+    let session_identity = match SessionIdentity::for_spec(&spec) {
+        Ok(identity) => identity,
+        Err(error) => return JobOutcome::Failed(error.to_string()),
     };
-    let password = match store.get_for(&credential_key) {
+    let password = match store.get_for(&session_identity.credential) {
         Ok(b) => String::from_utf8_lossy(&b).into_owned(),
-        Err(_) => {
-            let _ = updates
-                .send(TransferUpdate {
-                    id,
-                    batch_id,
-                    requires_decision: pause_on_error,
-                    bytes_done: 0,
-                    bytes_total: None,
-                    state: TransferState::Failed("missing credential".into()),
-                })
-                .await;
-            return true;
+        Err(crate::store::CredentialError::NotFound)
+            if spec.protocol == Protocol::Sftp && spec.sftp_auth != SftpAuth::Password =>
+        {
+            String::new()
         }
+        Err(error) => return JobOutcome::Failed(error.to_string()),
     };
 
-    let result: Result<(), String> = match (job.direction, spec.protocol) {
-        (TransferDirection::Download, Protocol::Ftp) => {
-            let (spec, password, remote, local) = (
-                spec.clone(),
-                password.clone(),
-                job.remote_path.clone(),
-                std::path::PathBuf::from(&job.local_path),
-            );
-            let progress = throttled(updates.clone(), id, batch_id, total);
-            let flag = flag.clone(); // Arc clone for the 'static spawn_blocking closure (M1)
-            tokio::task::spawn_blocking(move || {
-                ftp::download(&spec, &password, &remote, &local, progress, Some(&*flag))
-            })
-            .await
-            .map_err(|e| e.to_string())
-            .and_then(|r| r.map(|_| ()).map_err(|e| e.to_string()))
+    if active_session
+        .as_ref()
+        .is_some_and(|session| session.identity() != &session_identity)
+    {
+        if let Some(session) = active_session.take() {
+            session.close().await;
         }
-        (TransferDirection::Upload, Protocol::Ftp) => {
-            let (spec, password, remote, local) = (
-                spec.clone(),
-                password.clone(),
-                job.remote_path.clone(),
-                std::path::PathBuf::from(&job.local_path),
-            );
-            let progress = throttled(updates.clone(), id, batch_id, total);
-            let flag = flag.clone(); // M1
-            tokio::task::spawn_blocking(move || {
-                ftp::upload(&spec, &password, &local, &remote, progress, Some(&*flag))
-            })
-            .await
-            .map_err(|e| e.to_string())
-            .and_then(|r| r.map(|_| ()).map_err(|e| e.to_string()))
-        }
-        (TransferDirection::Download, Protocol::Sftp) => {
-            let progress = throttled(updates.clone(), id, batch_id, total);
-            let local = std::path::PathBuf::from(&job.local_path);
-            sftp::download(
-                &spec,
-                &password,
-                &job.remote_path,
-                &local,
-                progress,
-                Some(&**flag),
+    }
+
+    let result = match spec.protocol {
+        Protocol::Ftp => {
+            run_ftp_job(
+                active_session,
+                session_identity,
+                spec,
+                password,
+                &job,
+                updates,
+                flag,
             )
             .await
-            .map(|_| ())
-            .map_err(|e| e.to_string())
         }
-        (TransferDirection::Upload, Protocol::Sftp) => {
-            let progress = throttled(updates.clone(), id, batch_id, total);
-            let local = std::path::PathBuf::from(&job.local_path);
-            sftp::upload(
-                &spec,
-                &password,
-                &local,
-                &job.remote_path,
-                progress,
-                Some(&**flag),
+        Protocol::Sftp => {
+            run_sftp_job(
+                active_session,
+                session_identity,
+                spec,
+                password,
+                &job,
+                updates,
+                flag,
             )
             .await
-            .map(|_| ())
-            .map_err(|e| e.to_string())
         }
-    };
+    }
+    .map_err(|error| error.to_string());
 
     // After this job's connection was disconnected (abort), don't surface the orphaned
     // outcome — it would read as a confusing "transfer complete" / "Operation timed out"
     // over a dead session. `flag` is this job's own cancel flag (set by abort(conn_id)).
     if flag.load(Ordering::Relaxed) {
-        return false;
+        return JobOutcome::Suppressed;
     }
-    let failed = result.is_err();
-    let _ = updates
-        .send(TransferUpdate {
-            id,
-            batch_id,
-            requires_decision: failed && pause_on_error,
-            bytes_done: 0,
-            bytes_total: total,
-            state: match result {
-                Ok(()) => TransferState::Done,
-                Err(e) => TransferState::Failed(e),
+    match result {
+        Ok(()) => JobOutcome::Done,
+        Err(error) => JobOutcome::Failed(error),
+    }
+}
+
+async fn run_ftp_job(
+    active_session: &mut Option<ActiveTransferSession>,
+    identity: SessionIdentity,
+    spec: ConnectionSpec,
+    password: String,
+    job: &TransferJob,
+    updates: &mpsc::Sender<TransferUpdate>,
+    flag: &Arc<AtomicBool>,
+) -> Result<(), crate::net::NetError> {
+    let existing = match active_session.take() {
+        Some(ActiveTransferSession::Ftp(existing_identity, session))
+            if existing_identity == identity =>
+        {
+            Some(session)
+        }
+        Some(other) => {
+            other.close().await;
+            None
+        }
+        None => None,
+    };
+    let reused = existing.is_some();
+    let direction = job.direction;
+    let local = std::path::PathBuf::from(&job.local_path);
+    let remote = job.remote_path.clone();
+    let resume = (direction == TransferDirection::Download && job.resume_token != 0).then_some(
+        crate::net::DownloadResume {
+            token: job.resume_token,
+            expected_total: job.bytes_total,
+        },
+    );
+    let progress = throttled(updates.clone(), job.id, job.batch_id, job.bytes_total);
+    let flag = flag.clone();
+
+    let (session, result) = tokio::task::spawn_blocking(move || {
+        let mut session = match existing {
+            Some(session) => session,
+            None => match ftp::TransferSession::connect(&spec, &password) {
+                Ok(session) => session,
+                Err(error) => return (None, Err(error)),
             },
-        })
-        .await;
-    failed
+        };
+        let transfer = |session: &mut ftp::TransferSession| match direction {
+            TransferDirection::Download => {
+                session.download_resumable(&remote, &local, &progress, Some(&*flag), resume)
+            }
+            TransferDirection::Upload => session.upload(&local, &remote, &progress, Some(&*flag)),
+        };
+        let mut result = transfer(&mut session);
+        if reused && result.is_err() && !flag.load(Ordering::Relaxed) {
+            tracing::debug!(
+                host = %spec.host,
+                "reused FTP session failed; reconnecting once"
+            );
+            session.close();
+            session = match ftp::TransferSession::connect(&spec, &password) {
+                Ok(session) => session,
+                Err(error) => return (None, Err(error)),
+            };
+            result = transfer(&mut session);
+        }
+        if result.is_ok() {
+            (Some(session), result)
+        } else {
+            session.close();
+            (None, result)
+        }
+    })
+    .await
+    .map_err(|error| crate::net::NetError::Join(error.to_string()))?;
+
+    if let Some(session) = session {
+        *active_session = Some(ActiveTransferSession::Ftp(identity, session));
+    }
+    result.map(|_| ())
+}
+
+async fn run_sftp_job(
+    active_session: &mut Option<ActiveTransferSession>,
+    identity: SessionIdentity,
+    spec: ConnectionSpec,
+    password: String,
+    job: &TransferJob,
+    updates: &mpsc::Sender<TransferUpdate>,
+    flag: &Arc<AtomicBool>,
+) -> Result<(), crate::net::NetError> {
+    let existing = match active_session.take() {
+        Some(ActiveTransferSession::Sftp(existing_identity, session))
+            if existing_identity == identity =>
+        {
+            Some(session)
+        }
+        Some(other) => {
+            other.close().await;
+            None
+        }
+        None => None,
+    };
+    let reused = existing.is_some();
+    let mut session = match existing {
+        Some(session) => session,
+        None => sftp::TransferSession::connect(&spec, &password).await?,
+    };
+    let local = std::path::PathBuf::from(&job.local_path);
+    let progress = throttled(updates.clone(), job.id, job.batch_id, job.bytes_total);
+    let mut result = perform_sftp_transfer(&session, job, &local, &progress, flag).await;
+    if reused && result.is_err() && !flag.load(Ordering::Relaxed) {
+        tracing::debug!(
+            host = %spec.host,
+            "reused SFTP session failed; reconnecting once"
+        );
+        session.close("stale-transfer-session").await;
+        session = sftp::TransferSession::connect(&spec, &password).await?;
+        result = perform_sftp_transfer(&session, job, &local, &progress, flag).await;
+    }
+    if result.is_ok() {
+        *active_session = Some(ActiveTransferSession::Sftp(identity, session));
+    } else {
+        session.close("failed-transfer-session").await;
+    }
+    result.map(|_| ())
+}
+
+async fn perform_sftp_transfer<F>(
+    session: &sftp::TransferSession,
+    job: &TransferJob,
+    local: &std::path::Path,
+    progress: &F,
+    flag: &AtomicBool,
+) -> Result<u64, crate::net::NetError>
+where
+    F: Fn(u64) + Send + Sync,
+{
+    match job.direction {
+        TransferDirection::Download => {
+            let resume = (job.resume_token != 0).then_some(crate::net::DownloadResume {
+                token: job.resume_token,
+                expected_total: job.bytes_total,
+            });
+            session
+                .download_resumable(&job.remote_path, local, progress, Some(flag), resume)
+                .await
+        }
+        TransferDirection::Upload => {
+            session
+                .upload(local, &job.remote_path, progress, Some(flag))
+                .await
+        }
+    }
 }
 
 /// Build a progress callback that emits at most ~30×/s to avoid flooding the UI.
@@ -347,6 +926,63 @@ mod batch_failure_tests {
     use super::*;
     use crate::model::{ConnectionId, Protocol};
     use crate::store::memory::InMemoryStore;
+    use crate::store::{CredentialError, CredentialStore};
+    use std::sync::Condvar;
+
+    struct ConcurrentProbeStore {
+        gate: (Mutex<usize>, Condvar),
+        active: AtomicUsize,
+        max_active: AtomicUsize,
+    }
+
+    impl ConcurrentProbeStore {
+        fn new() -> Self {
+            Self {
+                gate: (Mutex::new(0), Condvar::new()),
+                active: AtomicUsize::new(0),
+                max_active: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl CredentialStore for ConcurrentProbeStore {
+        fn get(&self, _host: &str, _user: &str) -> Result<Vec<u8>, CredentialError> {
+            Err(CredentialError::NotFound)
+        }
+
+        fn set(&self, _host: &str, _user: &str, _secret: &[u8]) -> Result<(), CredentialError> {
+            Ok(())
+        }
+
+        fn delete(&self, _host: &str, _user: &str) -> Result<(), CredentialError> {
+            Ok(())
+        }
+
+        fn get_for(&self, _key: &CredentialKey) -> Result<Vec<u8>, CredentialError> {
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_active.fetch_max(active, Ordering::SeqCst);
+            let (lock, ready) = &self.gate;
+            let mut arrived = lock.lock().unwrap();
+            *arrived += 1;
+            if *arrived >= 2 {
+                ready.notify_all();
+            } else {
+                let (guard, _) = ready.wait_timeout(arrived, Duration::from_secs(1)).unwrap();
+                arrived = guard;
+            }
+            drop(arrived);
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            Err(CredentialError::NotFound)
+        }
+
+        fn set_for(&self, _key: &CredentialKey, _secret: &[u8]) -> Result<(), CredentialError> {
+            Ok(())
+        }
+
+        fn delete_for(&self, _key: &CredentialKey) -> Result<(), CredentialError> {
+            Ok(())
+        }
+    }
 
     fn spec() -> ConnectionSpec {
         ConnectionSpec {
@@ -359,6 +995,8 @@ mod batch_failure_tests {
             initial_path: String::new(),
             allow_plaintext_ftp: false,
             accept_invalid_tls: false,
+            sftp_auth: Default::default(),
+            sftp_private_key: None,
         }
     }
 
@@ -371,6 +1009,7 @@ mod batch_failure_tests {
             local_path: "/missing".into(),
             remote_path: "/missing".into(),
             bytes_total: None,
+            resume_token: 0,
         }
     }
 
@@ -407,5 +1046,105 @@ mod batch_failure_tests {
         assert_eq!(next.id, TransferId(2));
         assert!(matches!(next.state, TransferState::Failed(_)));
         assert!(!next.requires_decision);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn different_endpoints_reach_independent_workers_concurrently() {
+        let (updates, mut rx) = mpsc::channel(8);
+        let store = Arc::new(ConcurrentProbeStore::new());
+        let engine = TransferEngine::start(store.clone(), updates);
+        let first = spec();
+        let mut second = spec();
+        second.id = ConnectionId(78);
+        second.host = "other.example.invalid".into();
+
+        engine.enqueue(job(1, 100, false), first).await;
+        engine.enqueue(job(2, 101, false), second).await;
+        for _ in 0..2 {
+            let update = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+                .await
+                .expect("endpoint workers should not block each other")
+                .expect("result");
+            assert!(matches!(update.state, TransferState::Failed(_)));
+        }
+        assert!(store.max_active.load(Ordering::SeqCst) >= 2);
+    }
+
+    #[tokio::test]
+    async fn abort_epoch_skips_old_jobs_but_allows_new_ones() {
+        let (updates, mut rx) = mpsc::channel(8);
+        let engine = TransferEngine::start(Arc::new(InMemoryStore::default()), updates);
+        let connection = spec();
+        engine.set_paused(true);
+        engine.enqueue(job(1, 110, false), connection.clone()).await;
+        engine.abort(connection.id);
+        engine.set_paused(false);
+
+        let old = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(old.state, TransferState::Skipped(_)));
+
+        engine.enqueue(job(2, 111, false), connection).await;
+        let new = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(new.id, TransferId(2));
+        assert!(matches!(new.state, TransferState::Failed(_)));
+    }
+
+    #[tokio::test]
+    async fn individual_cancel_can_be_retried_with_the_same_job_id() {
+        let (updates, mut rx) = mpsc::channel(8);
+        let engine = TransferEngine::start(Arc::new(InMemoryStore::default()), updates);
+        engine.set_paused(true);
+        engine.enqueue(job(9, 120, false), spec()).await;
+        engine.cancel_job(TransferId(9));
+        engine.set_paused(false);
+
+        let cancelled = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cancelled.id, TransferId(9));
+        assert!(matches!(cancelled.state, TransferState::Cancelled));
+
+        engine.retry_job(TransferId(9)).unwrap();
+        let retried = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(retried.id, TransferId(9));
+        assert!(matches!(retried.state, TransferState::Failed(_)));
+
+        engine.forget_job(TransferId(9));
+        assert_eq!(engine.retry_job(TransferId(9)), Err(RetryError::NotFound));
+    }
+
+    #[tokio::test]
+    async fn endpoint_limit_can_grow_without_interrupting_active_permits() {
+        let limiter = Arc::new(EndpointLimiter::new(2));
+        let first = limiter.acquire().await;
+        let second = limiter.acquire().await;
+        let waiting_limiter = limiter.clone();
+        let waiting = tokio::spawn(async move { waiting_limiter.acquire().await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!waiting.is_finished());
+
+        assert_eq!(limiter.set_limit(3), 3);
+        let third = tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(limiter.set_limit(0), MIN_ENDPOINT_CONCURRENCY);
+        drop(first);
+        drop(second);
+        drop(third);
+        let _single = tokio::time::timeout(Duration::from_secs(1), limiter.acquire())
+            .await
+            .unwrap();
     }
 }

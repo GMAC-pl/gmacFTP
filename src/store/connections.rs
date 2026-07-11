@@ -112,6 +112,8 @@ pub fn load_seed(
             initial_path,
             allow_plaintext_ftp: false,
             accept_invalid_tls: false,
+            sftp_auth: Default::default(),
+            sftp_private_key: None,
         });
     }
     Ok(specs)
@@ -196,6 +198,8 @@ pub fn load_filezilla(
             initial_path: String::new(),
             allow_plaintext_ftp: false,
             accept_invalid_tls: false,
+            sftp_auth: Default::default(),
+            sftp_private_key: None,
         });
         idx += 1;
     }
@@ -364,6 +368,11 @@ pub(crate) fn normalize_sync_metadata_bytes(bytes: &[u8]) -> Result<Vec<u8>, Imp
     for spec in &mut specs {
         spec.allow_plaintext_ftp = false;
         spec.accept_invalid_tls = false;
+        // A private-key path describes this Mac's filesystem and can reveal a local account
+        // name. Never put it into the cross-device metadata file. Preserve the auth mode so the
+        // destination Mac asks for its own key path instead of misusing the synced key passphrase
+        // as a server password.
+        spec.sftp_private_key = None;
     }
     serde_json::to_vec_pretty(&specs).map_err(ImportError::Json)
 }
@@ -373,9 +382,23 @@ fn validate_specs(specs: &[ConnectionSpec]) -> Result<(), ImportError> {
         return Err(ImportError::TooLarge);
     }
     for spec in specs {
-        if spec.name.len() > 1024 || spec.initial_path.len() > 4096 {
+        if spec.name.len() > 1024
+            || spec.initial_path.len() > 4096
+            || spec
+                .sftp_private_key
+                .as_ref()
+                .is_some_and(|path| path.len() > 4096 || path.chars().any(char::is_control))
+        {
             return Err(ImportError::Metadata(
                 "connection field exceeds limit".to_string(),
+            ));
+        }
+        if spec.protocol == Protocol::Ftp
+            && (spec.sftp_auth != crate::model::SftpAuth::Password
+                || spec.sftp_private_key.is_some())
+        {
+            return Err(ImportError::Metadata(
+                "FTP connection contains invalid SSH authentication settings".to_string(),
             ));
         }
         CredentialKey::new(spec.protocol, &spec.host, spec.port, &spec.user)
@@ -596,23 +619,27 @@ mod tests {
     }
 
     #[test]
-    fn sync_metadata_clears_transport_security_exceptions() {
+    fn sync_metadata_clears_local_security_state() {
         let specs = vec![ConnectionSpec {
             id: ConnectionId(0),
             name: "legacy".into(),
-            protocol: Protocol::Ftp,
+            protocol: Protocol::Sftp,
             host: "example.com".into(),
-            port: 21,
+            port: 22,
             user: "alice".into(),
             initial_path: String::new(),
             allow_plaintext_ftp: true,
             accept_invalid_tls: true,
+            sftp_auth: crate::model::SftpAuth::PrivateKey,
+            sftp_private_key: Some("/Users/demo/.ssh/id_ed25519".into()),
         }];
         let normalized =
             normalize_sync_metadata_bytes(&serde_json::to_vec(&specs).unwrap()).unwrap();
         let decoded: Vec<ConnectionSpec> = serde_json::from_slice(&normalized).unwrap();
         assert!(!decoded[0].allow_plaintext_ftp);
         assert!(!decoded[0].accept_invalid_tls);
+        assert_eq!(decoded[0].sftp_auth, crate::model::SftpAuth::PrivateKey);
+        assert_eq!(decoded[0].sftp_private_key, None);
     }
 
     #[test]

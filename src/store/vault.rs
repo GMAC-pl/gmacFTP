@@ -1578,6 +1578,8 @@ mod tests {
             initial_path: String::new(),
             allow_plaintext_ftp: false,
             accept_invalid_tls: false,
+            sftp_auth: Default::default(),
+            sftp_private_key: None,
         }
     }
 

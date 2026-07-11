@@ -45,8 +45,10 @@ jobs:
   # on informational warnings. See SECURITY.md for the full classification.
   #
   # Three advisories are ignored (documented + accepted):
-  #   RUSTSEC-2023-0071 — rsa "Marvin Attack" (transitive via russh). No upstream fix. The affected
-  #                       RSA private-key decryption is not used: SFTP supports password auth only.
+  #   RUSTSEC-2023-0071 — rsa "Marvin Attack" (transitive via russh). No upstream fix. gmacFTP
+  #                       rejects built-in RSA private keys before authentication, so this crate
+  #                       performs no remotely observable RSA private operation. RSA through SSH
+  #                       Agent delegates signing to the system agent; host-key use is public-only.
   #   RUSTSEC-2026-0194 — quick-xml duplicated-attribute quadratic (HIGH). Linux-only: pulled by
   #                       Slint's winit wayland-scanner, NOT compiled into the macOS binary
   #                       (cargo tree -i quick-xml --target aarch64-apple-darwin => nothing).

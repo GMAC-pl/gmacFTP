@@ -18,14 +18,18 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
+use futures::stream::{FuturesOrdered, FuturesUnordered};
+use futures::StreamExt;
 use russh_sftp::client::error::Error as SftpError;
 use russh_sftp::client::{Config as SftpConfig, RawSftpSession};
 use russh_sftp::protocol::{FileAttributes, OpenFlags, StatusCode};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
-use crate::model::{ConnectionSpec, RemoteEntry};
+use crate::model::{ConnectionSpec, RemoteEntry, SftpAuth};
 use crate::net::error::{HostKeyChallenge, NetError};
-use crate::net::RemoteTreeStats;
+use crate::net::partial::open_download_part;
+use crate::net::safe::validate_remote_component;
+use crate::net::{DownloadResume, RemoteTreeStats};
 
 const SFTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const SFTP_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(90);
@@ -36,6 +40,9 @@ const SFTP_KEEPALIVE_MAX: usize = 3;
 /// hold an authenticated session indefinitely.
 const SFTP_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 const SFTP_TRANSFER_CHUNK: u32 = 64 * 1024;
+/// Multiple SFTP READ/WRITE requests may be in flight on one channel. Eight 64 KiB requests keep
+/// a 512 KiB bandwidth-delay window without excessive memory use or pressure on small servers.
+const SFTP_TRANSFER_PIPELINE: usize = 8;
 /// `RawSftpSession`'s incoming packet reader otherwise accepts a server-declared length up to
 /// `u32::MAX` before deserialisation. Enforce a cap on the framed stream itself, before that
 /// allocation can happen. Normal OpenSSH SFTP packets are at most a few hundred KiB.
@@ -45,6 +52,7 @@ const MAX_LISTING_BYTES: usize = 16 * 1024 * 1024;
 const MAX_REMOTE_FILES: usize = 100_000;
 const MAX_REMOTE_DIRECTORIES: usize = 10_000;
 const MAX_RECURSION_DEPTH: usize = 64;
+const MAX_PRIVATE_KEY_BYTES: u64 = 1024 * 1024;
 
 /// Transparent SFTP stream wrapper that rejects an oversized incoming frame as soon as its
 /// four-byte length prefix has arrived. Returning the error with the prefix read prevents the
@@ -370,6 +378,81 @@ fn read_regular_file_limited(path: &std::path::Path, limit: u64) -> std::io::Res
     Ok(bytes)
 }
 
+/// Read a user-selected SSH private key without following a symlink and reject permissions that
+/// expose the secret to another local account. The metadata checks are repeated on the opened
+/// descriptor so a path replacement race cannot swap in a different file after validation.
+fn read_private_key(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    let before = std::fs::symlink_metadata(path)?;
+    if !before.file_type().is_file() || before.len() > MAX_PRIVATE_KEY_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "SSH private key must be a regular file no larger than 1 MiB",
+        ));
+    }
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let file = options.open(path)?;
+    let opened = file.metadata()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if before.dev() != opened.dev()
+            || before.ino() != opened.ino()
+            || opened.nlink() != 1
+            || opened.mode() & 0o077 != 0
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "SSH private key changed while opening, is hard-linked, or is readable by other users (use chmod 600)",
+            ));
+        }
+    }
+    if !opened.file_type().is_file() || opened.len() > MAX_PRIVATE_KEY_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "SSH private key changed type or size while opening",
+        ));
+    }
+    let mut bytes = Vec::with_capacity(opened.len() as usize);
+    let mut limited = std::io::Read::take(file, MAX_PRIVATE_KEY_BYTES + 1);
+    std::io::Read::read_to_end(&mut limited, &mut bytes)?;
+    if bytes.len() as u64 > MAX_PRIVATE_KEY_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "SSH private key exceeds 1 MiB",
+        ));
+    }
+    Ok(bytes)
+}
+
+fn private_key_path(spec: &ConnectionSpec) -> Result<PathBuf, NetError> {
+    let raw = spec
+        .sftp_private_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .ok_or_else(|| NetError::Ssh("no SSH private key was selected".into()))?;
+    if raw.as_bytes().contains(&0) {
+        return Err(NetError::Ssh("SSH private-key path contains NUL".into()));
+    }
+    if raw == "~" || raw.starts_with("~/") {
+        let home = directories::BaseDirs::new()
+            .ok_or_else(|| NetError::Ssh("home directory is unavailable".into()))?;
+        return Ok(if raw == "~" {
+            home.home_dir().to_path_buf()
+        } else {
+            home.home_dir().join(&raw[2..])
+        });
+    }
+    Ok(PathBuf::from(raw))
+}
+
 fn acquire_known_hosts_write_lock(
     known_hosts_path: &std::path::Path,
 ) -> Result<KnownHostsWriteLock, String> {
@@ -576,6 +659,115 @@ async fn close_session(
     .await;
 }
 
+async fn authenticate(
+    handle: &mut russh::client::Handle<Handler>,
+    spec: &ConnectionSpec,
+    password_or_passphrase: &str,
+) -> Result<bool, NetError> {
+    match spec.sftp_auth {
+        SftpAuth::Password => Ok(timed(
+            "password authentication",
+            handle.authenticate_password(spec.user.clone(), password_or_passphrase.to_string()),
+        )
+        .await?
+        .success()),
+        SftpAuth::PrivateKey => {
+            let path = private_key_path(spec)?;
+            let bytes = tokio::task::spawn_blocking(move || read_private_key(&path))
+                .await
+                .map_err(|error| NetError::Join(error.to_string()))??;
+            let encoded = zeroize::Zeroizing::new(String::from_utf8(bytes).map_err(|_| {
+                NetError::Ssh("SSH private key is not valid UTF-8/OpenSSH text".into())
+            })?);
+            let passphrase = (!password_or_passphrase.is_empty()).then_some(password_or_passphrase);
+            let key = russh::keys::decode_secret_key(&encoded, passphrase).map_err(|error| {
+                NetError::Ssh(format!("could not unlock SSH private key: {error}"))
+            })?;
+            // RustCrypto's transitive `rsa` crate still carries RUSTSEC-2023-0071. Loading is
+            // local, but signing would expose private-key timing to the server. Keep built-in key
+            // auth on Ed25519/ECDSA; RSA remains available safely through SSH Agent, where the
+            // private operation is delegated to the system agent instead of this dependency.
+            if key.algorithm().is_rsa() {
+                return Err(NetError::Ssh(
+                    "built-in RSA private keys are disabled; use an Ed25519/ECDSA key or SSH Agent"
+                        .into(),
+                ));
+            }
+            Ok(timed(
+                "private-key authentication",
+                handle.authenticate_publickey(
+                    spec.user.clone(),
+                    russh::keys::PrivateKeyWithHashAlg::new(Arc::new(key), None),
+                ),
+            )
+            .await?
+            .success())
+        }
+        SftpAuth::Agent => {
+            #[cfg(unix)]
+            {
+                let mut agent = timed(
+                    "connect to SSH agent",
+                    russh::keys::agent::client::AgentClient::connect_env(),
+                )
+                .await?;
+                let identities =
+                    timed("read SSH agent identities", agent.request_identities()).await?;
+                if identities.is_empty() {
+                    return Err(NetError::Ssh("SSH agent has no identities".into()));
+                }
+                let rsa_hash = timed("negotiate RSA signature", handle.best_supported_rsa_hash())
+                    .await?
+                    .flatten();
+                for identity in identities {
+                    let auth = match identity {
+                        russh::keys::agent::AgentIdentity::PublicKey { key, .. } => {
+                            let hash = key.algorithm().is_rsa().then_some(rsa_hash).flatten();
+                            timed(
+                                "SSH-agent authentication",
+                                handle.authenticate_publickey_with(
+                                    spec.user.clone(),
+                                    key,
+                                    hash,
+                                    &mut agent,
+                                ),
+                            )
+                            .await?
+                        }
+                        russh::keys::agent::AgentIdentity::Certificate { certificate, .. } => {
+                            let hash = certificate
+                                .algorithm()
+                                .is_rsa()
+                                .then_some(rsa_hash)
+                                .flatten();
+                            timed(
+                                "SSH-agent certificate authentication",
+                                handle.authenticate_certificate_with(
+                                    spec.user.clone(),
+                                    certificate,
+                                    hash,
+                                    &mut agent,
+                                ),
+                            )
+                            .await?
+                        }
+                    };
+                    if auth.success() {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+            #[cfg(not(unix))]
+            {
+                Err(NetError::Ssh(
+                    "SSH Agent authentication is not supported on this platform".into(),
+                ))
+            }
+        }
+    }
+}
+
 /// Connect, authenticate, open and initialize the SFTP subsystem. Listing uses the raw request
 /// API rather than `SftpSession::read_dir`, whose convenience implementation first accumulates
 /// every REaddir page into a Vec.
@@ -634,13 +826,8 @@ async fn open_session(
         }
     };
 
-    let auth = match timed(
-        "password authentication",
-        handle.authenticate_password(spec.user.clone(), password.to_string()),
-    )
-    .await
-    {
-        Ok(auth) => auth,
+    let authenticated = match authenticate(&mut handle, spec, password).await {
+        Ok(authenticated) => authenticated,
         Err(error) => {
             let _ = timed(
                 "disconnect",
@@ -650,7 +837,7 @@ async fn open_session(
             return Err(error);
         }
     };
-    if !auth.success() {
+    if !authenticated {
         let _ = timed(
             "disconnect",
             handle.disconnect(russh::Disconnect::ByApplication, "auth-failed", "en"),
@@ -700,6 +887,65 @@ async fn open_session(
             close_session(&mut handle, &sftp, "sftp-init-failed").await;
             Err(e)
         }
+    }
+}
+
+/// Authenticated SFTP channel reusable by the transfer scheduler. Browsing operations retain
+/// their short-lived sessions; queued files on the same endpoint can share this one handshake.
+pub struct TransferSession {
+    handle: russh::client::Handle<Handler>,
+    sftp: RawSftpSession,
+}
+
+impl TransferSession {
+    pub async fn connect(spec: &ConnectionSpec, password: &str) -> Result<Self, NetError> {
+        let (handle, sftp) = open_session(spec, password).await?;
+        Ok(Self { handle, sftp })
+    }
+
+    pub async fn download(
+        &self,
+        remote_path: &str,
+        local_path: &std::path::Path,
+        progress: impl Fn(u64) + Send,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<u64, NetError> {
+        self.download_resumable(remote_path, local_path, progress, cancel, None)
+            .await
+    }
+
+    pub async fn download_resumable(
+        &self,
+        remote_path: &str,
+        local_path: &std::path::Path,
+        progress: impl Fn(u64) + Send,
+        cancel: Option<&AtomicBool>,
+        resume: Option<DownloadResume>,
+    ) -> Result<u64, NetError> {
+        download_with_session(
+            &self.sftp,
+            remote_path,
+            local_path,
+            progress,
+            cancel,
+            resume,
+        )
+        .await
+    }
+
+    pub async fn upload(
+        &self,
+        local_path: &std::path::Path,
+        remote_path: &str,
+        progress: impl Fn(u64) + Send,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<u64, NetError> {
+        let file = tokio::fs::File::open(local_path).await?;
+        upload_with_session(&self.sftp, file, remote_path, progress, cancel).await
+    }
+
+    pub async fn close(mut self, reason: &'static str) {
+        close_session(&mut self.handle, &self.sftp, reason).await;
     }
 }
 
@@ -800,6 +1046,7 @@ async fn list_dir_bounded(sftp: &RawSftpSession, dir: &str) -> Result<SftpListin
                 if file.filename == "." || file.filename == ".." {
                     continue;
                 }
+                validate_remote_component(&file.filename)?;
                 let next_bytes = stored_bytes.saturating_add(file.filename.len());
                 if entries.len() >= MAX_LISTING_ENTRIES || next_bytes > MAX_LISTING_BYTES {
                     truncated = true;
@@ -1001,6 +1248,52 @@ fn join_remote_path(dir: &str, name: &str) -> String {
     }
 }
 
+enum SftpReadChunk {
+    Data(Vec<u8>),
+    Eof,
+}
+
+async fn read_transfer_chunk(
+    sftp: &RawSftpSession,
+    handle: String,
+    offset: u64,
+    len: u32,
+) -> (u64, u32, Result<SftpReadChunk, NetError>) {
+    let result =
+        match tokio::time::timeout(SFTP_OPERATION_TIMEOUT, sftp.read(handle, offset, len)).await {
+            Ok(Ok(data)) if data.data.is_empty() => Err(NetError::Ssh(
+                "SFTP read returned empty data without EOF".into(),
+            )),
+            Ok(Ok(data)) if data.data.len() > len as usize => Err(NetError::Ssh(format!(
+                "SFTP server returned {} bytes for a {len}-byte read",
+                data.data.len()
+            ))),
+            Ok(Ok(data)) => Ok(SftpReadChunk::Data(data.data)),
+            Ok(Err(SftpError::Status(status))) if status.status_code == StatusCode::Eof => {
+                Ok(SftpReadChunk::Eof)
+            }
+            Ok(Err(error)) => Err(NetError::Ssh(format!("SFTP read failed: {error}"))),
+            Err(_) => Err(NetError::Ssh(format!(
+                "SFTP read timed out after {} seconds",
+                SFTP_OPERATION_TIMEOUT.as_secs()
+            ))),
+        };
+    (offset, len, result)
+}
+
+async fn write_transfer_chunk(
+    sftp: &RawSftpSession,
+    handle: String,
+    offset: u64,
+    data: Vec<u8>,
+) -> (usize, Result<(), NetError>) {
+    let len = data.len();
+    let result = timed("write remote file", sftp.write(handle, offset, data))
+        .await
+        .map(|_| ());
+    (len, result)
+}
+
 /// Download `remote_path` to `local_path`, reporting cumulative bytes via `progress`.
 /// Writes to a unique private sibling and renames on success — a failure leaves no partial file.
 #[allow(dead_code)] // wired in by the transfer actor (M6)
@@ -1012,9 +1305,11 @@ pub async fn download(
     progress: impl Fn(u64) + Send,
     cancel: Option<&AtomicBool>, // M1
 ) -> Result<u64, NetError> {
-    let (mut handle, sftp) = open_session(spec, password).await?;
-    let result = download_with_session(&sftp, remote_path, local_path, progress, cancel).await;
-    close_session(&mut handle, &sftp, "bye").await;
+    let session = TransferSession::connect(spec, password).await?;
+    let result = session
+        .download(remote_path, local_path, progress, cancel)
+        .await;
+    session.close("bye").await;
     result
 }
 
@@ -1024,12 +1319,17 @@ async fn download_with_session(
     local_path: &std::path::Path,
     progress: impl Fn(u64) + Send,
     cancel: Option<&AtomicBool>,
+    resume: Option<DownloadResume>,
 ) -> Result<u64, NetError> {
     if let Some(parent) = local_path.parent() {
-        let _ = tokio::fs::create_dir_all(parent).await; // supports folder downloads
+        tokio::fs::create_dir_all(parent).await?; // supports folder downloads
     }
-    let (part, file) = create_unique_part(local_path)?;
-    let mut file = tokio::fs::File::from_std(file);
+    let part = open_download_part(local_path, resume)?;
+    let part_path = part.path;
+    let keep_on_error = part.keep_on_error;
+    let offset = part.offset;
+    let mut file = tokio::fs::File::from_std(part.file);
+    file.seek(std::io::SeekFrom::Start(offset)).await?;
     let remote = match timed(
         "open remote file for download",
         sftp.open(
@@ -1042,47 +1342,84 @@ async fn download_with_session(
     {
         Ok(remote) => remote,
         Err(error) => {
-            let _ = tokio::fs::remove_file(&part).await;
+            if !keep_on_error {
+                let _ = tokio::fs::remove_file(&part_path).await;
+            }
             return Err(error);
         }
     };
     let remote_handle = remote.handle;
     let result: Result<u64, NetError> = async {
-        let mut done: u64 = 0;
-        loop {
+        let mut done = offset;
+        let mut next_offset = offset;
+        if done > 0 {
+            progress(done);
+        }
+        let mut reads = FuturesOrdered::new();
+        for _ in 0..SFTP_TRANSFER_PIPELINE {
+            reads.push_back(read_transfer_chunk(
+                sftp,
+                remote_handle.clone(),
+                next_offset,
+                SFTP_TRANSFER_CHUNK,
+            ));
+            next_offset = next_offset.saturating_add(SFTP_TRANSFER_CHUNK as u64);
+        }
+
+        'download: while let Some((offset, requested, response)) = reads.next().await {
             if let Some(f) = cancel {
                 if f.load(Ordering::Relaxed) {
                     return Err(NetError::Cancelled);
                 }
             }
-            let data = match tokio::time::timeout(
-                SFTP_OPERATION_TIMEOUT,
-                sftp.read(remote_handle.clone(), done, SFTP_TRANSFER_CHUNK),
-            )
-            .await
-            {
-                Ok(Ok(data)) => data,
-                Ok(Err(SftpError::Status(status))) if status.status_code == StatusCode::Eof => {
-                    break;
-                }
-                Ok(Err(error)) => {
-                    return Err(NetError::Ssh(format!("SFTP read failed: {error}")));
-                }
-                Err(_) => {
-                    return Err(NetError::Ssh(format!(
-                        "SFTP read timed out after {} seconds",
-                        SFTP_OPERATION_TIMEOUT.as_secs()
-                    )));
-                }
-            };
-            if data.data.is_empty() {
-                return Err(NetError::Ssh(
-                    "SFTP read returned empty data without EOF".into(),
-                ));
+            if offset != done {
+                return Err(NetError::Ssh(format!(
+                    "SFTP download response gap: expected offset {done}, received {offset}"
+                )));
             }
-            file.write_all(&data.data).await?;
-            done = done.saturating_add(data.data.len() as u64);
-            progress(done);
+
+            // Servers are allowed to return less data than requested before EOF. Fill that rare
+            // short-read gap synchronously so the already-pipelined next fixed offset can never
+            // leave missing bytes in the local file.
+            let mut response = response;
+            let mut chunk_offset = offset;
+            let mut remaining = requested;
+            loop {
+                match response? {
+                    SftpReadChunk::Eof => break 'download,
+                    SftpReadChunk::Data(data) => {
+                        file.write_all(&data).await?;
+                        let received = u32::try_from(data.len()).map_err(|_| {
+                            NetError::Ssh("SFTP read length did not fit in u32".into())
+                        })?;
+                        done = done.saturating_add(received as u64);
+                        chunk_offset = chunk_offset.saturating_add(received as u64);
+                        remaining = remaining.checked_sub(received).ok_or_else(|| {
+                            NetError::Ssh("SFTP server returned overlapping data".into())
+                        })?;
+                        progress(done);
+                        if remaining == 0 {
+                            break;
+                        }
+                    }
+                }
+                if let Some(f) = cancel {
+                    if f.load(Ordering::Relaxed) {
+                        return Err(NetError::Cancelled);
+                    }
+                }
+                let (_, _, gap_response) =
+                    read_transfer_chunk(sftp, remote_handle.clone(), chunk_offset, remaining).await;
+                response = gap_response;
+            }
+
+            reads.push_back(read_transfer_chunk(
+                sftp,
+                remote_handle.clone(),
+                next_offset,
+                SFTP_TRANSFER_CHUNK,
+            ));
+            next_offset = next_offset.saturating_add(SFTP_TRANSFER_CHUNK as u64);
         }
         file.sync_all().await?;
         Ok(done)
@@ -1092,50 +1429,26 @@ async fn download_with_session(
     match result {
         Ok(done) => {
             if let Err(error) = close_result {
-                let _ = tokio::fs::remove_file(&part).await;
+                if !keep_on_error {
+                    let _ = tokio::fs::remove_file(&part_path).await;
+                }
                 return Err(error);
             }
-            match tokio::fs::rename(&part, local_path).await {
+            match tokio::fs::rename(&part_path, local_path).await {
                 Ok(()) => Ok(done),
                 Err(error) => {
-                    let _ = tokio::fs::remove_file(&part).await;
+                    let _ = tokio::fs::remove_file(&part_path).await;
                     Err(error.into())
                 }
             }
         }
         Err(e) => {
-            let _ = tokio::fs::remove_file(&part).await;
+            if !keep_on_error {
+                let _ = tokio::fs::remove_file(&part_path).await;
+            }
             Err(e)
         }
     }
-}
-
-fn part_path_with_nonce(p: &std::path::Path, pid: u32, nonce: u64) -> std::path::PathBuf {
-    let parent = p.parent().unwrap_or_else(|| std::path::Path::new("."));
-    let mut name = std::ffi::OsString::from(".");
-    name.push(
-        p.file_name()
-            .unwrap_or_else(|| std::ffi::OsStr::new("download")),
-    );
-    name.push(format!(".gmacftp-{pid}-{nonce}.part"));
-    parent.join(name)
-}
-
-fn create_unique_part(
-    destination: &std::path::Path,
-) -> Result<(std::path::PathBuf, std::fs::File), std::io::Error> {
-    for _ in 0..16 {
-        let path = part_path_with_nonce(destination, std::process::id(), rand::random::<u64>());
-        match crate::store::vault::create_exclusive(&path) {
-            Ok(file) => return Ok((path, file)),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(error),
-        }
-    }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::AlreadyExists,
-        "could not allocate a unique download temp file",
-    ))
 }
 
 /// Upload `local_path` to `remote_path`, reporting cumulative bytes via `progress`.
@@ -1150,11 +1463,23 @@ pub async fn upload(
 ) -> Result<u64, NetError> {
     // Open local input before authenticating. A local permission/not-found error must not leave a
     // remote session alive merely because `?` returned before the teardown path was installed.
-    let mut file = tokio::fs::File::open(local_path).await?;
-    let (mut handle, sftp) = open_session(spec, password).await?;
+    let file = tokio::fs::File::open(local_path).await?;
+    let session = TransferSession::connect(spec, password).await?;
+    let result = upload_with_session(&session.sftp, file, remote_path, progress, cancel).await;
+    session.close("bye").await;
+    result
+}
+
+async fn upload_with_session(
+    sftp: &RawSftpSession,
+    mut file: tokio::fs::File,
+    remote_path: &str,
+    progress: impl Fn(u64) + Send,
+    cancel: Option<&AtomicBool>,
+) -> Result<u64, NetError> {
     let result: Result<u64, NetError> = async {
         if let Some(parent) = parent_remote(remote_path) {
-            mkdirs_sftp(&sftp, &parent).await?; // supports folder uploads (mkdir -p ancestors)
+            mkdirs_sftp(sftp, &parent).await?; // supports folder uploads (mkdir -p ancestors)
         }
         let remote = timed(
             "open remote file for upload",
@@ -1166,28 +1491,43 @@ pub async fn upload(
         )
         .await?;
         let remote_handle = remote.handle;
-        let mut buf = vec![0u8; 64 * 1024];
-        let mut done: u64 = 0;
         let transfer_result: Result<u64, NetError> = async {
+            let mut writes = FuturesUnordered::new();
+            let mut next_offset = 0_u64;
+            let mut acknowledged = 0_u64;
+            let mut eof = false;
             loop {
                 if let Some(f) = cancel {
                     if f.load(Ordering::Relaxed) {
                         return Err(NetError::Cancelled);
                     }
                 }
-                let n = file.read(&mut buf).await?;
-                if n == 0 {
-                    break;
+
+                while writes.len() < SFTP_TRANSFER_PIPELINE && !eof {
+                    let mut data = vec![0_u8; SFTP_TRANSFER_CHUNK as usize];
+                    let read = file.read(&mut data).await?;
+                    if read == 0 {
+                        eof = true;
+                        break;
+                    }
+                    data.truncate(read);
+                    writes.push(write_transfer_chunk(
+                        sftp,
+                        remote_handle.clone(),
+                        next_offset,
+                        data,
+                    ));
+                    next_offset = next_offset.saturating_add(read as u64);
                 }
-                timed(
-                    "write remote file",
-                    sftp.write(remote_handle.clone(), done, buf[..n].to_vec()),
-                )
-                .await?;
-                done = done.saturating_add(n as u64);
-                progress(done);
+
+                let Some((written, result)) = writes.next().await else {
+                    break;
+                };
+                result?;
+                acknowledged = acknowledged.saturating_add(written as u64);
+                progress(acknowledged);
             }
-            Ok(done)
+            Ok(acknowledged)
         }
         .await;
         let close_result = timed("close uploaded file", sftp.close(remote_handle)).await;
@@ -1200,8 +1540,98 @@ pub async fn upload(
         }
     }
     .await;
+    result
+}
+
+pub async fn rename(
+    spec: &ConnectionSpec,
+    password: &str,
+    from: &str,
+    to: &str,
+) -> Result<(), NetError> {
+    let (mut handle, sftp) = open_session(spec, password).await?;
+    let result = timed("rename path", sftp.rename(from.to_string(), to.to_string()))
+        .await
+        .map(|_| ());
     close_session(&mut handle, &sftp, "bye").await;
     result
+}
+
+pub async fn create_dir(spec: &ConnectionSpec, password: &str, path: &str) -> Result<(), NetError> {
+    let (mut handle, sftp) = open_session(spec, password).await?;
+    let result = timed(
+        "create directory",
+        sftp.mkdir(path.to_string(), FileAttributes::empty()),
+    )
+    .await
+    .map(|_| ());
+    close_session(&mut handle, &sftp, "bye").await;
+    result
+}
+
+pub async fn chmod(
+    spec: &ConnectionSpec,
+    password: &str,
+    path: &str,
+    mode: u32,
+) -> Result<(), NetError> {
+    if mode > 0o777 {
+        return Err(NetError::InvalidPath("invalid permission mode".into()));
+    }
+    let (mut handle, sftp) = open_session(spec, password).await?;
+    let mut attributes = FileAttributes::empty();
+    attributes.permissions = Some(mode);
+    let result = timed(
+        "change permissions",
+        sftp.setstat(path.to_string(), attributes),
+    )
+    .await
+    .map(|_| ());
+    close_session(&mut handle, &sftp, "bye").await;
+    result
+}
+
+async fn collect_delete_tree(
+    sftp: &RawSftpSession,
+    path: &str,
+    out: &mut Vec<(String, bool)>,
+    depth: usize,
+    directories: &mut usize,
+) -> Result<(), NetError> {
+    if depth >= MAX_RECURSION_DEPTH || *directories >= MAX_REMOTE_DIRECTORIES {
+        return Err(NetError::Ssh(
+            "remote folder exceeds recursive-delete safety limits".into(),
+        ));
+    }
+    *directories += 1;
+    let listing = list_dir_bounded(sftp, path).await?;
+    if listing.truncated {
+        return Err(NetError::Ssh(
+            "remote folder listing was truncated; refusing incomplete delete".into(),
+        ));
+    }
+    for entry in listing.entries {
+        if out.len() >= MAX_REMOTE_FILES + MAX_REMOTE_DIRECTORIES {
+            return Err(NetError::Ssh(
+                "remote folder exceeds recursive-delete safety limits".into(),
+            ));
+        }
+        let child = join_remote_path(path, &entry.name);
+        if entry.is_dir {
+            Box::pin(collect_delete_tree(
+                sftp,
+                &child,
+                out,
+                depth + 1,
+                directories,
+            ))
+            .await?;
+        } else {
+            out.push((child, false));
+        }
+    }
+    out.push((path.to_string(), true));
+    Ok(())
 }
 
 /// Delete a remote file or an empty remote directory.
@@ -1214,7 +1644,16 @@ pub async fn delete(
     let (mut handle, sftp) = open_session(spec, password).await?;
     let result: Result<(), NetError> = async {
         if is_dir {
-            timed("remove directory", sftp.rmdir(remote_path.to_string())).await?;
+            let mut paths = Vec::new();
+            let mut directories = 0;
+            collect_delete_tree(&sftp, remote_path, &mut paths, 0, &mut directories).await?;
+            for (path, directory) in paths {
+                if directory {
+                    timed("remove directory", sftp.rmdir(path)).await?;
+                } else {
+                    timed("remove file", sftp.remove(path)).await?;
+                }
+            }
         } else {
             timed("remove file", sftp.remove(remote_path.to_string())).await?;
         }
@@ -1228,6 +1667,113 @@ pub async fn delete(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use russh_sftp::protocol::{Data, Handle, Status, Version};
+
+    struct MemorySftpServer {
+        data: Arc<Mutex<Vec<u8>>>,
+        short_reads: bool,
+    }
+
+    impl russh_sftp::server::Handler for MemorySftpServer {
+        type Error = StatusCode;
+
+        fn unimplemented(&self) -> Self::Error {
+            StatusCode::OpUnsupported
+        }
+
+        async fn init(
+            &mut self,
+            _version: u32,
+            _extensions: std::collections::HashMap<String, String>,
+        ) -> Result<Version, Self::Error> {
+            Ok(Version::new())
+        }
+
+        async fn open(
+            &mut self,
+            id: u32,
+            _filename: String,
+            flags: OpenFlags,
+            _attrs: FileAttributes,
+        ) -> Result<Handle, Self::Error> {
+            if flags.contains(OpenFlags::TRUNCATE) {
+                self.data.lock().unwrap().clear();
+            }
+            Ok(Handle {
+                id,
+                handle: "memory-file".into(),
+            })
+        }
+
+        async fn close(&mut self, id: u32, _handle: String) -> Result<Status, Self::Error> {
+            Ok(Status {
+                id,
+                status_code: StatusCode::Ok,
+                error_message: "Ok".into(),
+                language_tag: "en-US".into(),
+            })
+        }
+
+        async fn read(
+            &mut self,
+            id: u32,
+            _handle: String,
+            offset: u64,
+            len: u32,
+        ) -> Result<Data, Self::Error> {
+            let data = self.data.lock().unwrap();
+            let start = usize::try_from(offset).map_err(|_| StatusCode::Failure)?;
+            if start >= data.len() {
+                return Err(StatusCode::Eof);
+            }
+            let requested = len as usize;
+            let returned = if self.short_reads {
+                requested.min(7_919)
+            } else {
+                requested
+            };
+            let end = start.saturating_add(returned).min(data.len());
+            Ok(Data {
+                id,
+                data: data[start..end].to_vec(),
+            })
+        }
+
+        async fn write(
+            &mut self,
+            id: u32,
+            _handle: String,
+            offset: u64,
+            bytes: Vec<u8>,
+        ) -> Result<Status, Self::Error> {
+            let start = usize::try_from(offset).map_err(|_| StatusCode::Failure)?;
+            let end = start.checked_add(bytes.len()).ok_or(StatusCode::Failure)?;
+            let mut data = self.data.lock().unwrap();
+            let new_len = data.len().max(end);
+            data.resize(new_len, 0);
+            data[start..end].copy_from_slice(&bytes);
+            Ok(Status {
+                id,
+                status_code: StatusCode::Ok,
+                error_message: "Ok".into(),
+                language_tag: "en-US".into(),
+            })
+        }
+    }
+
+    async fn memory_sftp(data: Arc<Mutex<Vec<u8>>>, short_reads: bool) -> RawSftpSession {
+        let (client, server) = tokio::io::duplex(2 * 1024 * 1024);
+        russh_sftp::server::run(server, MemorySftpServer { data, short_reads }).await;
+        let sftp = RawSftpSession::new_with_config(
+            client,
+            SftpConfig {
+                request_timeout_secs: 5,
+                ..Default::default()
+            },
+        );
+        sftp.init().await.unwrap();
+        sftp
+    }
 
     /// Hermetic scratch dir with no additional test dependency. Auto-removed on drop.
     struct TestDir(PathBuf);
@@ -1357,6 +1903,31 @@ mod tests {
         assert!(read_known_hosts(&path).is_err());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn private_key_reader_requires_a_private_regular_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TestDir::new();
+        let key = dir.0.join("id_test");
+        std::fs::write(&key, b"private key bytes").unwrap();
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(read_private_key(&key).unwrap(), b"private key bytes");
+
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(read_private_key(&key).is_err());
+
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let link = dir.0.join("id_link");
+        std::os::unix::fs::symlink(&key, &link).unwrap();
+        assert!(read_private_key(&link).is_err());
+
+        let oversized = dir.0.join("id_oversized");
+        std::fs::write(&oversized, vec![0; (MAX_PRIVATE_KEY_BYTES + 1) as usize]).unwrap();
+        std::fs::set_permissions(&oversized, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(read_private_key(&oversized).is_err());
+    }
+
     #[tokio::test]
     async fn incoming_sftp_packet_length_is_bounded_before_body_allocation() {
         let (mut sender, receiver) = tokio::io::duplex(32);
@@ -1379,13 +1950,96 @@ mod tests {
         assert_eq!(&packet[4..], b"abc");
     }
 
-    #[test]
-    fn download_temp_name_is_unique_and_does_not_claim_dot_part() {
-        let destination = std::path::Path::new("/tmp/report.pdf");
-        let first = part_path_with_nonce(destination, 42, 1);
-        let second = part_path_with_nonce(destination, 42, 2);
-        assert_ne!(first, second);
-        assert_ne!(first, std::path::PathBuf::from("/tmp/report.pdf.part"));
-        assert_eq!(first.file_name().unwrap(), ".report.pdf.gmacftp-42-1.part");
+    #[tokio::test]
+    async fn pipelined_download_preserves_integrity_across_short_reads() {
+        let expected = (0..(SFTP_TRANSFER_CHUNK as usize * 12 + 1_337))
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let remote = Arc::new(Mutex::new(expected.clone()));
+        let sftp = memory_sftp(remote, true).await;
+        let dir = TestDir::new();
+        let destination = dir.0.join("download.bin");
+        let progress = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let reported = progress.clone();
+
+        let downloaded = download_with_session(
+            &sftp,
+            "/download.bin",
+            &destination,
+            move |bytes| reported.store(bytes, Ordering::Relaxed),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(downloaded, expected.len() as u64);
+        assert_eq!(progress.load(Ordering::Relaxed), downloaded);
+        assert_eq!(std::fs::read(destination).unwrap(), expected);
+        let _ = sftp.close_session();
+    }
+
+    #[tokio::test]
+    async fn pipelined_upload_preserves_integrity_over_multiple_windows() {
+        let expected = (0..(SFTP_TRANSFER_CHUNK as usize * 17 + 733))
+            .map(|index| (index % 239) as u8)
+            .collect::<Vec<_>>();
+        let remote = Arc::new(Mutex::new(Vec::new()));
+        let sftp = memory_sftp(remote.clone(), false).await;
+        let dir = TestDir::new();
+        let source = dir.0.join("upload.bin");
+        std::fs::write(&source, &expected).unwrap();
+        let file = tokio::fs::File::open(&source).await.unwrap();
+        let progress = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let reported = progress.clone();
+
+        let uploaded = upload_with_session(
+            &sftp,
+            file,
+            "/upload.bin",
+            move |bytes| reported.store(bytes, Ordering::Relaxed),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(uploaded, expected.len() as u64);
+        assert_eq!(progress.load(Ordering::Relaxed), uploaded);
+        assert_eq!(*remote.lock().unwrap(), expected);
+        let _ = sftp.close_session();
+    }
+
+    #[tokio::test]
+    async fn resumable_download_appends_from_the_fragment_offset() {
+        let expected = (0..(SFTP_TRANSFER_CHUNK as usize * 3 + 911))
+            .map(|index| (index % 227) as u8)
+            .collect::<Vec<_>>();
+        let remote = Arc::new(Mutex::new(expected.clone()));
+        let sftp = memory_sftp(remote, true).await;
+        let dir = TestDir::new();
+        let destination = dir.0.join("resumed.bin");
+        let resume = DownloadResume {
+            token: 0x1234,
+            expected_total: Some(expected.len() as u64),
+        };
+        let part = open_download_part(&destination, Some(resume)).unwrap();
+        let prefix_len = 93_117;
+        std::fs::write(&part.path, &expected[..prefix_len]).unwrap();
+        drop(part);
+
+        let downloaded = download_with_session(
+            &sftp,
+            "/resumed.bin",
+            &destination,
+            |_| {},
+            None,
+            Some(resume),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(downloaded, expected.len() as u64);
+        assert_eq!(std::fs::read(destination).unwrap(), expected);
+        let _ = sftp.close_session();
     }
 }
