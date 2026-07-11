@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.1 — 2026-07-11
 
 - Updated `ureq` to 3.3, `sha2` to 0.11, `directories` to 6, and `roxmltree` to 0.21.
 - Hardened the in-app updater so every intermediate redirect must remain HTTPS and on the explicit
