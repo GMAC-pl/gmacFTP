@@ -64,7 +64,7 @@ trash = "5"   # move local files to the OS Trash on delete (reversible, never pe
 drag = "2.1"
 # In-app update check: query the GitHub Releases API + download the latest DMG.
 ureq = { version = "2.12", features = ["json"] }
-sha2 = "0.10" # verify GitHub's release-asset digest before opening an update
+sha2 = "0.11" # verify GitHub's release-asset digest before opening an update
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2" # O_NOFOLLOW when reopening resumable transfer fragments
