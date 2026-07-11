@@ -1,6 +1,6 @@
 [package]
 name = "gmacftp"
-version = "0.0.20"
+version = "0.1.0"
 edition = "2021"
 rust-version = "1.88"
 description = "gmacFTP — native, lightweight FTP/FTPS/SFTP client for macOS"
@@ -65,6 +65,9 @@ drag = "2.1"
 # In-app update check: query the GitHub Releases API + download the latest DMG.
 ureq = { version = "2.12", features = ["json"] }
 sha2 = "0.10" # verify GitHub's release-asset digest before opening an update
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2" # O_NOFOLLOW when reopening resumable transfer fragments
 
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "3"   # one-time ForkLift internet-password import

@@ -21,4 +21,7 @@ pub struct TransferJob {
     pub remote_path: String,
     /// Total size in bytes, if known before the transfer starts.
     pub bytes_total: Option<u64>,
+    /// Random per-job token for a private resumable download fragment. Zero disables resume
+    /// (uploads currently retry from the beginning).
+    pub resume_token: u64,
 }

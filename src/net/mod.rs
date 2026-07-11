@@ -3,6 +3,7 @@
 
 pub mod error;
 pub mod ftp;
+mod partial;
 pub mod safe;
 pub mod sftp;
 
@@ -10,7 +11,9 @@ use crate::model::{ConnectionSpec, Protocol, RemoteEntry};
 
 pub use error::{HostKeyChallenge, NetError};
 pub use ftp::{accept_invalid_tls, allow_plaintext_ftp};
-pub use safe::{assert_within, sanitize_local_rel, validate_ftp_path};
+pub(crate) use partial::discard_download_fragment;
+pub use partial::DownloadResume;
+pub use safe::{assert_within, sanitize_local_rel, validate_ftp_path, validate_remote_component};
 
 #[derive(Debug, Clone, Default)]
 pub struct RemoteTreeStats {
@@ -110,6 +113,153 @@ pub async fn download_file(
             )
             .await
         }
+    }
+}
+
+/// Download a temporary helper file with a hard byte ceiling. The server-provided directory
+/// listing is only advisory; the progress callback also cancels the transfer if the actual stream
+/// exceeds the limit, preventing previews/edit sessions from filling the local disk.
+pub async fn download_file_limited(
+    spec: &ConnectionSpec,
+    password: &str,
+    remote_path: &str,
+    local_path: std::path::PathBuf,
+    max_bytes: u64,
+) -> Result<u64, NetError> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let exceeded = Arc::new(AtomicBool::new(false));
+    let result = match spec.protocol {
+        Protocol::Ftp => {
+            let (spec, password, remote) =
+                (spec.clone(), password.to_string(), remote_path.to_string());
+            let exceeded = exceeded.clone();
+            tokio::task::spawn_blocking(move || {
+                let cancel = Arc::new(AtomicBool::new(false));
+                let progress_cancel = cancel.clone();
+                let progress_exceeded = exceeded.clone();
+                ftp::download(
+                    &spec,
+                    &password,
+                    &remote,
+                    &local_path,
+                    move |done| {
+                        if done > max_bytes {
+                            progress_exceeded.store(true, Ordering::Relaxed);
+                            progress_cancel.store(true, Ordering::Relaxed);
+                        }
+                    },
+                    Some(cancel.as_ref()),
+                )
+            })
+            .await
+            .map_err(|error| NetError::Join(error.to_string()))?
+        }
+        Protocol::Sftp => {
+            let cancel = AtomicBool::new(false);
+            let progress_exceeded = exceeded.clone();
+            sftp::download(
+                spec,
+                password,
+                remote_path,
+                &local_path,
+                |done| {
+                    if done > max_bytes {
+                        progress_exceeded.store(true, Ordering::Relaxed);
+                        cancel.store(true, Ordering::Relaxed);
+                    }
+                },
+                Some(&cancel),
+            )
+            .await
+        }
+    };
+    if exceeded.load(Ordering::Relaxed) {
+        Err(NetError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("remote file exceeds the {max_bytes}-byte safety limit"),
+        )))
+    } else {
+        result
+    }
+}
+
+/// Upload one local file outside the queued transfer UI (remote edit save-back).
+pub async fn upload_file(
+    spec: &ConnectionSpec,
+    password: &str,
+    local_path: std::path::PathBuf,
+    remote_path: &str,
+) -> Result<u64, NetError> {
+    match spec.protocol {
+        Protocol::Ftp => {
+            let (spec, password, remote) =
+                (spec.clone(), password.to_string(), remote_path.to_string());
+            tokio::task::spawn_blocking(move || {
+                ftp::upload(&spec, &password, &local_path, &remote, |_| {}, None)
+            })
+            .await
+            .map_err(|error| NetError::Join(error.to_string()))?
+        }
+        Protocol::Sftp => {
+            sftp::upload(spec, password, &local_path, remote_path, |_| {}, None).await
+        }
+    }
+}
+
+pub async fn rename_remote(
+    spec: &ConnectionSpec,
+    password: &str,
+    from: &str,
+    to: &str,
+) -> Result<(), NetError> {
+    match spec.protocol {
+        Protocol::Ftp => {
+            let (spec, password, from, to) = (
+                spec.clone(),
+                password.to_string(),
+                from.to_string(),
+                to.to_string(),
+            );
+            tokio::task::spawn_blocking(move || ftp::rename(&spec, &password, &from, &to))
+                .await
+                .map_err(|error| NetError::Join(error.to_string()))?
+        }
+        Protocol::Sftp => sftp::rename(spec, password, from, to).await,
+    }
+}
+
+pub async fn create_remote_dir(
+    spec: &ConnectionSpec,
+    password: &str,
+    path: &str,
+) -> Result<(), NetError> {
+    match spec.protocol {
+        Protocol::Ftp => {
+            let (spec, password, path) = (spec.clone(), password.to_string(), path.to_string());
+            tokio::task::spawn_blocking(move || ftp::create_dir(&spec, &password, &path))
+                .await
+                .map_err(|error| NetError::Join(error.to_string()))?
+        }
+        Protocol::Sftp => sftp::create_dir(spec, password, path).await,
+    }
+}
+
+pub async fn chmod_remote(
+    spec: &ConnectionSpec,
+    password: &str,
+    path: &str,
+    mode: u32,
+) -> Result<(), NetError> {
+    match spec.protocol {
+        Protocol::Ftp => {
+            let (spec, password, path) = (spec.clone(), password.to_string(), path.to_string());
+            tokio::task::spawn_blocking(move || ftp::chmod(&spec, &password, &path, mode))
+                .await
+                .map_err(|error| NetError::Join(error.to_string()))?
+        }
+        Protocol::Sftp => sftp::chmod(spec, password, path, mode).await,
     }
 }
 

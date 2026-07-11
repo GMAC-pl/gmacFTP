@@ -7,6 +7,8 @@ pub enum TransferState {
     Active,
     Done,
     Failed(String),
+    /// Explicitly cancelled by the user; resumable download data is retained for Retry/Resume.
+    Cancelled,
     /// Never started because the user stopped this batch after an earlier file failed.
     Skipped(String),
 }

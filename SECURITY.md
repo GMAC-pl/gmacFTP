@@ -34,10 +34,11 @@ advisories, all explicitly reviewed:
 
 - **macOS dependency, vulnerable operation not used.** `rsa 0.10.0-rc.18`
   (RUSTSEC-2023-0071, "Marvin Attack", MEDIUM 5.9) is pulled in transitively by `russh` and has
-  no fixed release. The affected operation is RSA private-key decryption. gmacFTP does not load
-  user private keys or perform public-key authentication: its SFTP client uses password
-  authentication and verifies the server's public host key. CI therefore accepts this advisory
-  until `russh` can remove or replace the dependency.
+  no fixed release. gmacFTP rejects built-in RSA private keys before authentication, so the crate
+  performs no remotely observable RSA private operation. RSA authentication remains available via
+  SSH Agent, which delegates signing to the system agent; RSA server host keys use public
+  verification only. Built-in Ed25519/ECDSA key authentication is unaffected. CI accepts this
+  advisory until `russh` can remove or replace the dependency.
 - **Linux-only.** `quick-xml 0.39.4` (RUSTSEC-2026-0194 and RUSTSEC-2026-0195, both HIGH 7.5)
   is pulled by Slint's Wayland/accessibility dependency graph. It is absent from both macOS
   target graphs (`cargo tree -i quick-xml --target aarch64-apple-darwin` and the equivalent

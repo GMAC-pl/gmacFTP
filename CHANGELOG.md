@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.1.0 — 2026-07-11
+
+The first feature-complete preview: faster browsing and transfers, resumable queues, native file
+operations, modern SFTP authentication, safe remote editing, and dry-run folder synchronization.
+
+- **Much faster browsing.** Local directory contents render before recursive folder sizes; folder
+  metadata is cached, coalesced, cancellable, and calculated in the background. Remote folder
+  statistics wait until the pane is idle and use a bounded concurrent cache.
+- **High-latency transfers are faster.** SFTP keeps up to eight 64 KiB requests in flight, FTP/SFTP
+  sessions are reused for consecutive files on the same endpoint, and independent endpoints run in
+  parallel with a user-selectable limit from 1 to 6.
+- **Reliable large batches.** Downloads retain private, symlink-safe resumable fragments; each
+  queued file can be cancelled and resumed/retried independently. Disconnect epochs prevent stale
+  queued work from restarting after a quick reconnect, while one bad file can still be skipped or
+  stop only its own batch.
+- **Native file management.** Create folders, rename without clobbering an item created in a race,
+  edit Unix permissions, and recursively delete preflighted remote trees with strict depth/entry
+  bounds. Command-A, Shift-click and Command-click work across mixed files and folders.
+- **SFTP keys and SSH Agent.** Password, Ed25519/ECDSA private-key, and system SSH Agent
+  authentication are available. Key files require private permissions, are opened without following
+  symlinks, and their local paths never enter iCloud metadata. Built-in RSA signing is disabled while
+  its transitive RustCrypto dependency carries RUSTSEC-2023-0071; RSA remains available through the
+  system SSH Agent.
+- **Safe remote editing.** A remote file can open in its default macOS editor and upload only when
+  changed. Editing is bounded to 64 MiB and compares exact SHA-256 content with a freshly downloaded
+  server copy before replacing anything, detecting same-size concurrent edits.
+- **Dry-run folder synchronization.** Compare one local and one server pane in either direction,
+  apply wildcard exclusions, and review every proposed copy first. The app re-scans before apply,
+  stops if the plan changed, and never deletes target-only files.
+- **Security and privacy gates.** Host keys remain explicit trust-on-first-use, transfer temp files
+  are private and link-safe, remote paths are contained, dependency auditing is current, and the
+  complete Git history plus release tree pass a secret scan.
+- **Regression coverage.** 74 library tests, 15 controller/path tests, and 4 relay integration tests
+  cover the new pipeline, resume, cancellation, concurrency, path, key-file, synchronization, and
+  no-clobber behavior.
+
 ## 0.0.20 — 2026-07-11
 
 Multi-selection and resilient batch-transfer release.

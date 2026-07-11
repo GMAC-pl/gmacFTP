@@ -11,12 +11,13 @@
 #[cfg(target_os = "macos")]
 use std::cell::Cell;
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::{Arc, LazyLock, Mutex};
-use std::time::Instant;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime};
 
 use futures::{stream, StreamExt};
 use slint::winit_030::WinitWindowAccessor;
@@ -25,13 +26,14 @@ use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 
 use gmacftp::model::{
-    ConnectionId, ConnectionSpec, Protocol, RemoteEntry, TransferDirection, TransferId, TransferJob,
+    ConnectionId, ConnectionSpec, Protocol, RemoteEntry, SftpAuth, TransferDirection, TransferId,
+    TransferJob,
 };
 use gmacftp::net;
 use gmacftp::store::{self, CredentialKey, CredentialStore};
 use gmacftp::transfer::{TransferEngine, TransferState, TransferUpdate};
 
-use crate::{App, ConnRow, EntryRow, LocalFavoriteRow, TransferRow};
+use crate::{App, ConnRow, EntryRow, LocalFavoriteRow, SyncRow, TransferRow};
 
 type ConnList = Arc<Mutex<Vec<ConnectionSpec>>>;
 type PasswordCache = HashMap<CredentialKey, Zeroizing<String>>;
@@ -39,6 +41,12 @@ type PasswordCache = HashMap<CredentialKey, Zeroizing<String>>;
 struct TransferBatch {
     id: usize,
     pause_on_error: bool,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CopyRequest {
+    name: String,
+    is_dir: bool,
+    total: Option<u64>,
 }
 type PendingCopy = (usize, usize, String, bool, Option<u64>, TransferBatch);
 type PendingExternalUpload = (ConnectionSpec, PathBuf, String, String, Option<u64>, bool);
@@ -56,6 +64,12 @@ static PASSWORD_CACHE: LazyLock<Mutex<PasswordCache>> =
 
 const MAX_LOCAL_FOLDER_STAT_FILES: usize = 3_000;
 const MAX_REMOTE_FOLDER_STAT_FILES: usize = 2_000;
+const MAX_LOCAL_FOLDER_STATS_CACHE_ENTRIES: usize = 512;
+const LOCAL_FOLDER_STATS_CACHE_TTL: Duration = Duration::from_secs(10);
+const MAX_REMOTE_FOLDER_STATS_CACHE_ENTRIES: usize = 512;
+const REMOTE_FOLDER_STATS_CACHE_TTL: Duration = Duration::from_secs(15);
+const REMOTE_METADATA_IDLE_DELAY: Duration = Duration::from_millis(300);
+const REMOTE_METADATA_CONCURRENCY: usize = 2;
 /// Bounds for recursive reads of a user-selected local folder. They keep a symlink loop, a
 /// pathological tree, or a mounted volume from turning one drag/copy into an unbounded walk.
 const MAX_LOCAL_TREE_FILES: usize = 100_000;
@@ -65,6 +79,7 @@ const MAX_LOCAL_TREE_DEPTH: usize = 64;
 /// area bounded; transfer-queue downloads remain the right path for larger trees.
 const MAX_DRAG_STAGING_FILES: usize = 10_000;
 const MAX_DRAG_STAGING_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const MAX_REMOTE_EDIT_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_IMPORT_BYTES: u64 = 1024 * 1024;
 const MIN_SYNC_PASSPHRASE_CHARS: usize = 12;
 const MAX_SYNC_PASSPHRASE_BYTES: usize = 1024;
@@ -88,6 +103,10 @@ static PENDING_EXTERNAL_UPLOAD: LazyLock<Mutex<VecDeque<PendingExternalUpload>>>
 static PENDING_HOST_KEY_TRUST: LazyLock<Mutex<Option<PendingHostKeyTrust>>> =
     LazyLock::new(|| Mutex::new(None));
 
+static PENDING_FOLDER_SYNC: LazyLock<Mutex<Option<PreparedFolderSync>>> =
+    LazyLock::new(|| Mutex::new(None));
+static FOLDER_SYNC_GENERATION: AtomicU64 = AtomicU64::new(0);
+
 /// Per-pane "Don't ask again this session" for the delete-confirmation dialog, indexed by pane
 /// (0 = left, 1 = right). Keying per-pane (not one global flag) means ticking it while deleting on
 /// one connection ONLY silences confirms for that pane — a local-Trash delete on the other pane
@@ -97,6 +116,40 @@ static PENDING_HOST_KEY_TRUST: LazyLock<Mutex<Option<PendingHostKeyTrust>>> =
 /// "don't ask again", but session-local rather than app-persistent.
 static SKIP_DELETE_CONFIRM: LazyLock<Mutex<[bool; 2]>> =
     LazyLock::new(|| Mutex::new([false, false]));
+
+/// A monotonically increasing request id per pane. Folder-size walks finish out of order; this
+/// prevents a result started for an old directory (or for a pane that became remote) from being
+/// written into the current model.
+static LOCAL_LIST_GENERATION: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+#[derive(Debug)]
+struct LocalFolderStatsCacheSlot {
+    root_modified: Option<SystemTime>,
+    value: Arc<OnceLock<CachedLocalFolderStats>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CachedLocalFolderStats {
+    stats: FolderStats,
+    cached_at: Instant,
+}
+
+/// Folder metadata is requested by both panes at startup and again after navigation. The
+/// per-path OnceLock coalesces concurrent walks, while the directory mtime and short TTL keep the
+/// cache from hiding normal filesystem changes.
+static LOCAL_FOLDER_STATS_CACHE: LazyLock<
+    Mutex<HashMap<(PathBuf, usize), LocalFolderStatsCacheSlot>>,
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[derive(Debug, Clone)]
+struct CachedRemoteFolderStats {
+    stats: net::RemoteTreeStats,
+    cached_at: Instant,
+}
+
+type RemoteFolderStatsCache = HashMap<(usize, String, usize), CachedRemoteFolderStats>;
+static REMOTE_FOLDER_STATS_CACHE: LazyLock<Mutex<RemoteFolderStatsCache>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn delete_confirm_skipped(pane: usize) -> bool {
     SKIP_DELETE_CONFIRM
@@ -142,6 +195,10 @@ fn transfer_summary_from_rows(rows: &[TransferRow]) -> String {
     let active = rows.iter().filter(|r| r.state.as_str() == "active").count();
     let queued = rows.iter().filter(|r| r.state.as_str() == "queued").count();
     let failed = rows.iter().filter(|r| r.state.as_str() == "failed").count();
+    let cancelled = rows
+        .iter()
+        .filter(|r| r.state.as_str() == "cancelled")
+        .count();
     let done = rows.iter().filter(|r| r.state.as_str() == "done").count();
     let speed = rows
         .iter()
@@ -165,6 +222,9 @@ fn transfer_summary_from_rows(rows: &[TransferRow]) -> String {
     }
     if failed > 0 {
         parts.push(format!("{failed} failed"));
+    }
+    if cancelled > 0 {
+        parts.push(format!("{cancelled} cancelled"));
     }
     parts.join(" · ")
 }
@@ -871,6 +931,7 @@ pub fn run() {
     // process setting, so concurrent connections cannot inherit one server's exception.
     let settings = store::settings::load();
     crate::I18n::get(&ui).set_locale(settings.locale.clone().into());
+    ui.set_transfer_concurrency(settings.transfer_concurrency as i32);
     let theme = std::env::var("MACKFTP_THEME").unwrap_or_else(|_| settings.theme.clone());
     if matches!(theme.as_str(), "light" | "dark") {
         crate::Tokens::get(&ui).set_theme(theme.into());
@@ -883,7 +944,9 @@ pub fn run() {
     // Upgrade legacy `(host, user)` credentials only for endpoints already present in the local,
     // pre-sync metadata. Doing this before reading an unauthenticated sync-folder metadata file
     // prevents that file from redirecting a legacy password into a new protocol or port.
-    if !settings.endpoint_credentials_migrated_v2 {
+    let benchmark = benchmark_mode();
+    let design_demo = use_design_demo_main() || benchmark;
+    if !design_demo && !settings.endpoint_credentials_migrated_v2 {
         let migration_store = store::default_store();
         match migrate_saved_passwords(&migration_store) {
             Ok(n) if n > 0 => ui.set_status(
@@ -899,10 +962,16 @@ pub fn run() {
     // Cross-device sync (before the final store loads local files): pull the newest
     // connections.json / vault.bin from the sync folder (default iCloud Drive) into the local
     // copies. The one-time v1 migration above has already used only trusted local endpoints.
-    store::cloud::bootstrap();
+    if !design_demo {
+        store::cloud::bootstrap();
+    }
     // Create the store AFTER the pull so FileVault::open loads the just-pulled vault (and so
     // is_locked() reflects the post-pull state).
-    let store: Arc<dyn CredentialStore> = Arc::new(store::default_store());
+    let store: Arc<dyn CredentialStore> = if design_demo {
+        Arc::new(store::InMemoryStore::default())
+    } else {
+        Arc::new(store::default_store())
+    };
     // If the pulled vault is undecryptable (master key absent locally) but a wrapped key exists
     // in the sync folder, prompt for the sync passphrase to unlock it.
     if store.is_locked() {
@@ -921,7 +990,7 @@ pub fn run() {
         ui.set_passphrase_open(true);
     }
 
-    let connections = if use_design_demo_connections() {
+    let connections = if use_design_demo_connections() || benchmark {
         design_demo_connections()
     } else {
         bootstrap(&store)
@@ -1087,6 +1156,14 @@ pub fn run() {
         engine.clone(),
         jobs_index.clone(),
     );
+    wire_folder_sync(
+        &ui,
+        &handle,
+        store.clone(),
+        panes.clone(),
+        engine.clone(),
+        jobs_index.clone(),
+    );
     wire_toggle_locale(&ui);
     wire_toggle_tls(&ui, conns.clone(), sessions.clone(), panes.clone());
     wire_toggle_theme(&ui);
@@ -1097,6 +1174,7 @@ pub fn run() {
     wire_sort(&ui, 1);
     // connection manager
     wire_new(&ui);
+    wire_choose_private_key(&ui, &handle);
     wire_edit(&ui, store.clone(), conns.clone());
     wire_delete(&ui, store.clone(), conns.clone());
     wire_save(&ui, store.clone(), conns.clone());
@@ -1114,9 +1192,11 @@ pub fn run() {
     wire_palette_filter(&ui);
     wire_set_pane_local(&ui, panes.clone());
     wire_local_favorites(&ui, panes.clone());
-    wire_clear_finished(&ui, jobs_index.clone());
-    wire_dismiss_transfer(&ui, jobs_index.clone());
+    wire_clear_finished(&ui, jobs_index.clone(), engine.clone());
+    wire_dismiss_transfer(&ui, jobs_index.clone(), engine.clone());
+    wire_individual_transfer_controls(&ui, jobs_index.clone(), engine.clone());
     wire_set_transfers_paused(&ui, engine.clone());
+    wire_set_transfer_concurrency(&ui, engine.clone());
     wire_resolve_transfer_error(&ui, engine.clone());
     wire_window_controls(
         &ui,
@@ -1129,6 +1209,8 @@ pub fn run() {
     wire_external_drag(&ui, &handle, store.clone(), panes.clone());
     wire_request_delete(&ui, &handle, store.clone(), panes.clone());
     wire_confirm_delete(&ui, &handle, store.clone(), panes.clone());
+    wire_file_operations(&ui, &handle, store.clone(), panes.clone());
+    wire_remote_edit(&ui, &handle, store.clone(), panes.clone());
     wire_keyboard(
         &ui,
         &handle,
@@ -1233,6 +1315,35 @@ pub fn run() {
                 ui.set_overwrite_name("report-Q3.pdf".into());
                 ui.set_overwrite_open(true);
             }
+            "sync" | "folder-sync" => {
+                ui.set_sync_direction("upload".into());
+                ui.set_sync_summary(
+                    "3 to copy; 42 unchanged; 2 target-only kept; 7 excluded. Path+size comparison; no deletions."
+                        .into(),
+                );
+                ui.set_sync_rows(ModelRc::from(Rc::new(VecModel::from(vec![
+                    SyncRow {
+                        path: "src/main.rs".into(),
+                        action: "UPLOAD".into(),
+                        reason: "size differs".into(),
+                        size_text: "48 KB".into(),
+                    },
+                    SyncRow {
+                        path: "assets/app-icon.png".into(),
+                        action: "UPLOAD".into(),
+                        reason: "missing".into(),
+                        size_text: "212 KB".into(),
+                    },
+                    SyncRow {
+                        path: "README.md".into(),
+                        action: "UPLOAD".into(),
+                        reason: "size differs".into(),
+                        size_text: "9 KB".into(),
+                    },
+                ]))));
+                ui.set_sync_preview_ready(true);
+                ui.set_sync_open(true);
+            }
             "palette" | "command-palette" => {
                 ui.set_palette_query("production".into());
                 apply_palette_filter(&ui);
@@ -1242,6 +1353,13 @@ pub fn run() {
         }
     }
 
+    if benchmark {
+        // `scripts/bench-cold-start.sh` measures real platform/UI/controller construction but
+        // must neither touch the user's vault nor wait indefinitely in the event loop.
+        slint::Timer::single_shot(Duration::from_millis(1), || {
+            let _ = slint::quit_event_loop();
+        });
+    }
     ui.run().expect("gmacFTP event loop exited with error");
     drop(engine);
     drop(runtime);
@@ -1275,6 +1393,10 @@ fn use_design_demo_connections() -> bool {
 
 fn use_design_demo_main() -> bool {
     std::env::var_os("MACKFTP_DEMO_MAIN").is_some()
+}
+
+fn benchmark_mode() -> bool {
+    std::env::args_os().any(|argument| argument == "--bench")
 }
 
 fn design_demo_connections() -> Vec<ConnectionSpec> {
@@ -1324,6 +1446,8 @@ fn design_demo_connections() -> Vec<ConnectionSpec> {
         initial_path: String::new(),
         allow_plaintext_ftp: false,
         accept_invalid_tls: false,
+        sftp_auth: Default::default(),
+        sftp_private_key: None,
     })
     .collect()
 }
@@ -2429,6 +2553,9 @@ fn set_pane_loading(ui: &App, pane: usize, loading: bool) {
 }
 
 fn clear_pane_view(ui: &App, pane: usize, cwd: &str) {
+    // A remote list (the only current caller) replaces any local view. Invalidate pending local
+    // folder walks before clearing so a late result cannot mutate the new remote model.
+    LOCAL_LIST_GENERATION[pane].fetch_add(1, AtomicOrdering::Relaxed);
     let empty = ModelRc::from(Rc::new(VecModel::from(Vec::<EntryRow>::new())));
     if let Ok(mut g) = TRUE_SIZE.lock() {
         g.retain(|(p, _), _| *p != pane);
@@ -2498,7 +2625,12 @@ fn local_folder_stats_inner(
             break;
         }
         let path = entry.path();
-        let Ok(md) = entry.metadata() else { continue };
+        let Ok(md) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if md.file_type().is_symlink() {
+            continue;
+        }
         if md.is_dir() {
             local_folder_stats_inner(&path, max_files, stats, visited);
         } else {
@@ -2518,49 +2650,223 @@ fn local_folder_stats_inner(
     }
 }
 
-fn list_local_pane(ui: &App, pane: usize, path: &Path, cwd: &str) {
-    let mut rows: Vec<EntryRow> = Vec::new();
-    let mut meta: Vec<(String, u64, i64)> = Vec::new();
-    match std::fs::read_dir(path) {
-        Ok(read) => {
-            for entry in read.flatten() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                let md = match entry.metadata() {
-                    Ok(m) => m,
-                    Err(_) => continue,
-                };
-                let is_dir = md.is_dir();
-                let len = md.len();
-                let item_path = entry.path();
-                let folder_stats =
-                    is_dir.then(|| local_folder_stats(&item_path, MAX_LOCAL_FOLDER_STAT_FILES));
-                let display_size = folder_stats.map(|s| s.size).unwrap_or(len);
-                let partial = folder_stats.map(|s| s.truncated).unwrap_or(false);
-                let own_mtime = md
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs() as i64)
-                    .unwrap_or(0);
-                let mtime = folder_stats
-                    .and_then(|s| s.newest_mtime)
-                    .unwrap_or(own_mtime);
-                rows.push(EntryRow {
-                    name: name.clone().into(),
-                    is_dir,
-                    size: display_size as i32,
-                    mtime: mtime as i32,
-                    date: fmt_date(mtime).into(),
-                    size_text: fmt_size_partial(display_size, partial).into(),
-                    metadata_state: "ready".into(),
-                });
-                meta.push((name, display_size, mtime));
+fn local_folder_stats_cached(root: &Path, max_files: usize) -> FolderStats {
+    let root_modified = std::fs::metadata(root)
+        .and_then(|metadata| metadata.modified())
+        .ok();
+    let key = (root.to_path_buf(), max_files);
+    let now = Instant::now();
+
+    let value = match LOCAL_FOLDER_STATS_CACHE.lock() {
+        Ok(mut cache) => {
+            cache.retain(|_, slot| {
+                slot.value.get().is_none_or(|cached| {
+                    now.saturating_duration_since(cached.cached_at) <= LOCAL_FOLDER_STATS_CACHE_TTL
+                })
+            });
+
+            let reusable = cache.get(&key).filter(|slot| {
+                slot.root_modified == root_modified
+                    && slot.value.get().is_none_or(|cached| {
+                        now.saturating_duration_since(cached.cached_at)
+                            <= LOCAL_FOLDER_STATS_CACHE_TTL
+                    })
+            });
+            if let Some(slot) = reusable {
+                slot.value.clone()
+            } else {
+                if cache.len() >= MAX_LOCAL_FOLDER_STATS_CACHE_ENTRIES {
+                    let oldest = cache
+                        .iter()
+                        .filter_map(|(key, slot)| {
+                            slot.value
+                                .get()
+                                .map(|cached| (key.clone(), cached.cached_at))
+                        })
+                        .min_by_key(|(_, cached_at)| *cached_at)
+                        .map(|(key, _)| key);
+                    if let Some(oldest) = oldest {
+                        cache.remove(&oldest);
+                    }
+                }
+                let value = Arc::new(OnceLock::new());
+                cache.insert(
+                    key,
+                    LocalFolderStatsCacheSlot {
+                        root_modified,
+                        value: value.clone(),
+                    },
+                );
+                value
             }
         }
-        Err(e) => ui.set_error(format!("local: {e}").into()),
+        // A poisoned performance cache must never make directory listing unavailable.
+        Err(_) => return local_folder_stats(root, max_files),
+    };
+
+    value
+        .get_or_init(|| CachedLocalFolderStats {
+            stats: local_folder_stats(root, max_files),
+            cached_at: Instant::now(),
+        })
+        .stats
+}
+
+#[derive(Debug)]
+struct LocalFolderEnrichment {
+    name: String,
+    path: PathBuf,
+    own_mtime: i64,
+}
+
+struct LocalPaneSnapshot {
+    rows: Vec<EntryRow>,
+    meta: Vec<(String, u64, i64)>,
+    folders: Vec<LocalFolderEnrichment>,
+}
+
+/// Read only the immediate directory. Recursive folder sizes are deliberately excluded so the
+/// UI can render the listing before any tree walk starts.
+fn local_pane_snapshot(path: &Path) -> std::io::Result<LocalPaneSnapshot> {
+    let read = std::fs::read_dir(path)?;
+    let mut rows = Vec::new();
+    let mut meta = Vec::new();
+    let mut folders = Vec::new();
+
+    for entry in read.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let is_symlink = entry
+            .file_type()
+            .map(|file_type| file_type.is_symlink())
+            .unwrap_or(false);
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        let is_dir = metadata.is_dir();
+        let size = if is_dir { 0 } else { metadata.len() };
+        let mtime = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|duration| duration.as_secs() as i64)
+            .unwrap_or(0);
+
+        rows.push(EntryRow {
+            name: name.clone().into(),
+            is_dir,
+            size: size as i32,
+            mtime: mtime as i32,
+            date: fmt_date(mtime).into(),
+            size_text: fmt_size(size).into(),
+            metadata_state: if is_dir && is_symlink {
+                "unavailable"
+            } else if is_dir {
+                "loading"
+            } else {
+                "ready"
+            }
+            .into(),
+        });
+        meta.push((name.clone(), size, mtime));
+        if is_dir && !is_symlink {
+            folders.push(LocalFolderEnrichment {
+                name,
+                path: entry.path(),
+                own_mtime: mtime,
+            });
+        }
     }
+
+    Ok(LocalPaneSnapshot {
+        rows,
+        meta,
+        folders,
+    })
+}
+
+fn local_pane_request_is_current(ui: &App, pane: usize, cwd: &str, generation: u64) -> bool {
+    if LOCAL_LIST_GENERATION[pane].load(AtomicOrdering::Relaxed) != generation {
+        return false;
+    }
+    let current_cwd = if pane == 0 {
+        ui.get_local_cwd()
+    } else {
+        ui.get_remote_cwd()
+    };
+    current_cwd.as_str() == cwd
+}
+
+fn list_local_pane(ui: &App, pane: usize, path: &Path, cwd: &str) {
+    let started = Instant::now();
+    let generation = LOCAL_LIST_GENERATION[pane]
+        .fetch_add(1, AtomicOrdering::Relaxed)
+        .wrapping_add(1);
+    let snapshot = match local_pane_snapshot(path) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            ui.set_error(format!("local: {error}").into());
+            set_true_meta(pane, &[]);
+            set_pane_full(ui, pane, Vec::new(), cwd);
+            return;
+        }
+    };
+    let LocalPaneSnapshot {
+        rows,
+        meta,
+        folders,
+    } = snapshot;
+    let entry_count = rows.len();
+    let folder_count = folders.len();
     set_true_meta(pane, &meta);
     set_pane_full(ui, pane, rows, cwd);
+    tracing::debug!(
+        target: "gmacftp",
+        pane,
+        entries = entry_count,
+        folders = folder_count,
+        elapsed_ms = started.elapsed().as_millis(),
+        "local directory listed without recursive metadata"
+    );
+
+    if folders.is_empty() {
+        return;
+    }
+    let ui = ui.as_weak();
+    let cwd = cwd.to_string();
+    let _ = std::thread::Builder::new()
+        .name(format!("local-metadata-{pane}"))
+        .spawn(move || {
+            let enrichment_started = Instant::now();
+            for folder in folders {
+                if LOCAL_LIST_GENERATION[pane].load(AtomicOrdering::Relaxed) != generation {
+                    return;
+                }
+                let stats = local_folder_stats_cached(&folder.path, MAX_LOCAL_FOLDER_STAT_FILES);
+                let entry = RemoteEntry {
+                    name: folder.name,
+                    is_dir: true,
+                    size: stats.size,
+                    mtime: stats.newest_mtime.or(Some(folder.own_mtime)),
+                };
+                let request_ui = ui.clone();
+                let request_cwd = cwd.clone();
+                let _ = slint::invoke_from_event_loop(move || {
+                    let Some(ui) = request_ui.upgrade() else {
+                        return;
+                    };
+                    if !local_pane_request_is_current(&ui, pane, &request_cwd, generation) {
+                        return;
+                    }
+                    update_pane_entry_metadata(&ui, pane, &entry, stats.truncated, "ready");
+                });
+            }
+            tracing::debug!(
+                target: "gmacftp",
+                pane,
+                elapsed_ms = enrichment_started.elapsed().as_millis(),
+                "local folder metadata enriched"
+            );
+        });
 }
 
 fn set_pane_entries(
@@ -2658,6 +2964,67 @@ fn remote_pane_request_is_current(
     matches!(state.kind, PaneKind::Remote)
         && state.conn.as_ref().map(|conn| conn.id) == Some(connection_id)
         && state.cwd == cwd
+}
+
+fn pane_request_is_current(
+    panes: &Panes,
+    pane: usize,
+    remote: bool,
+    connection_id: Option<ConnectionId>,
+    cwd: &str,
+) -> bool {
+    let Ok(panes) = panes.lock() else {
+        return false;
+    };
+    let Some(state) = panes.get(pane) else {
+        return false;
+    };
+    let kind_matches = matches!(state.kind, PaneKind::Remote) == remote;
+    kind_matches
+        && state.cwd == cwd
+        && (!remote || state.conn.as_ref().map(|connection| connection.id) == connection_id)
+}
+
+fn cached_remote_folder_stats(
+    connection_id: ConnectionId,
+    path: &str,
+    max_files: usize,
+) -> Option<net::RemoteTreeStats> {
+    let now = Instant::now();
+    let mut cache = REMOTE_FOLDER_STATS_CACHE.lock().ok()?;
+    cache.retain(|_, cached| {
+        now.saturating_duration_since(cached.cached_at) <= REMOTE_FOLDER_STATS_CACHE_TTL
+    });
+    cache
+        .get(&(connection_id.0, path.to_string(), max_files))
+        .map(|cached| cached.stats.clone())
+}
+
+fn store_remote_folder_stats(
+    connection_id: ConnectionId,
+    path: String,
+    max_files: usize,
+    stats: &net::RemoteTreeStats,
+) {
+    let Ok(mut cache) = REMOTE_FOLDER_STATS_CACHE.lock() else {
+        return;
+    };
+    if cache.len() >= MAX_REMOTE_FOLDER_STATS_CACHE_ENTRIES {
+        if let Some(oldest) = cache
+            .iter()
+            .min_by_key(|(_, cached)| cached.cached_at)
+            .map(|(key, _)| key.clone())
+        {
+            cache.remove(&oldest);
+        }
+    }
+    cache.insert(
+        (connection_id.0, path, max_files),
+        CachedRemoteFolderStats {
+            stats: stats.clone(),
+            cached_at: Instant::now(),
+        },
+    );
 }
 
 /// Re-list a pane at its current cwd (Local → fs read; Remote → connect + list, per-op).
@@ -2807,6 +3174,13 @@ fn refresh_pane(
                     }
                 });
 
+                // Give navigation and transfers priority. If the user opens another directory
+                // during this short idle window, no recursive metadata connections are started.
+                tokio::time::sleep(REMOTE_METADATA_IDLE_DELAY).await;
+                if !remote_pane_request_is_current(&panes, pane, spec.id, &cwd) {
+                    return;
+                }
+
                 let enrichment_started = Instant::now();
                 let folders = entries
                     .iter()
@@ -2823,7 +3197,19 @@ fn refresh_pane(
                 let tasks = stream::iter(folders.into_iter().map(|(index, _, remote_path)| {
                     let spec = s.clone();
                     let password = password.clone();
+                    let panes = panes.clone();
+                    let cwd = cwd.clone();
                     async move {
+                        if !remote_pane_request_is_current(&panes, pane, spec.id, &cwd) {
+                            return (index, remote_path, None);
+                        }
+                        if let Some(stats) = cached_remote_folder_stats(
+                            spec.id,
+                            &remote_path,
+                            MAX_REMOTE_FOLDER_STAT_FILES,
+                        ) {
+                            return (index, remote_path, Some(Ok(Ok(stats))));
+                        }
                         let result = tokio::time::timeout(
                             std::time::Duration::from_secs(15),
                             net::remote_tree_stats(
@@ -2834,13 +3220,27 @@ fn refresh_pane(
                             ),
                         )
                         .await;
-                        (index, remote_path, result)
+                        if let Ok(Ok(stats)) = &result {
+                            store_remote_folder_stats(
+                                spec.id,
+                                remote_path.clone(),
+                                MAX_REMOTE_FOLDER_STAT_FILES,
+                                stats,
+                            );
+                        }
+                        (index, remote_path, Some(result))
                     }
                 }))
-                .buffer_unordered(4);
+                .buffer_unordered(REMOTE_METADATA_CONCURRENCY);
                 tokio::pin!(tasks);
                 let mut entries = entries;
                 while let Some((index, remote_path, result)) = tasks.next().await {
+                    let Some(result) = result else {
+                        continue;
+                    };
+                    if !remote_pane_request_is_current(&panes, pane, spec.id, &cwd) {
+                        return;
+                    }
                     let (metadata_state, partial) = match result {
                         Ok(Ok(stats)) => {
                             if let Some(entry) = entries.get_mut(index) {
@@ -3505,15 +3905,51 @@ fn transfer(
     if rows.len() > 1 {
         ui.set_status(format!("copying {} selected items…", rows.len()).into());
     }
-    for row in rows {
-        let name = row.name.to_string();
-        // Use the true u64 size from the sidecar (EntryRow.size is i32 and truncates >2 GiB);
-        // fall back to the i32 field only if the sidecar missed it.
-        let total = TRUE_SIZE
-            .lock()
-            .ok()
-            .and_then(|g| g.get(&(src_pane, name.clone())).copied())
-            .or((row.size > 0).then_some(row.size as u64));
+    let requests = rows
+        .into_iter()
+        .map(|row| {
+            let name = row.name.to_string();
+            // Use the true u64 size from the sidecar (EntryRow.size is i32 and truncates >2 GiB);
+            // fall back to the i32 field only if the sidecar missed it.
+            let total = TRUE_SIZE
+                .lock()
+                .ok()
+                .and_then(|g| g.get(&(src_pane, name.clone())).copied())
+                .or((row.size > 0).then_some(row.size as u64));
+            CopyRequest {
+                name,
+                is_dir: row.is_dir,
+                total,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let destination_is_remote = panes
+        .lock()
+        .ok()
+        .and_then(|panes| {
+            panes
+                .get(dst_pane)
+                .map(|pane| matches!(pane.kind, PaneKind::Remote))
+        })
+        .unwrap_or(false);
+    if requests.len() > 1 && destination_is_remote {
+        start_remote_transfer_batch(
+            handle,
+            store,
+            panes,
+            engine,
+            idx,
+            ui.as_weak(),
+            src_pane,
+            dst_pane,
+            requests,
+            batch,
+        );
+        return;
+    }
+
+    for request in requests {
         start_transfer(
             handle,
             store.clone(),
@@ -3523,12 +3959,170 @@ fn transfer(
             ui.as_weak(),
             src_pane,
             dst_pane,
-            name,
-            row.is_dir,
-            total,
+            request.name,
+            request.is_dir,
+            request.total,
             batch,
         );
     }
+}
+
+fn split_copy_conflicts(
+    requests: Vec<CopyRequest>,
+    existing_names: &HashSet<String>,
+) -> (Vec<CopyRequest>, Vec<CopyRequest>) {
+    requests
+        .into_iter()
+        .partition(|request| !existing_names.contains(&request.name))
+}
+
+/// Check a remote destination once for the entire Command/Shift selection. The old per-file
+/// path opened and authenticated one connection, then listed the same directory, for every item.
+fn start_remote_transfer_batch(
+    handle: &Handle,
+    store: Arc<dyn CredentialStore>,
+    panes: Panes,
+    engine: TransferEngine,
+    idx: Arc<Mutex<HashMap<i32, usize>>>,
+    ui: Weak<App>,
+    src_pane: usize,
+    dst_pane: usize,
+    requests: Vec<CopyRequest>,
+    batch: TransferBatch,
+) {
+    let (spec, cwd, source_remote, source_connection_id, source_cwd) = {
+        let Ok(panes) = panes.lock() else {
+            set_err(&ui, "could not read destination state");
+            return;
+        };
+        let Some(source) = panes.get(src_pane) else {
+            set_err(&ui, "invalid source pane");
+            return;
+        };
+        let Some(destination) = panes.get(dst_pane) else {
+            set_err(&ui, "invalid destination pane");
+            return;
+        };
+        let Some(spec) = destination.conn.clone() else {
+            set_err(&ui, "destination is not connected");
+            return;
+        };
+        (
+            spec,
+            destination.cwd.clone(),
+            matches!(source.kind, PaneKind::Remote),
+            source.conn.as_ref().map(|connection| connection.id),
+            source.cwd.clone(),
+        )
+    };
+    let Some(password) = password_for(&store, &spec) else {
+        set_err(&ui, "missing credential");
+        return;
+    };
+
+    let handle = handle.clone();
+    handle.clone().spawn(async move {
+        let started = Instant::now();
+        let mut listing_spec = spec.clone();
+        listing_spec.initial_path = cwd.clone();
+        let entries = match net::connect_and_list(&listing_spec, &password).await {
+            Ok((entries, _)) => entries,
+            Err(error) => {
+                set_err(&ui, &format!("conflict check failed: {error}"));
+                return;
+            }
+        };
+        let existing_names = entries
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect::<HashSet<_>>();
+        let request_count = requests.len();
+        let (ready, conflicts) = split_copy_conflicts(requests, &existing_names);
+        tracing::info!(
+            target: "gmacftp",
+            host = %spec.host,
+            items = request_count,
+            conflicts = conflicts.len(),
+            elapsed_ms = started.elapsed().as_millis(),
+            "batch destination checked with one directory listing"
+        );
+
+        let request_ui = ui.clone();
+        let request_panes = panes.clone();
+        let request_cwd = cwd.clone();
+        let connection_id = spec.id;
+        let _ = slint::invoke_from_event_loop(move || {
+            let destination_current = remote_pane_request_is_current(
+                &request_panes,
+                dst_pane,
+                connection_id,
+                &request_cwd,
+            );
+            let source_current = pane_request_is_current(
+                &request_panes,
+                src_pane,
+                source_remote,
+                source_connection_id,
+                &source_cwd,
+            );
+            if !destination_current || !source_current {
+                if let Some(ui) = request_ui.upgrade() {
+                    ui.set_status("".into());
+                    ui.set_error(
+                        "Source or destination changed; copy was cancelled safely.".into(),
+                    );
+                }
+                return;
+            }
+
+            for request in ready {
+                do_transfer(
+                    &handle,
+                    store.clone(),
+                    panes.clone(),
+                    engine.clone(),
+                    idx.clone(),
+                    request_ui.clone(),
+                    src_pane,
+                    dst_pane,
+                    request.name.clone(),
+                    request.name,
+                    request.is_dir,
+                    request.total,
+                    batch,
+                );
+            }
+
+            if !conflicts.is_empty() {
+                let Ok(mut pending) = PENDING_COPY.lock() else {
+                    if let Some(ui) = request_ui.upgrade() {
+                        ui.set_error("Could not queue overwrite decisions.".into());
+                    }
+                    return;
+                };
+                pending.extend(conflicts.into_iter().map(|request| {
+                    (
+                        src_pane,
+                        dst_pane,
+                        request.name,
+                        request.is_dir,
+                        request.total,
+                        batch,
+                    )
+                }));
+            }
+            if let Some(ui) = request_ui.upgrade() {
+                if !ui.get_overwrite_open()
+                    && PENDING_COPY
+                        .lock()
+                        .map(|pending| !pending.is_empty())
+                        .unwrap_or(false)
+                {
+                    show_next_overwrite(&ui);
+                }
+            }
+        });
+    });
 }
 
 /// Start a copy: check the destination for a name clash and open the overwrite dialog if there is
@@ -4209,6 +4803,486 @@ fn wire_send_sync(ui: &App, store: Arc<dyn CredentialStore>) {
     });
 }
 
+const MAX_SYNC_PREVIEW_ROWS: usize = 2_000;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FolderSyncContextKey {
+    local_pane: usize,
+    remote_pane: usize,
+    local_root: PathBuf,
+    remote_root: String,
+    connection_id: ConnectionId,
+}
+
+#[derive(Clone)]
+struct FolderSyncContext {
+    key: FolderSyncContextKey,
+    spec: ConnectionSpec,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FolderSyncCandidate {
+    label: String,
+    local_path: String,
+    remote_path: String,
+    bytes: u64,
+}
+
+#[derive(Clone)]
+struct PreparedFolderSync {
+    context: FolderSyncContext,
+    direction: TransferDirection,
+    exclusions: Vec<String>,
+    preview: gmacftp::folder_sync::SyncPreview,
+    candidates: Vec<FolderSyncCandidate>,
+}
+
+fn folder_sync_context(panes: &Panes) -> Result<FolderSyncContext, String> {
+    let panes = panes
+        .lock()
+        .map_err(|_| "could not inspect the panes".to_string())?;
+    let local = panes
+        .iter()
+        .enumerate()
+        .filter(|(_, pane)| matches!(pane.kind, PaneKind::Local))
+        .collect::<Vec<_>>();
+    let remote = panes
+        .iter()
+        .enumerate()
+        .filter(|(_, pane)| matches!(pane.kind, PaneKind::Remote))
+        .collect::<Vec<_>>();
+    if local.len() != 1 || remote.len() != 1 {
+        return Err(
+            "folder sync requires exactly one local pane and one connected server pane".to_string(),
+        );
+    }
+    let (local_pane, local) = local[0];
+    let (remote_pane, remote) = remote[0];
+    let spec = remote
+        .conn
+        .clone()
+        .ok_or_else(|| "the remote pane is not connected".to_string())?;
+    Ok(FolderSyncContext {
+        key: FolderSyncContextKey {
+            local_pane,
+            remote_pane,
+            local_root: PathBuf::from(&local.cwd),
+            remote_root: remote.cwd.clone(),
+            connection_id: spec.id,
+        },
+        spec,
+    })
+}
+
+fn folder_sync_context_is_current(panes: &Panes, expected: &FolderSyncContextKey) -> bool {
+    let Ok(panes) = panes.lock() else {
+        return false;
+    };
+    let Some(local) = panes.get(expected.local_pane) else {
+        return false;
+    };
+    let Some(remote) = panes.get(expected.remote_pane) else {
+        return false;
+    };
+    matches!(local.kind, PaneKind::Local)
+        && Path::new(&local.cwd) == expected.local_root
+        && matches!(remote.kind, PaneKind::Remote)
+        && remote.cwd == expected.remote_root
+        && remote.conn.as_ref().map(|spec| spec.id) == Some(expected.connection_id)
+}
+
+fn remote_sync_relative(root: &str, full_path: &str) -> Result<String, String> {
+    let root = root.trim().trim_end_matches('/');
+    let relative = if root.is_empty() || root == "." || root == "/" {
+        full_path.trim_start_matches('/')
+    } else {
+        let prefix = format!("{root}/");
+        full_path.strip_prefix(&prefix).ok_or_else(|| {
+            format!("server returned a path outside the synchronized folder: {full_path}")
+        })?
+    };
+    if relative.is_empty() {
+        return Err("server returned an empty file path".to_string());
+    }
+    net::sanitize_local_rel(relative).map_err(|error| error.to_string())
+}
+
+async fn prepare_folder_sync(
+    context: FolderSyncContext,
+    direction: TransferDirection,
+    exclusions: Vec<String>,
+    password: String,
+) -> Result<PreparedFolderSync, String> {
+    let local_root = context.key.local_root.clone();
+    let local_exclusions = exclusions.clone();
+    let local_walk =
+        tokio::task::spawn_blocking(move || walk_local_for_sync(&local_root, &local_exclusions));
+    let remote_walk = net::walk_remote(&context.spec, &password, context.key.remote_root.as_str());
+    let (local_tree, remote_files) = tokio::join!(local_walk, remote_walk);
+    let local_tree = local_tree
+        .map_err(|error| format!("local scan failed: {error}"))?
+        .map_err(|error| format!("local scan failed: {error}"))?;
+    let remote_files = remote_files.map_err(|error| format!("remote scan failed: {error}"))?;
+
+    let mut local_sizes = BTreeMap::new();
+    let mut local_paths = BTreeMap::new();
+    for (path, relative, bytes) in local_tree.files {
+        if local_sizes.insert(relative.clone(), bytes).is_some() {
+            return Err(format!("duplicate local path in sync scan: {relative}"));
+        }
+        local_paths.insert(relative, path);
+    }
+
+    let mut remote_sizes = BTreeMap::new();
+    let mut remote_paths = BTreeMap::new();
+    for (path, bytes) in remote_files {
+        let relative = remote_sync_relative(&context.key.remote_root, &path)?;
+        if remote_sizes.insert(relative.clone(), bytes).is_some() {
+            return Err(format!("server returned duplicate path: {relative}"));
+        }
+        remote_paths.insert(relative, path);
+    }
+
+    let (source, target) = match direction {
+        TransferDirection::Upload => (&local_sizes, &remote_sizes),
+        TransferDirection::Download => (&remote_sizes, &local_sizes),
+    };
+    let preview = gmacftp::folder_sync::build_preview(source, target, &exclusions);
+    let mut candidates = Vec::with_capacity(preview.actions.len());
+    for action in &preview.actions {
+        let relative = &action.relative_path;
+        let (local_path, remote_path) = match direction {
+            TransferDirection::Upload => {
+                let local = local_paths
+                    .get(relative)
+                    .ok_or_else(|| format!("local file disappeared during scan: {relative}"))?;
+                let remote = join_remote(PathBuf::from(&context.key.remote_root).join(relative));
+                (local.clone(), remote)
+            }
+            TransferDirection::Download => {
+                let remote = remote_paths
+                    .get(relative)
+                    .ok_or_else(|| format!("remote file disappeared during scan: {relative}"))?;
+                let local = remote_local_target(&context.key.local_root, relative)
+                    .map_err(|error| error.to_string())?;
+                (local, remote.clone())
+            }
+        };
+        candidates.push(FolderSyncCandidate {
+            label: relative.clone(),
+            local_path: local_path.to_string_lossy().into_owned(),
+            remote_path,
+            bytes: action.bytes,
+        });
+    }
+    Ok(PreparedFolderSync {
+        context,
+        direction,
+        exclusions,
+        preview,
+        candidates,
+    })
+}
+
+fn folder_sync_summary(prepared: &PreparedFolderSync, changed_since_preview: bool) -> String {
+    let p = &prepared.preview;
+    let prefix = if changed_since_preview {
+        "Folders changed; review the refreshed dry-run. "
+    } else {
+        ""
+    };
+    let hidden = p.actions.len().saturating_sub(MAX_SYNC_PREVIEW_ROWS);
+    let shown = if hidden > 0 {
+        format!(" Showing the first {MAX_SYNC_PREVIEW_ROWS} (+{hidden} more).")
+    } else {
+        String::new()
+    };
+    format!(
+        "{prefix}{} to copy; {} unchanged; {} target-only kept; {} excluded. Path+size comparison; no deletions.{shown}",
+        p.actions.len(), p.unchanged, p.target_only, p.excluded
+    )
+}
+
+fn show_folder_sync_preview(ui: &App, prepared: &PreparedFolderSync, changed: bool) {
+    let action = match prepared.direction {
+        TransferDirection::Upload => "UPLOAD",
+        TransferDirection::Download => "DOWNLOAD",
+    };
+    let rows = prepared
+        .preview
+        .actions
+        .iter()
+        .take(MAX_SYNC_PREVIEW_ROWS)
+        .map(|item| SyncRow {
+            path: item.relative_path.clone().into(),
+            action: action.into(),
+            reason: match item.reason {
+                gmacftp::folder_sync::SyncReason::Missing => "missing",
+                gmacftp::folder_sync::SyncReason::DifferentSize => "size differs",
+            }
+            .into(),
+            size_text: fmt_size(item.bytes).into(),
+        })
+        .collect::<Vec<_>>();
+    ui.set_sync_rows(ModelRc::from(Rc::new(VecModel::from(rows))));
+    ui.set_sync_summary(folder_sync_summary(prepared, changed).into());
+    ui.set_sync_preview_ready(true);
+    ui.set_sync_scanning(false);
+}
+
+fn start_folder_sync_scan(
+    handle: Handle,
+    store: Arc<dyn CredentialStore>,
+    panes: Panes,
+    engine: TransferEngine,
+    idx: Arc<Mutex<HashMap<i32, usize>>>,
+    ui: Weak<App>,
+    direction: String,
+    exclusions: String,
+    apply: bool,
+) {
+    let direction = match direction.as_str() {
+        "download" => TransferDirection::Download,
+        _ => TransferDirection::Upload,
+    };
+    let exclusions = match gmacftp::folder_sync::parse_exclusions(&exclusions) {
+        Ok(exclusions) => exclusions,
+        Err(error) => {
+            if let Some(ui) = ui.upgrade() {
+                ui.set_sync_summary(format!("Invalid exclusions: {error}").into());
+                ui.set_error(format!("Invalid sync exclusions: {error}").into());
+            }
+            return;
+        }
+    };
+    let context = match folder_sync_context(&panes) {
+        Ok(context) => context,
+        Err(error) => {
+            if let Some(ui) = ui.upgrade() {
+                ui.set_sync_summary(error.clone().into());
+                ui.set_error(error.into());
+            }
+            return;
+        }
+    };
+    let expected = if apply {
+        PENDING_FOLDER_SYNC
+            .lock()
+            .ok()
+            .and_then(|pending| pending.clone())
+    } else {
+        None
+    };
+    if apply && expected.is_none() {
+        if let Some(ui) = ui.upgrade() {
+            ui.set_sync_summary("Run a dry-run preview before applying.".into());
+        }
+        return;
+    }
+    let Some(password) = password_for(&store, &context.spec) else {
+        if let Some(ui) = ui.upgrade() {
+            ui.set_sync_summary("The server credential is unavailable.".into());
+            ui.set_error("missing credential".into());
+        }
+        return;
+    };
+    let generation = FOLDER_SYNC_GENERATION.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+    if let Some(ui) = ui.upgrade() {
+        ui.set_error("".into());
+        ui.set_sync_scanning(true);
+        ui.set_sync_summary(
+            if apply {
+                "Rechecking both folders before applying…"
+            } else {
+                "Scanning both folders for a dry-run preview…"
+            }
+            .into(),
+        );
+        if !apply {
+            ui.set_sync_preview_ready(false);
+            ui.set_sync_rows(ModelRc::from(Rc::new(
+                VecModel::from(Vec::<SyncRow>::new()),
+            )));
+        }
+    }
+    handle.clone().spawn(async move {
+        let prepared = prepare_folder_sync(context, direction, exclusions, password).await;
+        if FOLDER_SYNC_GENERATION.load(AtomicOrdering::Relaxed) != generation {
+            return;
+        }
+        let prepared = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(ui) = ui.upgrade() {
+                        ui.set_sync_scanning(false);
+                        ui.set_sync_preview_ready(false);
+                        ui.set_sync_summary(format!("Sync preview failed: {error}").into());
+                        ui.set_error(format!("Sync preview failed: {error}").into());
+                    }
+                });
+                return;
+            }
+        };
+        if !folder_sync_context_is_current(&panes, &prepared.context.key) {
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(ui) = ui.upgrade() {
+                    ui.set_sync_scanning(false);
+                    ui.set_sync_preview_ready(false);
+                    ui.set_sync_summary(
+                        "A pane changed during the scan; run the preview again.".into(),
+                    );
+                }
+            });
+            return;
+        }
+
+        if !apply {
+            if let Ok(mut pending) = PENDING_FOLDER_SYNC.lock() {
+                *pending = Some(prepared.clone());
+            }
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(ui) = ui.upgrade() {
+                    show_folder_sync_preview(&ui, &prepared, false);
+                }
+            });
+            return;
+        }
+
+        let expected = expected.expect("apply path checked above");
+        let unchanged = expected.context.key == prepared.context.key
+            && expected.direction == prepared.direction
+            && expected.exclusions == prepared.exclusions
+            && expected.preview == prepared.preview
+            && expected.candidates == prepared.candidates;
+        if !unchanged {
+            if let Ok(mut pending) = PENDING_FOLDER_SYNC.lock() {
+                *pending = Some(prepared.clone());
+            }
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(ui) = ui.upgrade() {
+                    show_folder_sync_preview(&ui, &prepared, true);
+                }
+            });
+            return;
+        }
+
+        if let Ok(mut pending) = PENDING_FOLDER_SYNC.lock() {
+            *pending = None;
+        }
+        let plans = prepared
+            .candidates
+            .into_iter()
+            .map(|candidate| PlannedXfer {
+                id: fresh_xfer_id(),
+                label: candidate.label,
+                local_path: candidate.local_path,
+                remote_path: candidate.remote_path,
+                bytes_total: Some(candidate.bytes),
+            })
+            .collect::<Vec<_>>();
+        let count = plans.len();
+        let spec = prepared.context.spec;
+        let host = spec.host.clone();
+        let direction = prepared.direction;
+        let batch = fresh_batch(count > 1);
+        let close_ui = ui.clone();
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(ui) = close_ui.upgrade() {
+                ui.set_sync_scanning(false);
+                ui.set_sync_open(false);
+                ui.set_status(format!("queued {count} synchronized file(s)…").into());
+            }
+        });
+        if !plans.is_empty() {
+            stream_folder_transfers(
+                &engine,
+                ui,
+                idx,
+                spec,
+                direction,
+                host,
+                plans,
+                format!("synchronizing {count} files…"),
+                batch,
+            )
+            .await;
+        }
+    });
+}
+
+fn wire_folder_sync(
+    ui: &App,
+    handle: &Handle,
+    store: Arc<dyn CredentialStore>,
+    panes: Panes,
+    engine: TransferEngine,
+    idx: Arc<Mutex<HashMap<i32, usize>>>,
+) {
+    let open_panes = panes.clone();
+    let open_ui = ui.as_weak();
+    ui.on_open_folder_sync(move || {
+        let Some(ui) = open_ui.upgrade() else {
+            return;
+        };
+        if let Err(error) = folder_sync_context(&open_panes) {
+            ui.set_error(error.into());
+            return;
+        }
+        FOLDER_SYNC_GENERATION.fetch_add(1, AtomicOrdering::Relaxed);
+        if let Ok(mut pending) = PENDING_FOLDER_SYNC.lock() {
+            *pending = None;
+        }
+        ui.set_sync_direction("upload".into());
+        ui.set_sync_exclusions(gmacftp::folder_sync::DEFAULT_EXCLUSIONS.into());
+        ui.set_sync_summary("Choose a direction, then run the dry-run preview.".into());
+        ui.set_sync_rows(ModelRc::from(Rc::new(
+            VecModel::from(Vec::<SyncRow>::new()),
+        )));
+        ui.set_sync_preview_ready(false);
+        ui.set_sync_scanning(false);
+        ui.set_sync_open(true);
+    });
+
+    let (preview_handle, preview_store, preview_panes, preview_engine, preview_idx, preview_ui) = (
+        handle.clone(),
+        store.clone(),
+        panes.clone(),
+        engine.clone(),
+        idx.clone(),
+        ui.as_weak(),
+    );
+    ui.on_preview_folder_sync(move |direction, exclusions| {
+        start_folder_sync_scan(
+            preview_handle.clone(),
+            preview_store.clone(),
+            preview_panes.clone(),
+            preview_engine.clone(),
+            preview_idx.clone(),
+            preview_ui.clone(),
+            direction.to_string(),
+            exclusions.to_string(),
+            false,
+        );
+    });
+
+    let (apply_handle, apply_store, apply_panes, apply_engine, apply_idx, apply_ui) =
+        (handle.clone(), store, panes, engine, idx, ui.as_weak());
+    ui.on_apply_folder_sync(move |direction, exclusions| {
+        start_folder_sync_scan(
+            apply_handle.clone(),
+            apply_store.clone(),
+            apply_panes.clone(),
+            apply_engine.clone(),
+            apply_idx.clone(),
+            apply_ui.clone(),
+            direction.to_string(),
+            exclusions.to_string(),
+            true,
+        );
+    });
+}
+
 /// One planned file in a folder transfer (the Send-friendly payload built off the UI thread; the
 /// panel row is materialised from it on the UI thread because Slint models are !Send).
 #[derive(Clone)]
@@ -4287,6 +5361,11 @@ async fn stream_folder_transfers(
             local_path: p.local_path,
             remote_path: p.remote_path,
             bytes_total: p.bytes_total,
+            resume_token: if matches!(direction, TransferDirection::Download) {
+                rand::random()
+            } else {
+                0
+            },
         };
         engine.enqueue(job, spec.clone()).await;
     }
@@ -4721,6 +5800,14 @@ fn canonicalize_local_lenient(path: &Path) -> Result<PathBuf, String> {
 /// directory identity set rejects alias/cycle tricks even on filesystems that permit unusual
 /// directory links.
 fn walk_local_with_limits(base: &Path, limits: LocalTreeLimits) -> Result<LocalTree, String> {
+    walk_local_with_limits_and_filter(base, limits, None)
+}
+
+fn walk_local_with_limits_and_filter(
+    base: &Path,
+    limits: LocalTreeLimits,
+    excluded: Option<&dyn Fn(&str) -> bool>,
+) -> Result<LocalTree, String> {
     let base_metadata = std::fs::symlink_metadata(base)
         .map_err(|e| format!("cannot inspect {}: {e}", base.display()))?;
     if base_metadata.file_type().is_symlink() {
@@ -4758,16 +5845,21 @@ fn walk_local_with_limits(base: &Path, limits: LocalTreeLimits) -> Result<LocalT
                 .into_string()
                 .map_err(|_| format!("refusing non-UTF-8 filename in {}", dir.display()))?;
             let path = entry.path();
-            let metadata = std::fs::symlink_metadata(&path)
-                .map_err(|e| format!("cannot inspect {}: {e}", path.display()))?;
-            if metadata.file_type().is_symlink() {
-                return Err(format!("refusing to traverse symlink {}", path.display()));
-            }
             let child_relative = if relative.is_empty() {
                 name
             } else {
                 format!("{relative}/{name}")
             };
+            // Exclusions are applied before metadata inspection/traversal. An excluded symlink or
+            // special file is never opened and cannot redirect the walk; it is simply out of scope.
+            if excluded.is_some_and(|is_excluded| is_excluded(&child_relative)) {
+                continue;
+            }
+            let metadata = std::fs::symlink_metadata(&path)
+                .map_err(|e| format!("cannot inspect {}: {e}", path.display()))?;
+            if metadata.file_type().is_symlink() {
+                return Err(format!("refusing to traverse symlink {}", path.display()));
+            }
             if metadata.is_dir() {
                 let child_depth = depth + 1;
                 if child_depth > limits.max_depth {
@@ -4820,6 +5912,11 @@ fn walk_local_with_limits(base: &Path, limits: LocalTreeLimits) -> Result<LocalT
 /// report a readable error instead of silently uploading an incomplete tree.
 fn walk_local(base: &Path) -> Result<LocalTree, String> {
     walk_local_with_limits(base, DEFAULT_LOCAL_TREE_LIMITS)
+}
+
+fn walk_local_for_sync(base: &Path, exclusions: &[String]) -> Result<LocalTree, String> {
+    let excluded = |relative: &str| gmacftp::folder_sync::is_excluded(relative, exclusions);
+    walk_local_with_limits_and_filter(base, DEFAULT_LOCAL_TREE_LIMITS, Some(&excluded))
 }
 
 fn copy_local_file(src: &Path, dst: &Path) -> Result<usize, String> {
@@ -4974,10 +6071,15 @@ fn password_for(store: &Arc<dyn CredentialStore>, spec: &ConnectionSpec) -> Opti
         }
     }
     tracing::debug!(target: "gmacftp::creds", host = %spec.host, user = %spec.user, "credential lookup (private vault; silent — no Keychain prompt)");
-    let p = store
-        .get_for(&key)
-        .ok()
-        .map(|b| String::from_utf8_lossy(&b).into_owned())?;
+    let p = match store.get_for(&key) {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        Err(store::CredentialError::NotFound)
+            if spec.protocol == Protocol::Sftp && spec.sftp_auth != SftpAuth::Password =>
+        {
+            String::new()
+        }
+        Err(_) => return None,
+    };
     if let Ok(mut cache) = PASSWORD_CACHE.lock() {
         cache.insert(key, Zeroizing::new(p.clone()));
     }
@@ -5445,6 +6547,459 @@ fn wire_confirm_delete(ui: &App, handle: &Handle, store: Arc<dyn CredentialStore
     });
 }
 
+fn validate_file_operation_name(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    if value.is_empty()
+        || matches!(value, "." | "..")
+        || value.len() > 255
+        || value.contains(['/', '\\'])
+        || value.chars().any(char::is_control)
+    {
+        return Err("Name must be a single safe path component (1–255 bytes).".into());
+    }
+    Ok(value.to_string())
+}
+
+fn parse_permission_mode(value: &str) -> Result<u32, String> {
+    let value = value.trim().trim_start_matches("0o");
+    if value.len() != 3 || !value.bytes().all(|byte| matches!(byte, b'0'..=b'7')) {
+        return Err("Permissions must be three octal digits, for example 644 or 755.".into());
+    }
+    u32::from_str_radix(value, 8).map_err(|_| "Invalid permission mode.".into())
+}
+
+/// Finder-style rename must not silently replace an item created between the UI's existence check
+/// and the filesystem operation. macOS exposes an atomic no-replace rename for exactly this case.
+#[cfg(target_os = "macos")]
+fn rename_local_noreplace(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let source = CString::new(source.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in source path"))?;
+    let destination = CString::new(destination.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in destination path")
+    })?;
+    // SAFETY: both C strings are NUL-terminated and remain alive for the call. `AT_FDCWD` makes
+    // the absolute/relative path semantics identical to std::fs::rename; RENAME_EXCL is atomic.
+    let result = unsafe {
+        libc::renameatx_np(
+            libc::AT_FDCWD,
+            source.as_ptr(),
+            libc::AT_FDCWD,
+            destination.as_ptr(),
+            libc::RENAME_EXCL,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn rename_local_noreplace(source: &Path, destination: &Path) -> std::io::Result<()> {
+    if std::fs::symlink_metadata(destination).is_ok() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "destination already exists",
+        ));
+    }
+    std::fs::rename(source, destination)
+}
+
+fn wire_file_operations(ui: &App, handle: &Handle, store: Arc<dyn CredentialStore>, panes: Panes) {
+    let (handle, ui_weak) = (handle.clone(), ui.as_weak());
+    ui.on_confirm_file_operation(move |mode, pane_alias, old_name, value, _is_dir| {
+        let pane = usize::from(pane_alias.as_str() == "remote");
+        let mode = mode.to_string();
+        let old_name = old_name.to_string();
+        let value = value.to_string();
+        let old_name = if matches!(mode.as_str(), "rename" | "chmod") {
+            match validate_file_operation_name(&old_name) {
+                Ok(name) => name,
+                Err(error) => {
+                    if let Some(ui) = ui_weak.upgrade() {
+                        ui.set_error(error.into());
+                    }
+                    return;
+                }
+            }
+        } else {
+            old_name
+        };
+        let parsed_name = if matches!(mode.as_str(), "rename" | "mkdir") {
+            match validate_file_operation_name(&value) {
+                Ok(name) => Some(name),
+                Err(error) => {
+                    if let Some(ui) = ui_weak.upgrade() {
+                        ui.set_error(error.into());
+                    }
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        let parsed_mode = if mode == "chmod" {
+            match parse_permission_mode(&value) {
+                Ok(mode) => Some(mode),
+                Err(error) => {
+                    if let Some(ui) = ui_weak.upgrade() {
+                        ui.set_error(error.into());
+                    }
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+
+        let (kind, spec, cwd) = {
+            let states = panes.lock().expect("panes");
+            (
+                states[pane].kind.clone(),
+                states[pane].conn.clone(),
+                states[pane].cwd.clone(),
+            )
+        };
+        let request_remote = matches!(kind, PaneKind::Remote);
+        let connection_id = spec.as_ref().map(|spec| spec.id);
+        let request_panes = panes.clone();
+        let request_ui = ui_weak.clone();
+        let request_handle = handle.clone();
+        let request_store = store.clone();
+        let request_cwd = cwd.clone();
+
+        handle.spawn(async move {
+            let result: Result<String, String> = async {
+                match kind {
+                    PaneKind::Local => {
+                        let cwd = PathBuf::from(&cwd);
+                        tokio::task::spawn_blocking(move || match mode.as_str() {
+                            "rename" => {
+                                let new_name = parsed_name.expect("validated rename name");
+                                let source = cwd.join(&old_name);
+                                let destination = cwd.join(&new_name);
+                                net::assert_within(&cwd, &source).map_err(|e| e.to_string())?;
+                                net::assert_within(&cwd, &destination)
+                                    .map_err(|e| e.to_string())?;
+                                if source == destination {
+                                    return Ok("Name is unchanged.".into());
+                                }
+                                rename_local_noreplace(&source, &destination).map_err(|e| {
+                                    if e.kind() == std::io::ErrorKind::AlreadyExists {
+                                        format!("{new_name} already exists.")
+                                    } else {
+                                        format!("rename failed: {e}")
+                                    }
+                                })?;
+                                Ok(format!("Renamed {old_name} to {new_name}."))
+                            }
+                            "mkdir" => {
+                                let name = parsed_name.expect("validated folder name");
+                                let path = cwd.join(&name);
+                                net::assert_within(&cwd, &path).map_err(|e| e.to_string())?;
+                                std::fs::create_dir(&path)
+                                    .map_err(|e| format!("could not create folder: {e}"))?;
+                                Ok(format!("Created folder {name}."))
+                            }
+                            "chmod" => {
+                                let path = cwd.join(&old_name);
+                                net::assert_within(&cwd, &path).map_err(|e| e.to_string())?;
+                                let metadata = std::fs::symlink_metadata(&path)
+                                    .map_err(|e| format!("could not inspect item: {e}"))?;
+                                if metadata.file_type().is_symlink() {
+                                    return Err("Refusing to chmod a symlink.".into());
+                                }
+                                #[cfg(unix)]
+                                {
+                                    use std::os::unix::fs::PermissionsExt;
+                                    let mode = parsed_mode.expect("validated permission mode");
+                                    std::fs::set_permissions(
+                                        &path,
+                                        std::fs::Permissions::from_mode(mode),
+                                    )
+                                    .map_err(|e| format!("chmod failed: {e}"))?;
+                                    Ok(format!("Permissions changed to {mode:03o}."))
+                                }
+                                #[cfg(not(unix))]
+                                Err("Permission editing is unavailable on this platform.".into())
+                            }
+                            _ => Err("Unknown file operation.".into()),
+                        })
+                        .await
+                        .map_err(|error| error.to_string())?
+                    }
+                    PaneKind::Remote => {
+                        let spec = spec.ok_or_else(|| "Pane is not connected.".to_string())?;
+                        let password = password_for(&request_store, &spec)
+                            .ok_or_else(|| "Missing credential.".to_string())?;
+                        match mode.as_str() {
+                            "rename" => {
+                                let new_name = parsed_name.expect("validated rename name");
+                                if new_name == old_name {
+                                    Ok("Name is unchanged.".into())
+                                } else if net::remote_exists(&spec, &password, &cwd, &new_name)
+                                    .await
+                                    .map_err(|e| e.to_string())?
+                                {
+                                    Err(format!("{new_name} already exists."))
+                                } else {
+                                    let from = join_remote(PathBuf::from(&cwd).join(&old_name));
+                                    let to = join_remote(PathBuf::from(&cwd).join(&new_name));
+                                    net::rename_remote(&spec, &password, &from, &to)
+                                        .await
+                                        .map_err(|e| e.to_string())?;
+                                    Ok(format!("Renamed {old_name} to {new_name}."))
+                                }
+                            }
+                            "mkdir" => {
+                                let name = parsed_name.expect("validated folder name");
+                                let path = join_remote(PathBuf::from(&cwd).join(&name));
+                                net::create_remote_dir(&spec, &password, &path)
+                                    .await
+                                    .map_err(|e| e.to_string())?;
+                                Ok(format!("Created folder {name}."))
+                            }
+                            "chmod" => {
+                                let permission = parsed_mode.expect("validated permission mode");
+                                let path = join_remote(PathBuf::from(&cwd).join(&old_name));
+                                net::chmod_remote(&spec, &password, &path, permission)
+                                    .await
+                                    .map_err(|e| e.to_string())?;
+                                Ok(format!("Permissions changed to {permission:03o}."))
+                            }
+                            _ => Err("Unknown file operation.".into()),
+                        }
+                    }
+                }
+            }
+            .await;
+
+            let _ = slint::invoke_from_event_loop(move || {
+                let Some(ui) = request_ui.upgrade() else {
+                    return;
+                };
+                match result {
+                    Ok(message) => {
+                        ui.set_error("".into());
+                        ui.set_status(message.into());
+                        if pane_request_is_current(
+                            &request_panes,
+                            pane,
+                            request_remote,
+                            connection_id,
+                            &request_cwd,
+                        ) {
+                            refresh_pane(
+                                &request_handle,
+                                request_store,
+                                request_panes,
+                                ui.as_weak(),
+                                pane,
+                            );
+                        }
+                    }
+                    Err(error) => ui.set_error(error.into()),
+                }
+            });
+        });
+    });
+}
+
+fn sha256_file(path: &Path) -> Result<[u8; 32], String> {
+    use sha2::Digest;
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("could not inspect edited file: {error}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err("edited path is no longer a regular file".into());
+    }
+    let mut file = std::fs::File::open(path)
+        .map_err(|error| format!("could not open edited file: {error}"))?;
+    let mut hasher = sha2::Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| format!("could not read edited file: {error}"))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher.finalize().into())
+}
+
+fn wire_remote_edit(ui: &App, handle: &Handle, store: Arc<dyn CredentialStore>, panes: Panes) {
+    let (handle, ui_weak) = (handle.clone(), ui.as_weak());
+    ui.on_edit_remote_file(move |pane_alias, name| {
+        let pane = usize::from(pane_alias.as_str() == "remote");
+        let name = match validate_file_operation_name(name.as_str()) {
+            Ok(name) => name,
+            Err(error) => {
+                if let Some(ui) = ui_weak.upgrade() {
+                    ui.set_error(error.into());
+                }
+                return;
+            }
+        };
+        let (spec, cwd) = {
+            let states = panes.lock().expect("panes");
+            if !matches!(states[pane].kind, PaneKind::Remote) {
+                if let Some(ui) = ui_weak.upgrade() {
+                    ui.set_error("Remote editing requires a connected server pane.".into());
+                }
+                return;
+            }
+            let Some(spec) = states[pane].conn.clone() else {
+                return;
+            };
+            (spec, states[pane].cwd.clone())
+        };
+        let Some(password) = password_for(&store, &spec) else {
+            if let Some(ui) = ui_weak.upgrade() {
+                ui.set_error("Missing credential.".into());
+            }
+            return;
+        };
+        if let Some(ui) = ui_weak.upgrade() {
+            ui.set_error("".into());
+            ui.set_status(format!("Downloading {name} for editing…").into());
+        }
+        let request_ui = ui_weak.clone();
+        let request_panes = panes.clone();
+        let request_handle = handle.clone();
+        let request_store = store.clone();
+        handle.spawn(async move {
+            let result: Result<String, String> = async {
+                let root = create_private_drag_root()?;
+                let local = remote_local_target(&root, &name).map_err(|e| e.to_string())?;
+                let remote = join_remote(PathBuf::from(&cwd).join(&name));
+                let operation: Result<String, String> = async {
+                    let mut listing_spec = spec.clone();
+                    listing_spec.initial_path = cwd.clone();
+                    let (entries, _) = net::connect_and_list(&listing_spec, &password)
+                        .await
+                        .map_err(|e| format!("could not inspect remote file: {e}"))?;
+                    let snapshot = entries
+                        .iter()
+                        .find(|entry| entry.name == name && !entry.is_dir)
+                        .ok_or_else(|| "Remote file no longer exists or is not a file.".to_string())?;
+                    if snapshot.size > MAX_REMOTE_EDIT_BYTES {
+                        return Err(format!(
+                            "Remote editing is limited to {}; download the file for larger changes.",
+                            fmt_size(MAX_REMOTE_EDIT_BYTES)
+                        ));
+                    }
+                    net::download_file_limited(
+                        &spec,
+                        &password,
+                        &remote,
+                        local.clone(),
+                        MAX_REMOTE_EDIT_BYTES,
+                    )
+                        .await
+                        .map_err(|e| format!("edit download failed: {e}"))?;
+                    let before = tokio::task::spawn_blocking({
+                        let local = local.clone();
+                        move || sha256_file(&local)
+                    })
+                    .await
+                    .map_err(|e| e.to_string())??;
+                    let editor_status = tokio::task::spawn_blocking({
+                        let local = local.clone();
+                        move || {
+                            std::process::Command::new("open")
+                                .arg("-W")
+                                .arg("--")
+                                .arg(local)
+                                .status()
+                        }
+                    })
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .map_err(|e| format!("could not open the default editor: {e}"))?;
+                    if !editor_status.success() {
+                        return Err("The default editor exited with an error; nothing was uploaded."
+                            .into());
+                    }
+                    let after = tokio::task::spawn_blocking({
+                        let local = local.clone();
+                        move || sha256_file(&local)
+                    })
+                    .await
+                    .map_err(|e| e.to_string())??;
+                    if before == after {
+                        return Ok(format!("{name} was not changed."));
+                    }
+
+                    // Optimistic concurrency check using exact bytes, not just LIST size/mtime.
+                    // FTP timestamps are often coarse and a same-size edit must still be caught.
+                    let current_copy = root.join(".gmacftp-server-current");
+                    net::download_file_limited(
+                        &spec,
+                        &password,
+                        &remote,
+                        current_copy.clone(),
+                        MAX_REMOTE_EDIT_BYTES,
+                    )
+                        .await
+                        .map_err(|e| format!("could not verify remote version: {e}"))?;
+                    let current_hash = tokio::task::spawn_blocking(move || {
+                        sha256_file(&current_copy)
+                    })
+                    .await
+                    .map_err(|e| e.to_string())??;
+                    if current_hash != before {
+                        return Err(
+                            "Remote file changed while the editor was open; local changes were not uploaded."
+                                .into(),
+                        );
+                    }
+                    net::upload_file(&spec, &password, local, &remote)
+                        .await
+                        .map_err(|e| format!("edited file upload failed: {e}"))?;
+                    Ok(format!("Uploaded edited {name}."))
+                }
+                .await;
+                let _ = std::fs::remove_dir_all(&root);
+                operation
+            }
+            .await;
+
+            let _ = slint::invoke_from_event_loop(move || {
+                let Some(ui) = request_ui.upgrade() else { return };
+                match result {
+                    Ok(message) => {
+                        ui.set_error("".into());
+                        ui.set_status(message.into());
+                        if remote_pane_request_is_current(
+                            &request_panes,
+                            pane,
+                            spec.id,
+                            &cwd,
+                        ) {
+                            refresh_pane(
+                                &request_handle,
+                                request_store,
+                                request_panes,
+                                ui.as_weak(),
+                                pane,
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        ui.set_status("".into());
+                        ui.set_error(error.into());
+                    }
+                }
+            });
+        });
+    });
+}
+
 // ── keyboard control + sidebar eject ──────────────────────────────────────────
 
 /// Arrow up/down: move the active pane's selection by `delta` (clamped to the list). With Shift,
@@ -5877,8 +7432,8 @@ fn wire_local_favorites(ui: &App, panes: Panes) {
     });
 }
 
-/// Remove finished (done/failed) rows from the transfer panel and rebuild the id→row index.
-fn wire_clear_finished(ui: &App, idx: Arc<Mutex<HashMap<i32, usize>>>) {
+/// Remove finished rows from the transfer panel and release their retry/resume records.
+fn wire_clear_finished(ui: &App, idx: Arc<Mutex<HashMap<i32, usize>>>, engine: TransferEngine) {
     let ui_weak = ui.as_weak();
     ui.on_clear_finished_transfers(move || {
         let ui = ui_weak.upgrade();
@@ -5891,8 +7446,11 @@ fn wire_clear_finished(ui: &App, idx: Arc<Mutex<HashMap<i32, usize>>>) {
                 i -= 1;
                 let finished = jobs
                     .row_data(i)
-                    .is_some_and(|r| r.state.as_str() == "done" || r.state.as_str() == "failed");
+                    .is_some_and(|r| matches!(r.state.as_str(), "done" | "failed" | "cancelled"));
                 if finished {
+                    if let Some(row) = jobs.row_data(i) {
+                        engine.forget_job(TransferId(row.id as usize));
+                    }
                     jobs.remove(i);
                 }
             }
@@ -5912,7 +7470,7 @@ fn wire_clear_finished(ui: &App, idx: Arc<Mutex<HashMap<i32, usize>>>) {
 }
 
 /// Per-row ✕ in the transfer panel: remove that one row (by id) and rebuild the id→row index.
-fn wire_dismiss_transfer(ui: &App, idx: Arc<Mutex<HashMap<i32, usize>>>) {
+fn wire_dismiss_transfer(ui: &App, idx: Arc<Mutex<HashMap<i32, usize>>>, engine: TransferEngine) {
     let ui_weak = ui.as_weak();
     ui.on_dismiss_transfer(move |id| {
         TRANSFER_JOBS.with(|jm| {
@@ -5921,6 +7479,7 @@ fn wire_dismiss_transfer(ui: &App, idx: Arc<Mutex<HashMap<i32, usize>>>) {
             if let Some(i) = (0..jobs.row_count())
                 .find(|&i| jobs.row_data(i).map(|r| r.id == id).unwrap_or(false))
             {
+                engine.forget_job(TransferId(id as usize));
                 jobs.remove(i);
             }
             if let Ok(mut g) = idx.lock() {
@@ -5938,10 +7497,105 @@ fn wire_dismiss_transfer(ui: &App, idx: Arc<Mutex<HashMap<i32, usize>>>) {
     });
 }
 
+fn wire_individual_transfer_controls(
+    ui: &App,
+    idx: Arc<Mutex<HashMap<i32, usize>>>,
+    engine: TransferEngine,
+) {
+    let cancel_engine = engine.clone();
+    let cancel_ui = ui.as_weak();
+    let cancel_idx = idx.clone();
+    ui.on_cancel_transfer(move |id| {
+        cancel_engine.cancel_job(TransferId(id as usize));
+        TRANSFER_JOBS.with(|jm| {
+            let jobs = jm.borrow();
+            let Some(jobs) = jobs.as_ref() else { return };
+            let Some(index) = cancel_idx.lock().ok().and_then(|map| map.get(&id).copied()) else {
+                return;
+            };
+            if let Some(mut row) = jobs.row_data(index) {
+                row.message = "cancelling…".into();
+                jobs.set_row_data(index, row);
+            }
+        });
+        if let Some(ui) = cancel_ui.upgrade() {
+            ui.set_status("cancelling selected transfer…".into());
+            ui.set_error("".into());
+        }
+    });
+
+    let retry_ui = ui.as_weak();
+    ui.on_retry_transfer(move |id| {
+        let Some(ui) = retry_ui.upgrade() else { return };
+        match engine.retry_job(TransferId(id as usize)) {
+            Ok(()) => {
+                TRANSFER_JOBS.with(|jm| {
+                    let jobs = jm.borrow();
+                    let Some(jobs) = jobs.as_ref() else { return };
+                    let Some(index) = idx.lock().ok().and_then(|map| map.get(&id).copied()) else {
+                        return;
+                    };
+                    let Some(mut row) = jobs.row_data(index) else {
+                        return;
+                    };
+                    let resumable = row.direction.as_str() == "download";
+                    row.done = 0;
+                    row.fraction = 0.0;
+                    row.progress_text = fmt_transfer_progress(0, row.total.max(0) as u64).into();
+                    row.state = "queued".into();
+                    row.message = if resumable {
+                        "resuming…"
+                    } else {
+                        "retrying…"
+                    }
+                    .into();
+                    jobs.set_row_data(index, row);
+                    update_transfer_summary_from_model(&ui, jobs);
+                });
+                ui.set_transfer_error_open(false);
+                ui.set_error("".into());
+                ui.set_status("transfer queued again".into());
+            }
+            Err(gmacftp::transfer::RetryError::NotFound) => {
+                ui.set_error("Retry data is no longer available.".into())
+            }
+            Err(gmacftp::transfer::RetryError::QueueFull) => {
+                ui.set_error("Transfer queue is full.".into())
+            }
+        }
+    });
+}
+
 /// Transfer-panel "Pause all" toggle → engine.set_paused (stops dequeue of new transfers).
 fn wire_set_transfers_paused(ui: &App, engine: TransferEngine) {
     ui.on_set_transfers_paused(move |paused| {
         engine.set_paused(paused);
+    });
+}
+
+fn wire_set_transfer_concurrency(ui: &App, engine: TransferEngine) {
+    let ui_weak = ui.as_weak();
+    ui.on_set_transfer_concurrency(move |requested| {
+        let Some(ui) = ui_weak.upgrade() else { return };
+        let limit = (requested.max(0) as usize).clamp(
+            gmacftp::transfer::MIN_ENDPOINT_CONCURRENCY,
+            gmacftp::transfer::MAX_ENDPOINT_CONCURRENCY,
+        );
+        let mut settings = store::settings::load();
+        let previous = settings.transfer_concurrency;
+        settings.transfer_concurrency = limit;
+        match store::settings::try_save(&settings) {
+            Ok(()) => {
+                let applied = engine.set_endpoint_concurrency(limit);
+                ui.set_transfer_concurrency(applied as i32);
+                ui.set_error("".into());
+                ui.set_status(format!("Parallel server transfers: {applied}.").into());
+            }
+            Err(error) => {
+                ui.set_transfer_concurrency(previous as i32);
+                ui.set_error(format!("Could not save transfer concurrency: {error}").into());
+            }
+        }
     });
 }
 
@@ -6182,8 +7836,36 @@ fn wire_new(ui: &App) {
         ui.set_editor_port("21".into());
         ui.set_editor_user("".into());
         ui.set_editor_password("".into());
+        ui.set_editor_sftp_auth("password".into());
+        ui.set_editor_sftp_key_path("".into());
         ui.set_editor_allow_plaintext_ftp(false);
         ui.set_editor_open(true);
+    });
+}
+
+fn wire_choose_private_key(ui: &App, handle: &Handle) {
+    let handle = handle.clone();
+    let ui_weak = ui.as_weak();
+    ui.on_choose_private_key(move || {
+        let ui_weak = ui_weak.clone();
+        handle.spawn(async move {
+            let mut dialog = rfd::AsyncFileDialog::new().set_title("Choose SSH private key");
+            if let Some(home) = directories::BaseDirs::new() {
+                let ssh = home.home_dir().join(".ssh");
+                if ssh.is_dir() {
+                    dialog = dialog.set_directory(ssh);
+                }
+            }
+            let Some(file) = dialog.pick_file().await else {
+                return;
+            };
+            let path = file.path().to_string_lossy().into_owned();
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(ui) = ui_weak.upgrade() {
+                    ui.set_editor_sftp_key_path(path.into());
+                }
+            });
+        });
     });
 }
 
@@ -6198,11 +7880,15 @@ fn wire_edit(ui: &App, store: Arc<dyn CredentialStore>, conns: ConnList) {
             .find(|c| c.id.0 as i32 == id)
             .cloned();
         let Some(spec) = spec else { return };
-        let pw = CredentialKey::for_spec(&spec)
-            .ok()
-            .and_then(|key| store.get_for(&key).ok())
-            .map(|b| String::from_utf8_lossy(&b).into_owned())
-            .unwrap_or_default();
+        let pw = if spec.sftp_auth == SftpAuth::Agent {
+            String::new()
+        } else {
+            CredentialKey::for_spec(&spec)
+                .ok()
+                .and_then(|key| store.get_for(&key).ok())
+                .map(|b| String::from_utf8_lossy(&b).into_owned())
+                .unwrap_or_default()
+        };
         ui.set_editor_id(spec.id.0 as i32);
         ui.set_editor_name(spec.name.into());
         ui.set_editor_protocol(spec.protocol.to_string().into());
@@ -6210,6 +7896,15 @@ fn wire_edit(ui: &App, store: Arc<dyn CredentialStore>, conns: ConnList) {
         ui.set_editor_port(spec.port.to_string().into());
         ui.set_editor_user(spec.user.into());
         ui.set_editor_password(pw.into());
+        ui.set_editor_sftp_auth(
+            match spec.sftp_auth {
+                SftpAuth::Password => "password",
+                SftpAuth::PrivateKey => "private_key",
+                SftpAuth::Agent => "agent",
+            }
+            .into(),
+        );
+        ui.set_editor_sftp_key_path(spec.sftp_private_key.unwrap_or_default().into());
         ui.set_editor_allow_plaintext_ftp(spec.allow_plaintext_ftp);
         ui.set_editor_open(true);
     });
@@ -6303,6 +7998,18 @@ fn wire_save(ui: &App, store: Arc<dyn CredentialStore>, conns: ConnList) {
             .to_ascii_lowercase()
             .parse()
             .unwrap_or(Protocol::Ftp);
+        let sftp_auth = if protocol == Protocol::Sftp {
+            match ui.get_editor_sftp_auth().trim() {
+                "private_key" => SftpAuth::PrivateKey,
+                "agent" => SftpAuth::Agent,
+                _ => SftpAuth::Password,
+            }
+        } else {
+            SftpAuth::Password
+        };
+        let sftp_private_key = (sftp_auth == SftpAuth::PrivateKey)
+            .then(|| ui.get_editor_sftp_key_path().trim().to_string())
+            .filter(|path| !path.is_empty());
         let port: u16 = ui
             .get_editor_port()
             .trim()
@@ -6315,6 +8022,10 @@ fn wire_save(ui: &App, store: Arc<dyn CredentialStore>, conns: ConnList) {
 
         if name.trim().is_empty() || host.is_empty() || user.is_empty() {
             ui.set_manager_message("name, host and user are required".into());
+            return;
+        }
+        if sftp_auth == SftpAuth::PrivateKey && sftp_private_key.is_none() {
+            ui.set_manager_message("choose an SSH private-key file".into());
             return;
         }
 
@@ -6341,7 +8052,10 @@ fn wire_save(ui: &App, store: Arc<dyn CredentialStore>, conns: ConnList) {
             host,
             port,
             user,
-            initial_path: String::new(),
+            initial_path: previous
+                .as_ref()
+                .map(|previous| previous.initial_path.clone())
+                .unwrap_or_default(),
             allow_plaintext_ftp,
             // The toolbar owns this per-server policy today; editing other fields must not
             // silently discard a TLS exception the user explicitly approved earlier.
@@ -6349,6 +8063,8 @@ fn wire_save(ui: &App, store: Arc<dyn CredentialStore>, conns: ConnList) {
                 .as_ref()
                 .map(|previous| previous.accept_invalid_tls)
                 .unwrap_or(false),
+            sftp_auth,
+            sftp_private_key,
         };
 
         let new_key = match CredentialKey::for_spec(&spec) {
@@ -6461,6 +8177,8 @@ fn wire_save(ui: &App, store: Arc<dyn CredentialStore>, conns: ConnList) {
             }
         }
         refresh_connections_model(&ui, &conns);
+        ui.set_editor_password("".into());
+        ui.set_editor_sftp_key_path("".into());
         ui.set_editor_open(false);
         let message = if let Some(error) = cleanup_error {
             format!(
@@ -6665,6 +8383,11 @@ fn enqueue(
         local_path: local_path.to_string_lossy().to_string(),
         remote_path,
         bytes_total,
+        resume_token: if matches!(direction, TransferDirection::Download) {
+            rand::random()
+        } else {
+            0
+        },
     };
     if engine.try_enqueue(job, spec).is_err() {
         // M4/CONC-1: the bounded worker channel was full — the job was NOT accepted. Mark
@@ -6748,6 +8471,15 @@ fn spawn_progress_forwarder(
                             row.state = "failed".into();
                             row.message = msg.clone().into();
                             failed_name = row.name.to_string();
+                        }
+                        TransferState::Cancelled => {
+                            row.state = "cancelled".into();
+                            row.message = if row.direction.as_str() == "download" {
+                                "cancelled — Resume available"
+                            } else {
+                                "cancelled — Retry available"
+                            }
+                            .into();
                         }
                         TransferState::Skipped(msg) => {
                             row.state = "failed".into();
@@ -6841,6 +8573,11 @@ fn spawn_progress_forwarder(
                             ui.set_status("file transfer failed".into());
                             ui.set_error(msg.clone().into());
                         }
+                    }
+                    TransferState::Cancelled => {
+                        ui.set_transfer_active(false);
+                        ui.set_status("transfer cancelled — use Resume/Retry in Transfers".into());
+                        ui.set_error("".into());
                     }
                     TransferState::Skipped(_) => {
                         ui.set_transfer_active(false);
@@ -6983,14 +8720,37 @@ mod path_safety_tests {
     }
 
     #[test]
+    fn batch_conflict_partition_preserves_selection_order() {
+        let requests = ["one.txt", "two.txt", "three.txt"]
+            .into_iter()
+            .map(|name| CopyRequest {
+                name: name.to_string(),
+                is_dir: false,
+                total: Some(1),
+            })
+            .collect();
+        let existing = HashSet::from(["two.txt".to_string()]);
+
+        let (ready, conflicts) = split_copy_conflicts(requests, &existing);
+        assert_eq!(
+            ready
+                .iter()
+                .map(|request| request.name.as_str())
+                .collect::<Vec<_>>(),
+            ["one.txt", "three.txt"]
+        );
+        assert_eq!(conflicts[0].name, "two.txt");
+    }
+
+    #[test]
     fn remote_local_target_contains_lexical_and_symlink_escapes() {
         let temp = scratch_dir();
         let root = temp.join("downloads");
         let target = remote_local_target(&root, "../../.ssh/authorized_keys").unwrap();
         assert_eq!(target, root.join(".ssh/authorized_keys"));
         assert_eq!(
-            remote_local_target(&root, "/Users/alice/evil.plist").unwrap(),
-            root.join("Users/alice/evil.plist")
+            remote_local_target(&root, "/Users/demo/evil.plist").unwrap(),
+            root.join("Users/demo/evil.plist")
         );
         assert!(remote_local_target(&root, "bad\rname").is_err());
 
@@ -7029,6 +8789,53 @@ mod path_safety_tests {
         )
         .is_err());
 
+        let _ = std::fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn local_snapshot_defers_recursive_folder_metadata() {
+        let temp = scratch_dir();
+        let nested = temp.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("payload.bin"), vec![7_u8; 4096]).unwrap();
+        std::fs::write(temp.join("visible.txt"), b"visible").unwrap();
+        std::os::unix::fs::symlink(&nested, temp.join("linked-folder")).unwrap();
+
+        let snapshot = local_pane_snapshot(&temp).unwrap();
+        let folder = snapshot
+            .rows
+            .iter()
+            .find(|row| row.name.as_str() == "nested")
+            .unwrap();
+        assert!(folder.is_dir);
+        assert_eq!(
+            folder.size, 0,
+            "the initial snapshot must not walk the tree"
+        );
+        assert_eq!(folder.metadata_state.as_str(), "loading");
+        assert_eq!(snapshot.folders.len(), 1);
+        let linked = snapshot
+            .rows
+            .iter()
+            .find(|row| row.name.as_str() == "linked-folder")
+            .unwrap();
+        assert!(
+            !linked.is_dir,
+            "directory symlinks are never traversed as folders"
+        );
+        assert_eq!(linked.metadata_state.as_str(), "ready");
+
+        let file = snapshot
+            .rows
+            .iter()
+            .find(|row| row.name.as_str() == "visible.txt")
+            .unwrap();
+        assert!(!file.is_dir);
+        assert_eq!(file.size, 7);
+        assert_eq!(file.metadata_state.as_str(), "ready");
+
+        let enriched = local_folder_stats(&nested, MAX_LOCAL_FOLDER_STAT_FILES);
+        assert_eq!(enriched.size, 4096);
         let _ = std::fs::remove_dir_all(temp);
     }
 
@@ -7103,6 +8910,85 @@ mod path_safety_tests {
         assert!(validate_new_sync_passphrase("short").is_err());
         assert!(validate_new_sync_passphrase(&"x".repeat(MAX_SYNC_PASSPHRASE_BYTES + 1)).is_err());
         assert!(validate_new_sync_passphrase("correct horse battery staple").is_ok());
+    }
+
+    #[test]
+    fn file_operation_inputs_reject_traversal_and_invalid_permissions() {
+        assert_eq!(
+            validate_file_operation_name(" report.txt ").unwrap(),
+            "report.txt"
+        );
+        for invalid in [
+            "",
+            ".",
+            "..",
+            "../secret",
+            "folder/file",
+            "bad\\name",
+            "bad\nname",
+        ] {
+            assert!(
+                validate_file_operation_name(invalid).is_err(),
+                "{invalid:?}"
+            );
+        }
+        assert_eq!(parse_permission_mode("644").unwrap(), 0o644);
+        assert_eq!(parse_permission_mode("0o755").unwrap(), 0o755);
+        for invalid in ["64", "0644", "888", "u+rwx"] {
+            assert!(parse_permission_mode(invalid).is_err(), "{invalid:?}");
+        }
+    }
+
+    #[test]
+    fn atomic_local_rename_never_clobbers_an_existing_item() {
+        let temp = scratch_dir();
+        let source = temp.join("source.txt");
+        let destination = temp.join("destination.txt");
+        std::fs::write(&source, b"source").unwrap();
+        std::fs::write(&destination, b"destination").unwrap();
+        assert!(rename_local_noreplace(&source, &destination).is_err());
+        assert_eq!(std::fs::read(&source).unwrap(), b"source");
+        assert_eq!(std::fs::read(&destination).unwrap(), b"destination");
+
+        let free_destination = temp.join("renamed.txt");
+        rename_local_noreplace(&source, &free_destination).unwrap();
+        assert!(!source.exists());
+        assert_eq!(std::fs::read(&free_destination).unwrap(), b"source");
+        let _ = std::fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn sync_walk_prunes_excluded_trees_before_following_links() {
+        let temp = scratch_dir();
+        let root = temp.join("source");
+        let outside = temp.join("outside");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join(".git/escape")).unwrap();
+        std::fs::write(root.join("keep.txt"), b"keep").unwrap();
+        let rules =
+            gmacftp::folder_sync::parse_exclusions(gmacftp::folder_sync::DEFAULT_EXCLUSIONS)
+                .unwrap();
+        let tree = walk_local_for_sync(&root, &rules).unwrap();
+        assert_eq!(tree.files.len(), 1);
+        assert_eq!(tree.files[0].1, "keep.txt");
+        assert_eq!(
+            remote_sync_relative("/site", "/site/nested/file.txt").unwrap(),
+            "nested/file.txt"
+        );
+        assert!(remote_sync_relative("/site", "/site-other/file.txt").is_err());
+        let _ = std::fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn edited_file_hash_detects_same_size_changes() {
+        let temp = scratch_dir();
+        let file = temp.join("edit.txt");
+        std::fs::write(&file, b"first").unwrap();
+        let before = sha256_file(&file).unwrap();
+        std::fs::write(&file, b"other").unwrap();
+        assert_ne!(before, sha256_file(&file).unwrap());
+        let _ = std::fs::remove_dir_all(temp);
     }
 
     #[test]

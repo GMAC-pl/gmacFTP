@@ -5,6 +5,9 @@ use std::io::Read;
 use std::path::PathBuf;
 
 const MAX_SETTINGS_BYTES: usize = 128 * 1024;
+pub const MIN_TRANSFER_CONCURRENCY: usize = 1;
+pub const MAX_TRANSFER_CONCURRENCY: usize = 6;
+pub const DEFAULT_TRANSFER_CONCURRENCY: usize = 3;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Settings {
@@ -20,6 +23,10 @@ pub struct Settings {
     /// UI theme: "light" (macOS Finder) | "dark".
     #[serde(default = "default_theme")]
     pub theme: String,
+    /// Maximum number of different endpoints that may transfer simultaneously. Each endpoint
+    /// remains sequential to preserve ordering and reuse one authenticated session.
+    #[serde(default = "default_transfer_concurrency")]
+    pub transfer_concurrency: usize,
     /// User-added local folder shortcuts shown under Favorites.
     #[serde(default)]
     pub local_favorites: Vec<String>,
@@ -69,6 +76,9 @@ fn default_locale() -> String {
 fn default_theme() -> String {
     "light".to_string()
 }
+fn default_transfer_concurrency() -> usize {
+    DEFAULT_TRANSFER_CONCURRENCY
+}
 
 impl Default for Settings {
     fn default() -> Self {
@@ -76,6 +86,7 @@ impl Default for Settings {
             accept_any_cert: default_accept_any_cert(),
             locale: default_locale(),
             theme: default_theme(),
+            transfer_concurrency: default_transfer_concurrency(),
             local_favorites: Vec::new(),
             local_favorites_customized: false,
             sync_via_icloud: false,
@@ -100,14 +111,18 @@ pub fn load() -> Settings {
     let Some(p) = path() else {
         return Settings::default();
     };
-    match read_regular_limited(&p, MAX_SETTINGS_BYTES) {
+    let mut settings = match read_regular_limited(&p, MAX_SETTINGS_BYTES) {
         Ok(bytes) if !bytes.iter().all(u8::is_ascii_whitespace) => serde_json::from_slice(&bytes)
             .unwrap_or_else(|e| {
                 tracing::warn!(error = %e, "settings parse failed; using defaults");
                 Settings::default()
             }),
         _ => Settings::default(),
-    }
+    };
+    settings.transfer_concurrency = settings
+        .transfer_concurrency
+        .clamp(MIN_TRANSFER_CONCURRENCY, MAX_TRANSFER_CONCURRENCY);
+    settings
 }
 
 fn read_regular_limited(path: &std::path::Path, limit: usize) -> std::io::Result<Vec<u8>> {
@@ -174,5 +189,6 @@ mod tests {
         let settings: Settings = serde_json::from_str(r#"{"keychain_migrated_v2":true}"#).unwrap();
         assert!(settings.keychain_migrated_v2);
         assert!(!settings.endpoint_credentials_migrated_v2);
+        assert_eq!(settings.transfer_concurrency, DEFAULT_TRANSFER_CONCURRENCY);
     }
 }

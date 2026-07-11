@@ -2668,7 +2668,7 @@ dependencies = [
 
 [[package]]
 name = "gmacftp"
-version = "0.0.20"
+version = "0.1.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -2680,6 +2680,7 @@ dependencies = [
  "i-slint-backend-winit",
  "i-slint-core",
  "keyring",
+ "libc",
  "objc2 0.6.4",
  "objc2-app-kit 0.3.2",
  "objc2-foundation 0.3.2",

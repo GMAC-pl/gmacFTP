@@ -31,6 +31,11 @@ SFTP host-key verification fails closed on a new or changed key. For a new serve
 the SHA-256 fingerprint before authentication; only an explicit user approval persists the pin in
 the app config directory. A changed pin cannot be replaced automatically.
 
+SFTP supports password, private-key, and SSH Agent authentication. Private keys are read with
+`O_NOFOLLOW`, a 1 MiB cap, and private Unix permissions. Built-in RSA private-key signing is
+disabled while the transitive RSA implementation has an unresolved timing advisory; RSA keys can
+be delegated to the system SSH Agent.
+
 ## Storage
 
 Connection metadata is stored without passwords. Secrets go through the credential store abstraction and are backed by macOS Keychain plus an encrypted local vault.
@@ -39,4 +44,13 @@ The app uses platform config directories via `directories::ProjectDirs` with the
 
 ## Transfers
 
-The transfer engine runs asynchronously and reports progress through throttled updates. The UI presents active, queued, completed, and failed jobs without blocking pane navigation.
+The transfer engine dispatches jobs to one ordered worker per endpoint. Workers reuse authenticated
+FTP/SFTP sessions, while a dynamic global limiter permits independent endpoints to run in parallel.
+Downloads use private resumable fragments and jobs retain enough immutable state for individual
+cancel/resume/retry. Progress is throttled before it reaches the UI.
+
+## Folder synchronization
+
+`src/folder_sync.rs` is a pure dry-run planner. The app scans a local and remote tree concurrently,
+applies bounded wildcard exclusions, and shows one-way copy actions. Before applying, both sides are
+scanned again and the exact plan must match. Target-only files are reported but never deleted.

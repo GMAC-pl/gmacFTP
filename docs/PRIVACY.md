@@ -20,6 +20,8 @@ This repository is intended to be public. Keep personal data and production cred
 - The public bundle uses safe defaults from the tracked source tree.
 - The personal bundle reads `.env.personal`, which is ignored by git and must stay local.
 - Never copy values from `.env.personal` into tracked docs, scripts, screenshots, or CI.
+- A selected SSH private-key **path** is local metadata only. The key is never copied, and the path
+  is removed from cross-device synchronization metadata because it can reveal a macOS account name.
 
 ## Safe Demo Data
 

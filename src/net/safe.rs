@@ -28,6 +28,23 @@ pub fn validate_ftp_path(s: &str) -> Result<(), NetError> {
     Ok(())
 }
 
+/// Validate a single filename received from a remote directory listing before it can be joined
+/// to the directory selected by the user. A hostile listing entry such as `/etc` or `../other`
+/// must never replace/escape that base on a later rename, delete, download, or recursive walk.
+pub fn validate_remote_component(name: &str) -> Result<(), NetError> {
+    if name.is_empty()
+        || matches!(name, "." | "..")
+        || name.len() > 255
+        || name.contains(['/', '\\'])
+        || name.chars().any(char::is_control)
+    {
+        return Err(NetError::InvalidPath(
+            "server returned an unsafe filename component".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Normalize a server-controlled RELATIVE path so it cannot escape the chosen local root.
 ///
 /// - strips a leading `/` (defeats absolute-path injection through `PathBuf::join`),
@@ -187,6 +204,27 @@ mod tests {
             sanitize_local_rel(&"a".repeat(255)).unwrap(),
             "a".repeat(255)
         );
+    }
+
+    #[test]
+    fn remote_components_cannot_replace_or_escape_the_listed_directory() {
+        for unsafe_name in [
+            "",
+            ".",
+            "..",
+            "../other",
+            "/etc",
+            "a/b",
+            "a\\b",
+            "bad\nname",
+        ] {
+            assert!(
+                validate_remote_component(unsafe_name).is_err(),
+                "{unsafe_name:?}"
+            );
+        }
+        assert!(validate_remote_component(&"x".repeat(256)).is_err());
+        assert!(validate_remote_component("report 2026.txt").is_ok());
     }
 
     // --- assert_within: containment guard -------------------------------------
