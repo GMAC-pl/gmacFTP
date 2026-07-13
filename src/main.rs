@@ -2,7 +2,9 @@
 slint::include_modules!();
 
 mod app;
+mod i18n;
 mod macos_menu;
+mod notifications;
 
 fn main() {
     // suppaftp logs complete control-channel commands at trace level, including `PASS <secret>`.

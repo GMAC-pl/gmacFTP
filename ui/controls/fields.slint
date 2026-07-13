@@ -1,0 +1,248 @@
+import { Tokens } from "../foundation.slint";
+import { KeyboardActionArea } from "actions.slint";
+import { Icon } from "visuals.slint";
+
+export component SearchField inherits Rectangle {
+    in-out property <string> text;
+    in property <string> placeholder;
+    in property <string> accessible-name: root.placeholder;
+    callback edited(string);
+    height: 30px;
+    border-radius: 7px;
+    background: Tokens.field-bg;
+    border-width: 1px;
+    border-color: Tokens.border;
+    forward-focus: input;
+    accessible-role: text-input;
+    accessible-label: root.accessible-name;
+    accessible-value: root.text;
+    accessible-placeholder-text: root.placeholder;
+    accessible-action-set-value(value) => { root.text = value; root.edited(value); }
+    Icon { kind: "search"; fg: Tokens.text-ter; x: 10px; y: (parent.height - self.height) / 2; }
+    Text {
+        x: 32px; width: parent.width - 42px; height: 100%;
+        text: root.text == "" ? root.placeholder : "";
+        color: Tokens.text-ter; font-size: 13px; vertical-alignment: center;
+    }
+    input := TextInput {
+        x: 32px; width: parent.width - 42px;
+        y: (parent.height - self.preferred-height) / 2;
+        text <=> root.text;
+        color: Tokens.text; font-size: 13px;
+        single-line: true;
+        selection-background-color: Tokens.accent;
+        selection-foreground-color: #FFFFFF;
+        accessible-role: none;
+        edited => { root.edited(root.text); }
+    }
+}
+
+// a single context-menu entry
+export component CtxItem inherits Rectangle {
+    in property <string> text;
+    in property <bool> danger: false;
+    in property <bool> disabled: false;
+    callback triggered();
+    height: 28px;
+    border-radius: 5px;
+    background: action.has-hover ? (root.danger ? #FF3B3022 : Tokens.accent) : transparent;
+    border-width: action.has-focus ? 2px : 0px;
+    border-color: Tokens.accent;
+    forward-focus: action;
+    accessible-role: button;
+    accessible-label: root.text;
+    accessible-enabled: !root.disabled;
+    accessible-action-default => { if (!root.disabled) { root.triggered(); } }
+    HorizontalLayout { padding-left: 12px; padding-right: 12px; alignment: start;
+        Text { text: root.text; color: root.disabled ? Tokens.text-ter : (action.has-hover && !root.danger ? #FFFFFF : (root.danger ? Tokens.danger-text : Tokens.text)); font-size: 12px; vertical-alignment: center; }
+    }
+    action := KeyboardActionArea { enabled: !root.disabled; clicked => { root.triggered(); } }
+}
+
+// Crisp, always-visible text field (macOS style). Replaces std LineEdit, whose default
+// fill is a muddy low-contrast gray (~#C3C3C3) that all but disappears on the white dialog
+// surface in light mode — so "Edit" showed no visible input boxes. Built on the TextInput
+// primitive (same pattern as Slint's own LineEditBase: forward-focus + preferred-height
+// centering) so we fully own the background, border and focus ring in BOTH themes.
+export component Field inherits Rectangle {
+    in property <string> placeholder;
+    in property <string> accessible-name: root.placeholder;
+    in-out property <string> text;
+    in property <InputType> input-type: InputType.text;
+    callback edited(string);
+    callback accepted();
+    public function focus-and-select() {
+        input.focus();
+        input.select-all();
+    }
+    height: 34px;
+    border-radius: 6px;
+    // Fill subtly distinct from the card surface so the field reads as a control, not as
+    // background; focus lifts it and swaps the border to the accent color.
+    background: input.has-focus
+        ? (Tokens.theme == "dark" ? #232325 : #FFFFFF)
+        : (Tokens.theme == "dark" ? #1B1B1D : #F2F2F5);
+    border-width: 1px;
+    border-color: input.has-focus ? Tokens.accent : Tokens.border-strong;
+    forward-focus: input;
+    clip: true;
+    accessible-role: text-input;
+    accessible-label: root.accessible-name;
+    accessible-value: root.input-type == InputType.password ? "" : root.text;
+    accessible-placeholder-text: root.placeholder;
+    accessible-action-set-value(value) => { root.text = value; root.edited(value); }
+    placeholder := Text {
+        x: 11px; width: parent.width - 22px; height: 100%;
+        vertical-alignment: center;
+        text: root.text == "" ? root.placeholder : "";
+        color: Tokens.text-sec; font-size: 12px;
+    }
+    input := TextInput {
+        x: 11px; width: parent.width - 22px;
+        y: (parent.height - self.preferred-height) / 2;
+        text <=> root.text;
+        color: Tokens.text; font-size: 12px;
+        input-type: root.input-type;
+        single-line: true;
+        selection-background-color: Tokens.accent;
+        selection-foreground-color: #FFFFFF;
+        accessible-role: none;
+        edited => { root.edited(root.text); }
+        accepted => { root.accepted(); }
+    }
+}
+
+export component SettingsToggleRow inherits Rectangle {
+    in property <string> title;
+    in property <string> detail: "";
+    in property <bool> interactive: true;
+    in-out property <bool> checked;
+    callback toggled();
+    height: root.detail == "" ? 38px : 50px;
+    background: transparent;
+    forward-focus: action;
+    accessible-role: switch;
+    accessible-label: root.title;
+    accessible-description: root.detail;
+    accessible-enabled: root.interactive;
+    accessible-checkable: true;
+    accessible-checked: root.checked;
+    accessible-action-default => {
+        if (root.interactive) {
+            root.checked = !root.checked;
+            root.toggled();
+        }
+    }
+    Text {
+        x: 0px; y: root.detail == "" ? 0px : 4px; width: parent.width - 58px; height: 22px;
+        text: root.title; color: Tokens.text; font-size: 12px; font-weight: 600;
+        vertical-alignment: center;
+    }
+    if root.detail != "" : Text {
+        x: 0px; y: 24px; width: parent.width - 58px; height: 17px;
+        text: root.detail; color: Tokens.text-sec; font-size: 10px; overflow: elide;
+        vertical-alignment: center;
+    }
+    Rectangle {
+        x: parent.width - 44px; y: (parent.height - 24px) / 2; width: 42px; height: 24px;
+        border-radius: 12px; background: root.checked ? Tokens.accent : Tokens.border-strong;
+        Rectangle {
+            width: 18px; height: 18px; border-radius: 9px; y: 3px;
+            x: root.checked ? 21px : 3px; background: #FFFFFF;
+            animate x { duration: 120ms; easing: ease-in-out; }
+        }
+        action := KeyboardActionArea { enabled: root.interactive; clicked => { root.checked = !root.checked; root.toggled(); } }
+    }
+}
+
+// a row in the sort popover: a label with an accent dot when it's the active sort.
+export component SortOpt inherits Rectangle {
+    in property <string> label;
+    in property <bool> active: false;
+    callback triggered();
+    height: 30px; border-radius: 4px;
+    background: action.has-hover ? Tokens.row-hover : transparent;
+    border-width: action.has-focus ? 2px : 0px;
+    border-color: Tokens.accent;
+    forward-focus: action;
+    accessible-role: radio-button;
+    accessible-label: root.label;
+    accessible-checkable: true;
+    accessible-checked: root.active;
+    accessible-action-default => { root.triggered(); }
+    HorizontalLayout { padding-left: 8px; padding-right: 8px; spacing: 10px; alignment: start;
+        Rectangle { width: 6px; height: 6px; y: (parent.height - self.height) / 2; border-radius: 3px; background: root.active ? Tokens.accent : transparent; }
+        Text { text: root.label; color: root.active ? Tokens.text : Tokens.text-sec; font-size: 12px; vertical-alignment: center; }
+    }
+    action := KeyboardActionArea { clicked => { root.triggered(); } }
+}
+
+export component SortDirOpt inherits Rectangle {
+    in property <string> label;
+    in property <bool> asc: true;
+    callback triggered();
+    height: 30px; border-radius: 4px;
+    background: action.has-hover ? Tokens.row-hover : transparent;
+    border-width: action.has-focus ? 2px : 0px;
+    border-color: Tokens.accent;
+    forward-focus: action;
+    accessible-role: button;
+    accessible-label: root.label;
+    accessible-action-default => { root.triggered(); }
+    Icon { kind: root.asc ? "sort-asc" : "sort-desc"; x: 8px; y: 8px; width: 14px; height: 14px; fg: Tokens.accent; }
+    Text { x: 32px; y: 0px; height: parent.height; text: root.label; color: Tokens.text; font-size: 12px; font-weight: 600; vertical-alignment: center; horizontal-alignment: left; }
+    action := KeyboardActionArea { clicked => { root.triggered(); } }
+}
+
+// Tiny sort-direction arrow (Path-based so it scales, unlike the fixed 16px Icon glyph). Shown
+// on the active column header. Up triangle = ascending, down triangle = descending.
+export component SortArrow inherits Rectangle {
+    in property <bool> asc: true;
+    in property <color> fg: Tokens.accent;
+    width: 8px; height: 10px; background: transparent;
+    Path {
+        x: 0px; y: 0px; width: 8px; height: 10px;
+        commands: root.asc ? "M4 0 L8 7 L0 7 Z" : "M0 3 L8 3 L4 10 Z";
+        fill: root.fg; stroke: transparent; stroke-width: 0px;
+    }
+}
+
+// A clickable column-header cell. `key` is this column's sort key; `active-key`/`active-dir` are
+// the pane's current sort state (drives the active highlight + arrow). Clicking emits the key.
+export component SortHeader inherits Rectangle {
+    in property <string> label;
+    in property <string> key;
+    in property <string> active-key;
+    in property <string> active-dir;
+    in property <bool> right-align: false;
+    callback clicked-with(string);
+    // No explicit height: in the column-header HorizontalLayout (24px) the cell stretches to fill
+    // the cross-axis by default — same as the plain Text headers did. An explicit `height: 100%`
+    // here resolved to the WINDOW height in Slint, growing this row and collapsing the file list
+    // below it to 0 (empty panes).
+    property <bool> active: root.active-key == root.key;
+    forward-focus: action;
+    accessible-role: button;
+    accessible-label: root.label;
+    accessible-description: root.active ? (root.active-dir == "asc" ? @tr("Sorted ascending") : @tr("Sorted descending")) : @tr("Not currently sorted");
+    accessible-action-default => { root.clicked-with(root.key); }
+    action := KeyboardActionArea { clicked => { root.clicked-with(root.key); } }
+    VerticalLayout { alignment: center;
+        HorizontalLayout {
+            spacing: 4px;
+            alignment: root.right-align ? end : start;
+            // For right-aligned columns (MODIFIED/SIZE) the arrow sits BEFORE the label so the
+            // label's right edge stays flush with the data. For the left-aligned NAME column the
+            // arrow sits AFTER the label, so the label stays anchored at x=0 (aligned with the file
+            // names below) instead of shifting ~12px right when it becomes the active sort.
+            if root.active && root.right-align : SortArrow { asc: root.active-dir == "asc"; fg: Tokens.accent; }
+            Text {
+                text: root.label;
+                color: root.active ? Tokens.text : Tokens.text-ter;
+                font-size: 10px; font-weight: 800; vertical-alignment: center;
+                horizontal-alignment: root.right-align ? right : left;
+            }
+            if root.active && !root.right-align : SortArrow { asc: root.active-dir == "asc"; fg: Tokens.accent; }
+        }
+    }
+}

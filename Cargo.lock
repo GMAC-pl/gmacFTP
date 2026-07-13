@@ -2703,15 +2703,17 @@ dependencies = [
 
 [[package]]
 name = "gmacftp"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
  "argon2 0.5.3",
  "base64",
+ "block2 0.6.2",
  "directories",
  "drag",
  "futures",
+ "i-slint-backend-testing",
  "i-slint-backend-winit",
  "i-slint-core",
  "keyring",
@@ -2719,6 +2721,7 @@ dependencies = [
  "objc2 0.6.4",
  "objc2-app-kit 0.3.2",
  "objc2-foundation 0.3.2",
+ "objc2-user-notifications 0.3.2",
  "rand 0.8.6",
  "raw-window-handle",
  "rfd",
@@ -3054,6 +3057,17 @@ dependencies = [
  "i-slint-core",
  "i-slint-core-macros",
  "i-slint-renderer-femtovg",
+]
+
+[[package]]
+name = "i-slint-backend-testing"
+version = "1.16.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1c1e38002d6f1babda30a77ce7bde2d659c7261a60f15c063ac9f7c3324ff570"
+dependencies = [
+ "i-slint-common",
+ "i-slint-core",
+ "vtable",
 ]
 
 [[package]]
@@ -4504,7 +4518,7 @@ dependencies = [
  "bitflags 2.13.0",
  "block2 0.5.1",
  "objc2 0.5.2",
- "objc2-core-location",
+ "objc2-core-location 0.2.2",
  "objc2-foundation 0.2.2",
 ]
 
@@ -4609,6 +4623,16 @@ dependencies = [
  "objc2 0.5.2",
  "objc2-contacts",
  "objc2-foundation 0.2.2",
+]
+
+[[package]]
+name = "objc2-core-location"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ca347214e24bc973fc025fd0d36ebb179ff30536ed1f80252706db19ee452009"
+dependencies = [
+ "objc2 0.6.4",
+ "objc2-foundation 0.3.2",
 ]
 
 [[package]]
@@ -4762,13 +4786,13 @@ dependencies = [
  "objc2-cloud-kit 0.2.2",
  "objc2-core-data 0.2.2",
  "objc2-core-image 0.2.2",
- "objc2-core-location",
+ "objc2-core-location 0.2.2",
  "objc2-foundation 0.2.2",
  "objc2-link-presentation",
  "objc2-quartz-core 0.2.2",
  "objc2-symbols",
  "objc2-uniform-type-identifiers",
- "objc2-user-notifications",
+ "objc2-user-notifications 0.2.2",
 ]
 
 [[package]]
@@ -4805,8 +4829,21 @@ dependencies = [
  "bitflags 2.13.0",
  "block2 0.5.1",
  "objc2 0.5.2",
- "objc2-core-location",
+ "objc2-core-location 0.2.2",
  "objc2-foundation 0.2.2",
+]
+
+[[package]]
+name = "objc2-user-notifications"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9df9128cbbfef73cda168416ccf7f837b62737d748333bfe9ab71c245d76613e"
+dependencies = [
+ "bitflags 2.13.0",
+ "block2 0.6.2",
+ "objc2 0.6.4",
+ "objc2-core-location 0.3.2",
+ "objc2-foundation 0.3.2",
 ]
 
 [[package]]
@@ -6918,6 +6955,7 @@ dependencies = [
  "lazy-regex",
  "log",
  "native-tls",
+ "rustls",
  "thiserror 2.0.18",
 ]
 

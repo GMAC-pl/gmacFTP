@@ -1,0 +1,462 @@
+import { ScrollView } from "std-widgets.slint";
+import { Tokens, Fmt } from "../foundation.slint";
+import { KeyboardActionArea } from "actions.slint";
+
+// folder / file glyph drawn as a vector Path (femtovg renders Path reliably). Full-row-height
+// transparent cell so the layout doesn't stretch the glyph; the 18×18 glyph is centered.
+export component FileIcon inherits Rectangle {
+    in property <bool> is-dir;
+    in property <bool> selected: false;   // white glyph on the solid selection background
+    width: 20px; height: 30px;
+    background: transparent;
+    Path {
+        x: 1px; y: 6px; width: 18px; height: 18px;
+        commands:
+            root.is-dir
+            ? "M15 15 A1.5 1.5 0 0 0 16.5 13.5 V6 A1.5 1.5 0 0 0 15 4.5 H9.08 A1.5 1.5 0 0 1 7.82 3.82 L7.2 2.92 A1.5 1.5 0 0 0 5.95 2.25 H3 A1.5 1.5 0 0 0 1.5 3.75 V13.5 A1.5 1.5 0 0 0 3 15 Z"
+            : "M4.5 16.5 A1.5 1.5 0 0 1 3 15 V3 A1.5 1.5 0 0 1 4.5 1.5 H10.5 A1.8 1.8 0 0 1 11.78 2.03 L14.47 4.72 A1.8 1.8 0 0 1 15 6 V15 A1.5 1.5 0 0 1 13.5 16.5 Z M10.5 1.5 V5.25 A0.75 0.75 0 0 0 11.25 6 H15 M7.5 6.75 H6 M12 9.75 H6 M12 12.75 H6";
+        fill: transparent;
+        stroke: root.selected ? #FFFFFF : (root.is-dir ? Tokens.folder : Tokens.file);
+        stroke-width: 1.7px;
+    }
+}
+export component MetadataSizeCell inherits Rectangle {
+    in property <string> text;
+    in property <string> state: "ready";
+    in property <bool> selected: false;
+    in property <int> pulse: 0;
+    width: 52px;
+    height: 30px;
+    background: transparent;
+
+    if root.state != "loading" : Text {
+        text: root.state == "unavailable" ? "-" : (root.state == "on_demand" ? @tr("size") : root.text);
+        color: root.selected ? #FFFFFFCC : (root.state == "on_demand" ? Tokens.accent-text : Tokens.text-sec);
+        font-family: "JetBrains Mono";
+        font-size: 11px;
+        width: parent.width;
+        height: parent.height;
+        vertical-alignment: center;
+        horizontal-alignment: right;
+    }
+
+    if root.state == "loading" : Rectangle {
+        width: parent.width;
+        height: parent.height;
+        background: transparent;
+        for dot[i] in 3 : Rectangle {
+            x: 28px + i * 7px;
+            y: (parent.height - 4px) / 2;
+            width: 4px;
+            height: 4px;
+            border-radius: 2px;
+            background: root.selected ? #FFFFFF : Tokens.accent;
+            opacity: root.pulse == i ? 1.0 : 0.28;
+            animate opacity { duration: 140ms; easing: ease-in-out; }
+        }
+    }
+}
+
+// vector line/fill icon (16px), drawn with a Slint Path. femtovg renders Path reliably;
+// this avoids the emoji / missing-glyph problem that broke the earlier icon set.
+export component Icon inherits Rectangle {
+    in property <string> kind;
+    in property <color> fg: Tokens.text;
+    width: 16px; height: 16px;
+    Path {
+        x: 0px; y: 0px; width: 16px; height: 16px;
+        commands:
+            root.kind == "search"     ? "M14 14 L11.1 11.1 M2 7.3 A5.3 5.3 0 1 1 12.7 7.3 A5.3 5.3 0 1 1 2 7.3" :
+            root.kind == "refresh"    ? "M2 8 A6 6 0 0 1 8 2 A6.5 6.5 0 0 1 12.5 3.8 L14 5.3 M14 2 V5.3 H10.7 M14 8 A6 6 0 0 1 8 14 A6.5 6.5 0 0 1 3.5 12.2 L2 10.7 M5.3 10.7 H2 V14" :
+            root.kind == "lock"       ? "M3 7.6 H13 V13.6 H3 Z M5 7.6 V5.6 A3 3 0 0 1 11 5.6 V7.6" :
+            root.kind == "eye"        ? "M1.5 8 C3 4.5 13 4.5 14.5 8 C13 11.5 3 11.5 1.5 8 Z M6.2 8 A1.8 1.8 0 1 0 9.8 8 A1.8 1.8 0 1 0 6.2 8" :
+            root.kind == "sun"        ? "M5.3 8 A2.7 2.7 0 1 0 10.7 8 A2.7 2.7 0 1 0 5.3 8 M8 1.3 V2.7 M8 13.3 V14.7 M3.3 3.3 L4.2 4.2 M11.8 11.8 L12.7 12.7 M1.3 8 H2.7 M13.3 8 H14.7 M4.2 11.8 L3.3 12.7 M12.7 3.3 L11.8 4.2" :
+            root.kind == "moon"       ? "M14 8.3 A6 6 0 1 1 7.7 2 C8 2 8.1 2.3 8 2.5 A4 4 0 0 0 13.5 8 C13.7 7.9 14 8 14 8.3" :
+            root.kind == "theme"      ? "M8 1.3 V2.7 M9.9 10.9 A4 4 0 1 1 5.1 6.1 C5.5 6 5.7 6.6 5.5 6.9 A2.7 2.7 0 0 0 9.1 10.5 C9.5 10.3 10 10.5 9.9 10.9 M10.7 8 A2.7 2.7 0 0 0 8 5.3 M12.7 3.3 L11.8 4.2 M13.3 8 H14.7" :
+            root.kind == "server"     ? "M2.7 1.3 H13.3 A1.3 1.3 0 0 1 14.7 2.7 V6 A1.3 1.3 0 0 1 13.3 7.3 H2.7 A1.3 1.3 0 0 1 1.3 6 V2.7 A1.3 1.3 0 0 1 2.7 1.3 M2.7 8.7 H13.3 A1.3 1.3 0 0 1 14.7 10 V13.3 A1.3 1.3 0 0 1 13.3 14.7 H2.7 A1.3 1.3 0 0 1 1.3 13.3 V10 A1.3 1.3 0 0 1 2.7 8.7 M4 4 H4.1 M4 12 H4.1" :
+            root.kind == "trash"      ? "M6.7 7.3 V11.3 M9.3 7.3 V11.3 M12.7 4 V13.3 A1.3 1.3 0 0 1 11.3 14.7 H4.7 A1.3 1.3 0 0 1 3.3 13.3 V4 M2 4 H14 M5.3 4 V2.7 A1.3 1.3 0 0 1 6.7 1.3 H9.3 A1.3 1.3 0 0 1 10.7 2.7 V4" :
+            root.kind == "edit"       ? "M14.1 4.5 A0.7 0.7 0 0 0 11.5 1.9 L2.6 10.8 A1.3 1.3 0 0 0 2.2 11.4 L1.3 14.2 A0.3 0.3 0 0 0 1.8 14.7 L4.7 13.8 A1.3 1.3 0 0 0 5.2 13.4 Z M10 3.3 L12.7 6" :
+            root.kind == "shield"     ? "M13.3 8.7 C13.3 12 11 13.7 8.2 14.6 A0.7 0.7 0 0 1 7.8 14.6 C5 13.7 2.7 12 2.7 8.7 V4 A0.7 0.7 0 0 1 3.3 3.3 C4.7 3.3 6.3 2.5 7.5 1.8 A0.8 0.8 0 0 1 8.5 1.8 C9.7 2.5 11.3 3.3 12.7 3.3 A0.7 0.7 0 0 1 13.3 4 Z M6 8 L7.3 9.3 L10 6.7" :
+            root.kind == "plug"       ? "M5.5 2 V5.2 M10.5 2 V5.2 M4 5.2 H12 V8 A4 4 0 0 1 4 8 Z M8 12 V14 M5 14 H11" :
+            root.kind == "plug-zap"   ? "M4.2 13.5 A1.6 1.6 0 0 0 6.5 13.5 L8 12 L4 8 L2.5 9.5 A1.6 1.6 0 0 0 2.5 11.8 Z M1.3 14.7 L3.3 12.7 M5 9 L6.7 7.3 M7 11 L8.7 9.3 M12 2 L9.3 4.7 H13.3 L10.7 7.3" :
+            root.kind == "enter"      ? "M13.3 2.7 V7.3 A2.7 2.7 0 0 1 10.7 10 H2.7 M6 6.7 L2.7 10 L6 13.3" :
+            root.kind == "log-out"    ? "M10.7 11.3 L14 8 L10.7 4.7 M14 8 H6 M6 14 H3.3 A1.3 1.3 0 0 1 2 12.7 V3.3 A1.3 1.3 0 0 1 3.3 2 H6" :
+            root.kind == "log-in"     ? "M6.7 11.3 L10 8 L6.7 4.7 M10 8 H2 M10 2 H12.7 A1.3 1.3 0 0 1 14 3.3 V12.7 A1.3 1.3 0 0 1 12.7 14 H10" :
+            root.kind == "check"      ? "M3 8.5 L6.4 12 L13 4" :
+            root.kind == "pause"      ? "M5 3 V13 M11 3 V13" :
+            root.kind == "activity"   ? "M2 9 H4.4 L5.6 4 L8.4 13 L10 7 H14" :
+            root.kind == "globe"      ? "M8 3 A5 5 0 1 0 8.01 3 M3 8 H13 M8 3 C5.5 5 5.5 11 8 13 C10.5 11 10.5 5 8 3" :
+            root.kind == "compare"    ? "M1.5 2.5 H6.2 V13.5 H1.5 Z M9.8 2.5 H14.5 V13.5 H9.8 Z M6.2 6 H9.8 M7.6 4.7 L6.2 6 L7.6 7.3 M8.4 8.7 L9.8 10 L8.4 11.3" :
+            root.kind == "link"       ? "M6.2 5.2 L5 4 A2.8 2.8 0 0 0 1 8 L3 10 A2.8 2.8 0 0 0 7 9 L9 7 M9.8 10.8 L11 12 A2.8 2.8 0 0 0 15 8 L13 6 A2.8 2.8 0 0 0 9 7 L7 9" :
+            root.kind == "transfer"   ? "M5.3 2 L2.7 4.7 L5.3 7.3 M2.7 4.7 H13.3 M10.7 14 L13.3 11.3 L10.7 8.7 M13.3 11.3 H2.7" :
+            root.kind == "arrow-up"   ? "M8 2 V14 M3 7 L8 2 L13 7" :
+            root.kind == "arrow-down" ? "M8 2 V14 M3 9 L8 14 L13 9" :
+            root.kind == "download"   ? "M8 2 V10 M3.3 10 V12.7 A1.3 1.3 0 0 0 4.7 14 H11.3 A1.3 1.3 0 0 0 12.7 12.7 V10 M4.7 6.7 L8 10 L11.3 6.7" :
+            root.kind == "arrow-down-line" ? "M8 2 V11.3 M4 7.3 L8 11.3 L12 7.3 M12.7 14 H3.3" :
+            root.kind == "arrow-up-line" ? "M12 6 L8 2 L4 6 M8 2 V11.3 M3.3 14 H12.7" :
+            root.kind == "sort-asc"   ? "M2 5.3 L4.7 2.7 L7.3 5.3 M4.7 2.7 V13.3 M7.3 8 H10 M7.3 10.7 H12 M7.3 13.3 H14" :
+            root.kind == "sort-desc"  ? "M2 10.7 L4.7 13.3 L7.3 10.7 M4.7 13.3 V2.7 M7.3 2.7 H14 M7.3 5.3 H12 M7.3 8 H10" :
+            root.kind == "arrow-left" ? "M2 8 H14 M7 3 L2 8 L7 13" :
+            root.kind == "arrow-right"? "M2 8 H14 M9 3 L14 8 L9 13" :
+            root.kind == "chevron-up" ? "M12 10 L8 6 L4 10" :
+            root.kind == "plus"       ? "M8 3 V13 M3 8 H13" :
+            root.kind == "power"      ? "M8 2 V7.5 M4.6 4 A5 5 0 1 0 11.4 4" :
+            root.kind == "list"       ? "M3 4 H13 M3 8 H13 M3 12 H13" :
+            root.kind == "copy"       ? "M5.3 5.3 H12.7 A1.3 1.3 0 0 1 14 6.7 V12.7 A1.3 1.3 0 0 1 12.7 14 H6.7 A1.3 1.3 0 0 1 5.3 12.7 Z M2.7 10.7 C1.9 10.7 1.3 10.1 1.3 9.3 V2.7 C1.3 1.9 1.9 1.3 2.7 1.3 H9.3 C10.1 1.3 10.7 1.9 10.7 2.7" :
+            root.kind == "home"       ? "M10 14 V8.7 A0.7 0.7 0 0 0 9.3 8 H6.7 A0.7 0.7 0 0 0 6 8.7 V14 M2 6.7 A1.3 1.3 0 0 1 2.5 5.7 L7.2 1.7 A1.3 1.3 0 0 1 8.8 1.7 L13.5 5.7 A1.3 1.3 0 0 1 14 6.7 V12.7 A1.3 1.3 0 0 1 12.7 14 H3.3 A1.3 1.3 0 0 1 2 12.7 Z" :
+            root.kind == "folder"     ? "M1.5 4.5 H6.2 L7.5 6 H14.5 V13.5 H1.5 Z M1.5 4.5 V3 H5.8 L7.1 4.5" :
+            root.kind == "clock"      ? "M8 1.5 A6.5 6.5 0 1 0 8.01 1.5 M8 4.3 V8 L10.8 9.7" :
+            root.kind == "eject"      ? "M3 11 L8 3 L13 11 Z M2 13.5 H14" :
+            "M3.5 3.5 L12.5 12.5 M12.5 3.5 L3.5 12.5";
+        fill: transparent;
+        stroke: root.fg;
+        stroke-width: 1.5px;
+    }
+}
+
+// Header checkbox for selecting/deselecting every visible file and folder in a pane.
+export component SelectAllBox inherits Rectangle {
+    in property <bool> checked: false;
+    in property <string> accessible-name: @tr("Select all items");
+    callback toggled();
+    width: 16px; height: 16px;
+    background: root.checked ? Tokens.accent : transparent;
+    border-width: 1px;
+    border-color: root.checked ? Tokens.accent : (action.has-hover ? Tokens.text-sec : (action.has-focus ? Tokens.accent : Tokens.border-strong));
+    border-radius: 4px;
+    forward-focus: action;
+    accessible-role: checkbox;
+    accessible-label: root.accessible-name;
+    accessible-checkable: true;
+    accessible-checked: root.checked;
+    accessible-action-default => { root.toggled(); }
+    if root.checked : Icon {
+        kind: "check"; width: 11px; height: 11px; fg: #FFFFFF;
+        x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
+    }
+    action := KeyboardActionArea { clicked => { root.toggled(); } }
+}
+
+// square icon button (Apple toolbar style) wrapping an Icon.
+export component IconButton inherits Rectangle {
+    in property <string> icon;
+    in property <string> accessible-name: root.icon;
+    in property <color> fg: Tokens.text-sec;
+    in property <bool> on: false;
+    in property <bool> checkable: false;
+    in property <bool> disabled: false;
+    callback clicked();
+    width: 34px; height: 30px;
+    background: root.on ? Tokens.accent-soft : (action.has-hover ? Tokens.row-hover : transparent);
+    border-width: action.has-focus ? 2px : 0px;
+    border-color: Tokens.accent;
+    border-radius: 6px;
+    forward-focus: action;
+    accessible-role: button;
+    accessible-label: root.accessible-name;
+    accessible-enabled: !root.disabled;
+    accessible-checkable: root.checkable;
+    accessible-checked: root.on;
+    accessible-action-default => { if (!root.disabled) { root.clicked(); } }
+    Icon {
+        kind: root.icon;
+        fg: root.disabled ? Tokens.text-ter : (root.on ? Tokens.accent : (action.has-hover ? Tokens.text : root.fg));
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+    }
+    action := KeyboardActionArea { enabled: !root.disabled; clicked => { root.clicked(); } }
+}
+
+export component RailButton inherits Rectangle {
+    in property <string> icon;
+    in property <string> text;
+    in property <bool> on: false;
+    in property <bool> checkable: false;
+    in property <bool> disabled: false;
+    callback clicked();
+    width: 44px; height: 43px; border-radius: 6px;
+    background: root.on ? Tokens.accent-soft : (action.has-hover ? Tokens.row-hover : transparent);
+    border-width: action.has-focus ? 2px : 0px;
+    border-color: Tokens.accent;
+    forward-focus: action;
+    accessible-role: button;
+    accessible-label: root.text;
+    accessible-enabled: !root.disabled;
+    accessible-checkable: root.checkable;
+    accessible-checked: root.on;
+    accessible-action-default => { if (!root.disabled) { root.clicked(); } }
+    Icon { kind: root.icon; width: 15px; height: 15px; x: (parent.width - self.width) / 2; y: 5px; fg: root.disabled ? Tokens.text-ter : (root.on ? Tokens.accent : Tokens.text-sec); }
+    Text { text: root.text; x: 1px; y: 23px; width: parent.width - 2px; height: 14px; color: root.disabled ? Tokens.text-ter : (root.on ? Tokens.accent-text : Tokens.text-sec); font-size: 7px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; overflow: elide; }
+    action := KeyboardActionArea { enabled: !root.disabled; clicked => { root.clicked(); } }
+}
+
+// icon + text toolbar button (Apple style). Used for primary actions where an icon alone
+// would be ambiguous (Upload/Download/Connect/Refresh/Transfers). Toggles stay IconButton.
+export component LabeledToolButton inherits Rectangle {
+    in property <string> icon;
+    in property <string> text;
+    in property <color> text-color: Tokens.text;
+    in property <color> accent-color: Tokens.accent;
+    in property <length> icon-y-offset: 0px;
+    in property <bool> disabled: false;
+    in property <bool> emphasized: false;       // filled accent chip (primary action)
+    in property <bool> danger-emphasis: false;  // emphasized but danger-filled (destructive primary)
+    in property <int> badge: 0;                // count chip (top-right); only shown when > 0
+    callback clicked();
+    height: 30px; min-width: 72px;
+    border-radius: 6px;
+    background: root.emphasized
+        ? (root.disabled
+            ? (root.danger-emphasis ? Tokens.danger-soft : Tokens.accent-soft)
+            : (root.danger-emphasis
+            ? (action.has-hover ? Tokens.danger-fill-hover : Tokens.danger-fill)
+            : (action.has-hover ? Tokens.primary-fill-hover : Tokens.primary-fill)))
+        : (action.has-hover ? Tokens.row-hover : transparent);
+    border-width: action.has-focus ? 2px : 0px;
+    border-color: root.emphasized ? #FFFFFF : Tokens.accent;
+    forward-focus: action;
+    accessible-role: button;
+    accessible-label: root.text;
+    accessible-enabled: !root.disabled;
+    accessible-action-default => { if (!root.disabled) { root.clicked(); } }
+    HorizontalLayout { alignment: center; padding-left: root.emphasized ? 12px : 11px; padding-right: root.emphasized ? 12px : 11px; spacing: root.emphasized ? 6px : 6px;
+        Icon {
+            kind: root.icon;
+            width: 15px; height: 15px;
+            fg: root.disabled ? (root.emphasized ? #FFFFFF99 : Tokens.text-ter)
+                : (root.emphasized ? #FFFFFF
+                    : (action.has-hover ? root.text-color : root.accent-color));
+            y: (parent.height - self.height) / 2 + root.icon-y-offset;
+        }
+        Text {
+            text: root.text;
+            color: root.disabled ? (root.emphasized ? #FFFFFF99 : Tokens.text-ter) : (root.emphasized ? #FFFFFF : root.text-color);
+            font-size: 12px; font-weight: root.emphasized ? 600 : 500; vertical-alignment: center;
+        }
+    }
+    if root.badge > 0 : Rectangle {
+        x: root.width - self.width - 5px; y: -4px; height: 16px; width: max(16px, ltb-badge-text.preferred-width + 8px);
+        border-radius: 8px; background: Tokens.accent;
+        ltb-badge-text := Text {
+            x: 0px; y: 0px; width: parent.width; height: parent.height;
+            text: root.badge; color: #FFFFFF; font-size: 9px; font-weight: 700; vertical-alignment: center; horizontal-alignment: center;
+        }
+    }
+    action := KeyboardActionArea { enabled: !root.disabled; clicked => { root.clicked(); } }
+}
+
+export component ManagerActionButton inherits Rectangle {
+    in property <string> icon;
+    in property <string> text;
+    in property <color> text-color: Tokens.text-sec;
+    in property <color> accent-color: Tokens.text-sec;
+    in property <bool> emphasized: false;
+    callback clicked();
+    height: 28px;
+    border-radius: 6px;
+    background: root.emphasized ? (action.has-hover ? Tokens.primary-fill-hover : Tokens.primary-fill) : (action.has-hover ? Tokens.row-hover : transparent);
+    border-width: action.has-focus ? 2px : 0px;
+    border-color: root.emphasized ? #FFFFFF : Tokens.accent;
+    forward-focus: action;
+    accessible-role: button;
+    accessible-label: root.text;
+    accessible-action-default => { root.clicked(); }
+    HorizontalLayout { alignment: center; padding-left: root.emphasized ? 11px : 10px; padding-right: root.emphasized ? 11px : 10px; spacing: root.emphasized ? 6px : 5px;
+        Rectangle {
+            width: 14px; height: 16px; background: transparent;
+            Icon { kind: root.icon; width: 14px; height: 14px; x: 0px; y: root.emphasized ? 4px : 3px; fg: root.emphasized ? #FFFFFF : (action.has-hover ? root.text-color : root.accent-color); }
+        }
+        Text { text: root.text; color: root.emphasized ? #FFFFFF : (action.has-hover ? root.text-color : root.accent-color); font-size: 11px; font-weight: root.emphasized ? 600 : 500; vertical-alignment: center; }
+    }
+    action := KeyboardActionArea { clicked => { root.clicked(); } }
+}
+
+// thin vertical separator between toolbar groups.
+export component ToolDivider inherits Rectangle {
+    width: 1px; height: 30px; background: transparent;
+    Rectangle { y: 5px; width: 1px; height: 20px; background: Tokens.border; }
+}
+
+export component ProtocolBadge inherits Rectangle {
+    in property <string> protocol;
+    in property <bool> compact: false;
+    width: root.compact ? 36px : 46px;
+    height: root.compact ? 18px : 22px;
+    border-radius: 5px;
+    background: root.protocol == "SFTP" ? Tokens.brand-soft : Tokens.accent-soft;
+    Text {
+        text: root.protocol;
+        color: root.protocol == "SFTP" ? Tokens.brand : Tokens.accent-text;
+        font-size: root.compact ? 9px : 11px;
+        font-weight: 700;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
+export component SidebarScrollBar inherits Rectangle {
+    in-out property <length> maximum;
+    in-out property <length> page-size;
+    in-out property <length> value;
+    out property <bool> active: grab.has-hover || grab.pressed;
+    callback scrolled();
+
+    width: 12px;
+    background: transparent;
+    visible: root.maximum > 0px;
+    clip: true;
+
+    property <length> track-size: root.height - 8px;
+    property <length> thumb-height: root.maximum <= 0px ? 0px : max(34px, root.track-size * (root.page-size / (root.maximum + root.page-size)));
+
+    thumb := Rectangle {
+        x: root.active ? 2px : 5px;
+        y: 4px + (root.track-size - root.thumb-height) * (-root.value / root.maximum);
+        width: root.active ? 8px : 4px;
+        height: root.thumb-height;
+        border-radius: self.width / 2;
+        background: Tokens.theme == "dark" ? #FFFFFF99 : #1D1D1F66;
+        opacity: root.active ? 0.62 : 0.34;
+        animate x, width, opacity { duration: 120ms; easing: ease-out; }
+    }
+
+    grab := TouchArea {
+        property <{pressed-value: length, maximum: length, y: length}> saved;
+        width: parent.width;
+        height: parent.height;
+        mouse-cursor: pointer;
+
+        function update-saved() {
+            self.saved = { pressed-value: -root.value, maximum: root.maximum, y: self.mouse-y };
+        }
+
+        pointer-event(event) => {
+            if (event.button == PointerEventButton.left && event.kind == PointerEventKind.down) {
+                self.update-saved();
+            }
+        }
+
+        moved => {
+            if (self.pressed && root.maximum > 0px) {
+                if (self.saved.maximum != root.maximum) {
+                    self.update-saved();
+                }
+                root.value = -max(0px, min(root.maximum, self.saved.pressed-value + (self.mouse-y - self.saved.y) * (root.maximum / (root.track-size - root.thumb-height))));
+                root.scrolled();
+            }
+        }
+
+        scroll-event(event) => {
+            if (event.delta-y != 0px) {
+                root.value = max(-root.maximum, min(0px, root.value + event.delta-y));
+                return accept;
+            }
+            reject
+        }
+    }
+}
+
+export component SidebarScrollView inherits Rectangle {
+    in-out property <length> viewport-y <=> flick.viewport-y;
+    out property <length> visible-height <=> flick.height;
+    in-out property <length> viewport-height <=> flick.viewport-height;
+
+    background: transparent;
+    clip: false;
+
+    flick := Flickable {
+        width: parent.width - 10px;
+        height: parent.height;
+        interactive: false;
+        viewport-y <=> bar.value;
+        @children
+    }
+
+    bar := SidebarScrollBar {
+        x: parent.width - self.width + 8px;
+        y: 0px;
+        height: parent.height;
+        maximum: max(0px, flick.viewport-height - flick.height);
+        page-size: flick.height;
+    }
+}
+
+export component TrafficButton inherits Rectangle {
+    in property <color> fill;
+    in property <string> mark;
+    in property <string> accessible-name;
+    callback clicked();
+
+    width: 14px;
+    height: 14px;
+    border-radius: 7px;
+    background: action.has-hover ? root.fill : root.fill.transparentize(0.10);
+    border-width: 1px;
+    border-color: action.has-focus ? Tokens.accent : root.fill.transparentize(0.28);
+    forward-focus: action;
+    accessible-role: button;
+    accessible-label: root.accessible-name;
+    accessible-enabled: true;
+    accessible-action-default => { root.clicked(); }
+
+    Text {
+        visible: action.has-hover;
+        text: root.mark;
+        width: parent.width;
+        height: parent.height;
+        color: #00000099;
+        font-size: 9px;
+        font-weight: 700;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    action := KeyboardActionArea { clicked => { root.clicked(); } }
+}
+
+export component BrandWordmark inherits Rectangle {
+    in property <length> wordmark-size: 16px;
+    in property <length> wordmark-width: 78px;
+
+    width: root.wordmark-width;
+    height: 30px;
+    background: transparent;
+
+    HorizontalLayout {
+        spacing: 0px;
+        Text {
+            text: "gmac";
+            color: Tokens.text;
+            font-family: "Avenir Next";
+            font-size: root.wordmark-size;
+            font-weight: 600;
+            vertical-alignment: center;
+        }
+        Text {
+            text: "FTP";
+            color: Tokens.accent;
+            font-family: "Avenir Next";
+            font-size: root.wordmark-size;
+            font-weight: 800;
+            vertical-alignment: center;
+        }
+    }
+}
+
+// Pane header badge ("LOCAL"/"REMOTE"/"LOKALNY"/"ZDALNY"). The colored chip is sized to its
+// text (content-driven width) so any locale label fits — the old fixed min-width:52px clipped
+// "REMOTE"/"LOKALNY" past the chip's edge. The 22px chip is vertically centered in the 30px cell.
+export component PaneBadge inherits Rectangle {
+    in property <string> text;
+    in property <color> fill: Tokens.accent;
+    height: 30px;
+    background: transparent;
+    VerticalLayout { alignment: center;
+        Rectangle {
+            height: 22px; border-radius: 4px; background: root.fill;
+            HorizontalLayout { padding-left: 10px; padding-right: 10px; alignment: center;
+                Text { text: root.text; color: #FFFFFF; font-size: 11px; font-weight: 800; vertical-alignment: center; horizontal-alignment: center; }
+            }
+        }
+    }
+}

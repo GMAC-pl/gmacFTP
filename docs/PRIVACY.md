@@ -32,6 +32,23 @@ Use:
 - `/Users/demo/...` or `~/Downloads` for paths
 - Small synthetic files in `/tmp`
 
+## Update Checks
+
+- The public app checks GitHub Releases only after a manual menu action or when the user explicitly
+  enables one background check after launch. The background preference is off by default.
+- Requests use fixed allow-listed HTTPS hosts and a generic `gmacFTP-updater` User-Agent. The app
+  sends no account, saved-server data, file paths, stable device identifier, or analytics event.
+  GitHub still receives ordinary connection metadata such as the source IP, as with any HTTPS
+  request.
+- A discovered release displays bounded release notes as plain text. It is never downloaded until
+  the user confirms. The downloaded DMG is accepted only after size, SHA-256 digest, expected Apple
+  Developer ID team, expected signing identifier, and stapled notarization checks pass.
+- Personal/local bundles have a different bundle identity and do not run the public updater.
+
+Po polsku: automatyczne sprawdzanie jest domyślnie wyłączone i wykonuje najwyżej jedno zapytanie po
+uruchomieniu. Aplikacja nie wysyła telemetrii ani identyfikatora użytkownika; pobranie zawsze wymaga
+osobnej zgody, a DMG jest otwierany dopiero po pełnej weryfikacji.
+
 ## Pre-Publish Scan
 
 Run this before making the repository public:

@@ -6,7 +6,9 @@ pub mod entry;
 pub mod protocol;
 pub mod transfer;
 
-pub use connection::{ConnectionId, ConnectionSpec, SftpAuth};
+pub use connection::{
+    ConnectionId, ConnectionSpec, FtpDataMode, FtpFilenameEncoding, FtpTlsMode, SftpAuth,
+};
 pub use entry::{sort_entries, RemoteEntry};
 pub use protocol::Protocol;
-pub use transfer::{TransferDirection, TransferId, TransferJob};
+pub use transfer::{TransferDirection, TransferId, TransferJob, TransferPriority};

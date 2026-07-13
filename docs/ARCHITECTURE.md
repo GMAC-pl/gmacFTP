@@ -2,9 +2,12 @@
 
 gmacFTP is split into a thin native UI shell and a Rust core that owns protocols, persistence, and transfers.
 
-## UI Layer
+## UI layer
 
-The UI lives in `ui/app.slint`. It defines the macOS-style toolbar, sidebar, dual panes, transfer panel, connection manager, dialogs, and theme tokens. Rust keeps the data models fresh and wires Slint callbacks to app behavior.
+`ui/app.slint` composes the macOS-style toolbar, sidebar, dual panes, transfer panel, connection
+manager, and dialogs. Shared tokens, translations, and model structs live in
+`ui/foundation.slint`; focused controls live under `ui/controls/` (`actions`, `fields`, and
+`visuals`). Rust keeps the data models fresh and wires Slint callbacks to app behavior.
 
 Important UI principles:
 
@@ -13,9 +16,21 @@ Important UI principles:
 - Light and dark colors come from the shared token system.
 - Public properties and callbacks on `App` are part of the Rust/UI contract.
 
-## App Controller
+## App controllers
 
-`src/app.rs` owns the Slint window, Tokio runtime, transfer engine, connection list, pane state, callbacks, and UI model updates.
+`src/app.rs` owns application construction, shared state, cross-controller workflows, and the Slint
+event loop. Focused callback and projection code is separated under `src/app/`:
+
+- `pane_controller.rs` — pane selection, filtering, sorting, and model projection
+- `connection_controller.rs` — connection manager/editor, import, and connection filtering
+- `transfer_controller.rs` — queue controls, transfer rows, progress, and reports
+- `sync_controller.rs` — sync profiles, scanning, preview, mirror safeguards, and reports
+- `settings_controller.rs` — validated settings forms, storage tools, and encrypted backups
+- `update_controller.rs` — manual/opt-in release discovery, bounded plain-text notes, explicit
+  download consent, and UI state for the verified public updater
+- `drag_drop_controller.rs` — bounded native and in-app drag/drop staging
+- `command_controller.rs` — keyboard, clipboard, path, and command actions
+- `state.rs` — validated enums at the Slint string/integer boundary
 
 The controller keeps blocking protocol work off the UI thread. Results are sent back through Slint's event loop so UI state changes remain on the correct thread.
 

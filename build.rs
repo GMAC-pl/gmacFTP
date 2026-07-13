@@ -21,5 +21,13 @@ fn main() {
     println!("cargo:rustc-env=MACKFTP_CONFIG_ORGANIZATION={organization}");
     println!("cargo:rustc-env=MACKFTP_CONFIG_APPLICATION={application}");
 
-    slint_build::compile("ui/app.slint").expect("Slint UI compilation failed");
+    println!("cargo:rerun-if-changed=translations");
+    // Slint's UI-tree test API needs compiler metadata. Keep it in development/test builds only;
+    // signed release binaries do not carry this introspection data.
+    let include_ui_debug_info = std::env::var("PROFILE").is_ok_and(|profile| profile != "release");
+    let config = slint_build::CompilerConfiguration::new()
+        .with_bundled_translations("translations")
+        .with_default_translation_context(slint_build::DefaultTranslationContext::None)
+        .with_debug_info(include_ui_debug_info);
+    slint_build::compile_with_config("ui/app.slint", config).expect("Slint UI compilation failed");
 }

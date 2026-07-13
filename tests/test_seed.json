@@ -1,0 +1,26 @@
+{
+  "source": "localhost test servers (pyftpdlib FTPS :2210, atmoz/sftp :2222)",
+  "count": 2,
+  "connections": [
+    {
+      "name": "Local FTPS",
+      "protocol": "ftp",
+      "host": "127.0.0.1",
+      "port": 2210,
+      "username": "testuser",
+      "password": "testpass",
+      "path": "/",
+      "id": 0
+    },
+    {
+      "name": "Local SFTP",
+      "protocol": "sftp",
+      "host": "127.0.0.1",
+      "port": 2222,
+      "username": "testuser",
+      "password": "testpass",
+      "path": "/upload",
+      "id": 1
+    }
+  ]
+}

@@ -46,10 +46,12 @@ advisories, all explicitly reviewed:
 
 The dependency audit also reports informational maintenance/unsoundness warnings. The GTK3,
 X11 and Wayland group (`atk`, `gdk`, `gtk`, `glib`, `bincode`, and `proc-macro-error`) is absent
-from the macOS target. `paste` is a proc-macro/build dependency and `ttf-parser` is a macOS
-dependency of Slint's font/rendering stack; RustSec currently marks their pinned versions
-unmaintained. These warnings have no known vulnerability entry and do not change
-`cargo audit`'s exit status; they remain tracked for future Slint upgrades.
+from the macOS target. `paste` is a proc-macro/build dependency. `rustybuzz 0.20.1` and
+`ttf-parser 0.25.1` are macOS dependencies of Slint's SVG/font rendering stack and are currently
+marked unmaintained by RustSec (RUSTSEC-2026-0206 and RUSTSEC-2026-0192). These warnings have no
+known vulnerability entry and do not change `cargo audit`'s exit status; they remain tracked for
+a future Slint upgrade. The formerly direct, unmaintained `rustls-pemfile` dependency has been
+removed; FTPS identities are parsed through the maintained PEM API already exposed by Rustls.
 
 RUSTSEC-2026-0186 is fixed by pinning `memmap2 0.9.11`; the lockfile also contains the non-yanked
 `crypto-bigint 0.7.5`. CI ignores only the three reviewed vulnerability IDs above, so every new

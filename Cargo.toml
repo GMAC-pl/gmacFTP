@@ -1,6 +1,6 @@
 [package]
 name = "gmacftp"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.88"
 description = "gmacFTP — native, lightweight FTP/FTPS/SFTP client for macOS"
@@ -31,8 +31,8 @@ i-slint-backend-winit = { version = "=1.16.1", features = ["muda"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "io-util", "net", "fs", "time"] }
 futures = "0.3"
 
-# --- FTP / FTPS (explicit-TLS; native-tls -> macOS Security.framework for CA compat) ---
-suppaftp = { version = "10", features = ["native-tls", "no-log"] }
+# --- FTP / FTPS (explicit + implicit TLS; native-tls -> macOS Security.framework for CA compat) ---
+suppaftp = { version = "10", features = ["native-tls", "rustls-ring", "deprecated", "no-log"] }
 
 # --- SFTP (pure Rust, no C deps) ---
 russh = "0.62"
@@ -75,9 +75,15 @@ objc2 = "0.6"
 raw-window-handle = "0.6"
 objc2-app-kit = "0.3.2"     # native macOS menu bar / About panel (NSMenu, NSApp, NSWindow)
 objc2-foundation = "0.3.2"  # NSString for the menu; NSPoint used in app.rs
+objc2-user-notifications = "0.3.2" # native local transfer completion/failure notifications
+block2 = "0.6"              # Objective-C completion handlers for UserNotifications
 
 [build-dependencies]
 slint-build = "1.16"
+
+[dev-dependencies]
+# Headless UI event delivery for keyboard/focus regression tests; never linked into release builds.
+i-slint-backend-testing = "=1.16.1"
 
 # --- Release profile: small binary + fast cold start. MEASURE with hyperfine, don't guess. ---
 [profile.release]

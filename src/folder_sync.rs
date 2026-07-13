@@ -1,12 +1,13 @@
 //! Pure planning for one-way folder synchronization.
 //!
 //! The planner never mutates either side and never schedules deletions. Callers provide safe,
-//! relative file paths and sizes collected from the local and remote trees, then explicitly apply
-//! the returned actions after showing a dry-run preview.
+//! relative file paths and metadata collected from the local and remote trees, then explicitly
+//! apply the returned actions after showing a dry-run preview.
 
 use std::collections::BTreeMap;
 
 pub const DEFAULT_EXCLUSIONS: &str = ".git, .DS_Store, *.part, *.tmp";
+pub const DEFAULT_MTIME_TOLERANCE_SECONDS: u64 = 2;
 const MAX_RULES: usize = 128;
 const MAX_RULE_BYTES: usize = 256;
 const MAX_RULESET_BYTES: usize = 8 * 1024;
@@ -15,6 +16,59 @@ const MAX_RULESET_BYTES: usize = 8 * 1024;
 pub enum SyncReason {
     Missing,
     DifferentSize,
+    DifferentModificationTime,
+    ModificationTimeUnavailable,
+    DifferentChecksum,
+    ChecksumUnavailable,
+    TargetOnly,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncMode {
+    #[default]
+    OneWay,
+    Mirror,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncComparison {
+    SizeOnly,
+    #[default]
+    SizeAndModificationTime,
+    Checksum,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SyncOptions {
+    pub mode: SyncMode,
+    pub comparison: SyncComparison,
+    pub mtime_tolerance_seconds: u64,
+    /// Adjustment applied before source timestamp comparison. A server known to report one hour
+    /// ahead is normalized with `-3600` when it is the source.
+    pub source_time_adjustment_seconds: i64,
+    /// Equivalent normalization for the target side.
+    pub target_time_adjustment_seconds: i64,
+}
+
+impl Default for SyncOptions {
+    fn default() -> Self {
+        Self {
+            mode: SyncMode::OneWay,
+            comparison: SyncComparison::SizeAndModificationTime,
+            mtime_tolerance_seconds: DEFAULT_MTIME_TOLERANCE_SECONDS,
+            source_time_adjustment_seconds: 0,
+            target_time_adjustment_seconds: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SyncFileMetadata {
+    pub bytes: u64,
+    pub modified: Option<i64>,
+    pub sha256: Option<[u8; 32]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,6 +81,8 @@ pub struct SyncAction {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SyncPreview {
     pub actions: Vec<SyncAction>,
+    /// Target-only files scheduled for deletion only in explicit mirror mode.
+    pub deletions: Vec<SyncAction>,
     pub unchanged: usize,
     /// Files found only on the target. They are deliberately retained: folder sync never deletes.
     pub target_only: usize,
@@ -108,12 +164,13 @@ fn glob_matches(pattern: &[u8], value: &[u8]) -> bool {
 }
 
 pub fn build_preview(
-    source: &BTreeMap<String, u64>,
-    target: &BTreeMap<String, u64>,
+    source: &BTreeMap<String, SyncFileMetadata>,
+    target: &BTreeMap<String, SyncFileMetadata>,
     rules: &[String],
+    options: SyncOptions,
 ) -> SyncPreview {
     let mut preview = SyncPreview::default();
-    for (path, bytes) in source {
+    for (path, source_metadata) in source {
         if is_excluded(path, rules) {
             preview.excluded += 1;
             continue;
@@ -121,15 +178,28 @@ pub fn build_preview(
         match target.get(path) {
             None => preview.actions.push(SyncAction {
                 relative_path: path.clone(),
-                bytes: *bytes,
+                bytes: source_metadata.bytes,
                 reason: SyncReason::Missing,
             }),
-            Some(target_bytes) if target_bytes != bytes => preview.actions.push(SyncAction {
-                relative_path: path.clone(),
-                bytes: *bytes,
-                reason: SyncReason::DifferentSize,
-            }),
-            Some(_) => preview.unchanged += 1,
+            Some(target_metadata) if target_metadata.bytes != source_metadata.bytes => {
+                preview.actions.push(SyncAction {
+                    relative_path: path.clone(),
+                    bytes: source_metadata.bytes,
+                    reason: SyncReason::DifferentSize,
+                })
+            }
+            Some(target_metadata) => {
+                let reason = comparison_reason(source_metadata, target_metadata, options);
+                if let Some(reason) = reason {
+                    preview.actions.push(SyncAction {
+                        relative_path: path.clone(),
+                        bytes: source_metadata.bytes,
+                        reason,
+                    });
+                } else {
+                    preview.unchanged += 1;
+                }
+            }
         }
     }
     for path in target.keys() {
@@ -137,9 +207,48 @@ pub fn build_preview(
             preview.excluded += 1;
         } else if !source.contains_key(path) {
             preview.target_only += 1;
+            if options.mode == SyncMode::Mirror {
+                let metadata = target
+                    .get(path)
+                    .expect("path came from the target map iterator");
+                preview.deletions.push(SyncAction {
+                    relative_path: path.clone(),
+                    bytes: metadata.bytes,
+                    reason: SyncReason::TargetOnly,
+                });
+            }
         }
     }
     preview
+}
+
+fn comparison_reason(
+    source: &SyncFileMetadata,
+    target: &SyncFileMetadata,
+    options: SyncOptions,
+) -> Option<SyncReason> {
+    match options.comparison {
+        SyncComparison::SizeOnly => None,
+        SyncComparison::SizeAndModificationTime => match (source.modified, target.modified) {
+            (Some(source), Some(target)) => {
+                let source = source.saturating_add(options.source_time_adjustment_seconds);
+                let target = target.saturating_add(options.target_time_adjustment_seconds);
+                // One-way sync treats the selected source as authoritative. A freshly copied
+                // target commonly receives a newer filesystem timestamp when the protocol cannot
+                // preserve mtimes; comparing absolute difference would therefore copy it forever.
+                // Copy only when the source is materially newer. Checksum mode remains available
+                // for archived/restored files whose timestamps intentionally move backwards.
+                (source > target && source.abs_diff(target) > options.mtime_tolerance_seconds)
+                    .then_some(SyncReason::DifferentModificationTime)
+            }
+            _ => Some(SyncReason::ModificationTimeUnavailable),
+        },
+        SyncComparison::Checksum => match (source.sha256, target.sha256) {
+            (Some(source), Some(target)) if source == target => None,
+            (Some(_), Some(_)) => Some(SyncReason::DifferentChecksum),
+            _ => Some(SyncReason::ChecksumUnavailable),
+        },
+    }
 }
 
 #[cfg(test)]
@@ -158,21 +267,22 @@ mod tests {
     #[test]
     fn dry_run_is_one_way_and_never_deletes_target_only_files() {
         let source = BTreeMap::from([
-            ("same.txt".into(), 10),
-            ("changed.txt".into(), 20),
-            ("new.txt".into(), 30),
-            (".git/config".into(), 40),
+            ("same.txt".into(), metadata(10, 100)),
+            ("changed.txt".into(), metadata(20, 100)),
+            ("new.txt".into(), metadata(30, 100)),
+            (".git/config".into(), metadata(40, 100)),
         ]);
         let target = BTreeMap::from([
-            ("same.txt".into(), 10),
-            ("changed.txt".into(), 19),
-            ("target-only.txt".into(), 50),
+            ("same.txt".into(), metadata(10, 100)),
+            ("changed.txt".into(), metadata(19, 100)),
+            ("target-only.txt".into(), metadata(50, 100)),
         ]);
         let rules = parse_exclusions(DEFAULT_EXCLUSIONS).unwrap();
-        let preview = build_preview(&source, &target, &rules);
+        let preview = build_preview(&source, &target, &rules, SyncOptions::default());
 
         assert_eq!(preview.unchanged, 1);
         assert_eq!(preview.target_only, 1);
+        assert!(preview.deletions.is_empty());
         assert_eq!(preview.excluded, 1);
         assert_eq!(
             preview.actions,
@@ -189,6 +299,101 @@ mod tests {
                 }
             ]
         );
+    }
+
+    #[test]
+    fn mirror_mode_lists_target_only_files_as_explicit_deletions() {
+        let source = BTreeMap::from([("same.txt".into(), metadata(10, 100))]);
+        let target = BTreeMap::from([
+            ("same.txt".into(), metadata(10, 100)),
+            ("old.txt".into(), metadata(25, 90)),
+            ("cache/ignored.tmp".into(), metadata(4, 80)),
+        ]);
+        let preview = build_preview(
+            &source,
+            &target,
+            &parse_exclusions("*.tmp").unwrap(),
+            SyncOptions {
+                mode: SyncMode::Mirror,
+                ..SyncOptions::default()
+            },
+        );
+        assert_eq!(preview.target_only, 1);
+        assert_eq!(preview.deletions.len(), 1);
+        assert_eq!(preview.deletions[0].relative_path, "old.txt");
+        assert_eq!(preview.deletions[0].reason, SyncReason::TargetOnly);
+    }
+
+    fn metadata(bytes: u64, modified: i64) -> SyncFileMetadata {
+        SyncFileMetadata {
+            bytes,
+            modified: Some(modified),
+            sha256: None,
+        }
+    }
+
+    #[test]
+    fn same_size_timestamp_change_is_not_silently_skipped() {
+        let source = BTreeMap::from([("changed.txt".into(), metadata(10, 200))]);
+        let target = BTreeMap::from([("changed.txt".into(), metadata(10, 100))]);
+        let preview = build_preview(&source, &target, &[], SyncOptions::default());
+        assert_eq!(preview.actions.len(), 1);
+        assert_eq!(
+            preview.actions[0].reason,
+            SyncReason::DifferentModificationTime
+        );
+    }
+
+    #[test]
+    fn timestamp_tolerance_and_clock_adjustment_are_applied() {
+        let source = BTreeMap::from([("same.txt".into(), metadata(10, 100))]);
+        let target = BTreeMap::from([("same.txt".into(), metadata(10, 3_701))]);
+        let preview = build_preview(
+            &source,
+            &target,
+            &[],
+            SyncOptions {
+                target_time_adjustment_seconds: -3_600,
+                ..SyncOptions::default()
+            },
+        );
+        assert_eq!(preview.unchanged, 1);
+    }
+
+    #[test]
+    fn newer_target_does_not_create_an_endless_one_way_sync_loop() {
+        let source = BTreeMap::from([("same.txt".into(), metadata(10, 100))]);
+        let target = BTreeMap::from([("same.txt".into(), metadata(10, 200))]);
+        let preview = build_preview(&source, &target, &[], SyncOptions::default());
+        assert_eq!(preview.unchanged, 1);
+        assert!(preview.actions.is_empty());
+    }
+
+    #[test]
+    fn unavailable_timestamp_and_checksum_fail_safe_to_copy() {
+        let source = BTreeMap::from([(
+            "uncertain.txt".into(),
+            SyncFileMetadata {
+                bytes: 10,
+                ..SyncFileMetadata::default()
+            },
+        )]);
+        let target = source.clone();
+        let timestamp = build_preview(&source, &target, &[], SyncOptions::default());
+        assert_eq!(
+            timestamp.actions[0].reason,
+            SyncReason::ModificationTimeUnavailable
+        );
+        let checksum = build_preview(
+            &source,
+            &target,
+            &[],
+            SyncOptions {
+                comparison: SyncComparison::Checksum,
+                ..SyncOptions::default()
+            },
+        );
+        assert_eq!(checksum.actions[0].reason, SyncReason::ChecksumUnavailable);
     }
 
     #[test]

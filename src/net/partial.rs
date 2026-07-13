@@ -3,8 +3,9 @@
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 
-/// Stable only for the lifetime of one queued job. The random token makes the staging name
-/// unguessable; `expected_total` prevents a corrupt/foreign oversized fragment from being used.
+/// Stable for one persisted queued job, including across application restarts. The random token
+/// makes the staging name unguessable; `expected_total` prevents a corrupt/foreign oversized
+/// fragment from being used.
 #[derive(Debug, Clone, Copy)]
 pub struct DownloadResume {
     pub token: u64,
@@ -18,7 +19,7 @@ pub(crate) struct DownloadPart {
     pub keep_on_error: bool,
 }
 
-fn resumable_part_path(destination: &Path, token: u64) -> PathBuf {
+pub fn resumable_part_path(destination: &Path, token: u64) -> PathBuf {
     let parent = destination.parent().unwrap_or_else(|| Path::new("."));
     let mut name = std::ffi::OsString::from(".");
     name.push(
@@ -26,7 +27,7 @@ fn resumable_part_path(destination: &Path, token: u64) -> PathBuf {
             .file_name()
             .unwrap_or_else(|| std::ffi::OsStr::new("download")),
     );
-    name.push(format!(".gmacftp-{}-{token:016x}.part", std::process::id()));
+    name.push(format!(".gmacftp-{token:016x}.part"));
     parent.join(name)
 }
 
@@ -168,6 +169,12 @@ mod tests {
         let reopened = open_download_part(&destination, Some(resume)).unwrap();
         assert_eq!(reopened.offset, 4);
         assert!(reopened.keep_on_error);
+        assert!(!reopened
+            .path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .contains(&format!("-{}-", std::process::id())));
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -1,0 +1,34 @@
+# Pin the multi-architecture base manifest and the upstream source archive independently.
+FROM debian:bookworm-slim@sha256:60eac759739651111db372c07be67863818726f754804b8707c90979bda511df AS builder
+
+ARG PURE_FTPD_VERSION=1.0.53
+ARG PURE_FTPD_SHA256=2b2a80047f49a97b6924521fcb27978ad34ce55482b3e57b919cfd22436d2762
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        autoconf autoconf-archive automake build-essential ca-certificates curl libssl-dev \
+        libsodium-dev libtool pkg-config \
+    && curl --fail --location --proto '=https' --tlsv1.2 \
+        --output /tmp/pure-ftpd.tar.gz \
+        "https://github.com/jedisct1/pure-ftpd/archive/refs/tags/${PURE_FTPD_VERSION}.tar.gz" \
+    && printf '%s  %s\n' "$PURE_FTPD_SHA256" /tmp/pure-ftpd.tar.gz | sha256sum --check --strict \
+    && mkdir /tmp/pure-ftpd \
+    && tar --extract --gzip --file /tmp/pure-ftpd.tar.gz --strip-components=1 \
+        --directory /tmp/pure-ftpd \
+    && cd /tmp/pure-ftpd \
+    && autoreconf --force --install \
+    && ./configure --prefix=/usr/local --with-tls --with-puredb --without-capabilities \
+    && make -j2 \
+    && make DESTDIR=/out install-strip
+
+FROM debian:bookworm-slim@sha256:60eac759739651111db372c07be67863818726f754804b8707c90979bda511df
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates libssl3 libsodium23 passwd \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /out/usr/local /usr/local
+COPY entrypoint.sh /usr/local/bin/gmacftp-compat-server
+RUN chmod 0755 /usr/local/bin/gmacftp-compat-server
+
+EXPOSE 2121 30000-30009
+ENTRYPOINT ["/usr/local/bin/gmacftp-compat-server"]

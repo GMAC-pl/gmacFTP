@@ -1,5 +1,48 @@
 # Changelog
 
+## 0.2.0 — 2026-07-13
+
+The reliability, power-user workflow, accessibility, and universal-Mac release.
+
+- **Transactional transfers and crash recovery.** Local copies and FTP/FTPS/SFTP uploads now stage
+  through private sibling files and replace the destination only after a complete, flushed write.
+  Uploads and downloads can resume safely, while a credential-free queue restores interrupted work
+  after launch.
+- **A stronger transfer queue.** Per-server parallelism, bandwidth limits, adaptive SFTP windows,
+  priority, manual reorder, per-job pause/retry, bounded exponential backoff, and redacted history
+  reports are configurable. A bad or locked file can be skipped without blocking the rest of its
+  batch.
+- **Fast large-directory browsing.** Virtualized rows, incremental cancellable listings, on-demand
+  folder metadata, bounded caches, and recursive-work budgets keep 10k/50k-entry workflows
+  responsive. Repeatable cold-start, memory, metadata, latency, and many-small-file benchmarks are
+  included.
+- **Native Settings.** General, Transfers, Connections, Sync, Editors, and Privacy & Storage pages
+  cover appearance, workspace restoration, concurrency, retries, conflict policy, notifications,
+  protocol details, saved sync profiles, external editors, encrypted backup, and cleanup controls.
+- **Finder-style file management.** Command-A, Shift and Command selection work across mixed files
+  and folders. The app adds an editable path bar, recent paths, remote Places, filtering, bounded
+  remote search, directory comparison, synchronized browsing, batch rename, duplicate, copy/paste,
+  same-server move, metadata inspection, and optional remote quarantine.
+- **Safer synchronization and editing.** Saved one-way and opt-in mirror profiles support size,
+  timestamp/tolerance, or checksum comparison, exclusions, a dry-run report, revalidation, and
+  explicit deletion approval. External-editor uploads detect server-side conflicts and offer a
+  bounded diff workflow.
+- **Broader secure connectivity.** SFTP supports keyboard-interactive/2FA, SSH Agent, protected
+  Ed25519/ECDSA keys, safe `~/.ssh/config` aliases, and one bounded ProxyJump. FTPS supports
+  explicit/implicit TLS, endpoint certificate pinning, optional client certificates, and
+  credential-free HTTP CONNECT or SOCKS5 proxies.
+- **Polished native experience.** The complete EN/PL catalog follows the macOS language, custom
+  controls expose VoiceOver semantics, every workflow is keyboard reachable, and privacy-safe
+  notifications plus Dock progress integrate with macOS.
+- **Verified updates without telemetry.** Optional once-per-launch checks are off by default.
+  Release notes are plain bounded text, downloads require confirmation, and accepted DMGs must pass
+  the exact GitHub SHA-256, expected Developer ID identity, and stapled Apple notarization ticket.
+- **Universal Mac build.** The public app now contains both `arm64` and `x86_64` and supports macOS
+  11 or newer. CI and the release script compile and verify both slices before signing.
+- **Audited release.** 177 automated tests pass, Clippy is warning-free, the protocol matrix covers
+  OpenSSH, vsftpd, ProFTPD, and Pure-FTPd, and source/history/release artifacts are scanned for
+  credentials, private paths, and unexpected attribution before publication.
+
 ## 0.1.1 — 2026-07-11
 
 - Updated `ureq` to 3.3, `sha2` to 0.11, `directories` to 6, and `roxmltree` to 0.21.

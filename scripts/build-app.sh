@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Assemble two macOS bundles:
-#   - target/release/gmacFTP.app          public/open-source build (the one that ships: DMG + Homebrew cask)
-#   - target/release/gmacFTP-Personal.app personal/local build (uses .env.personal when present)
+#   - target/release/gmacFTP.app          public universal build (arm64 + x86_64)
+#   - target/release/gmacFTP-Personal.app personal/local native build (uses .env.personal)
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
@@ -17,6 +17,32 @@ export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }--remap-path-prefix $ROOT=gmacftp --r
 # CFBundleVersion must be a monotonically-increasing integer (git commit count).
 PKG_VER="${MACKFTP_VERSION:-$(grep '^version' "$ROOT/Cargo.toml" | head -1 | sed 's/.*"\([^"]*\)".*/\1/')}"
 PKG_BUILD="${MACKFTP_BUILD_NUMBER:-$(git -C "$ROOT" rev-list --count HEAD 2>/dev/null || echo 1)}"
+NATIVE_TARGET="$(rustc -vV | sed -n 's/^host: //p')"
+PUBLIC_ARCHS="${MACKFTP_PUBLIC_ARCHS:-aarch64-apple-darwin x86_64-apple-darwin}"
+PERSONAL_ARCHS="${MACKFTP_PERSONAL_ARCHS:-$NATIVE_TARGET}"
+
+ensure_rust_target() {
+  local target="$1"
+  local target_libdir
+  target_libdir="$(rustc --print target-libdir --target "$target" 2>/dev/null || true)"
+  if [ -n "$target_libdir" ] && [ -d "$target_libdir" ]; then
+    return
+  fi
+  if ! command -v rustup >/dev/null 2>&1; then
+    echo "ERROR: Rust standard library for $target is missing; install it with rustup." >&2
+    exit 1
+  fi
+  echo "==> installing Rust target: $target"
+  rustup target add "$target"
+}
+
+target_arch_name() {
+  case "$1" in
+    aarch64-apple-darwin) printf '%s\n' arm64 ;;
+    x86_64-apple-darwin) printf '%s\n' x86_64 ;;
+    *) echo "ERROR: unsupported macOS release target: $1" >&2; exit 64 ;;
+  esac
+}
 
 sign_app() {
   local app="$1"
@@ -72,17 +98,56 @@ build_bundle() {
   local qualifier="$5"
   local organization="$6"
   local application="$7"
+  local targets="$8"
+  local target
+  local target_arch
+  local binary_archs
+  local expected_arch_count=0
+  local -a target_list
+  local -a binaries
+  target_list=()
+  binaries=()
+  read -r -a target_list <<<"$targets"
 
-  echo "==> cargo build --release ($label)"
-  MACKFTP_BUNDLE_ID="$bundle_id" \
-  MACKFTP_CONFIG_QUALIFIER="$qualifier" \
-  MACKFTP_CONFIG_ORGANIZATION="$organization" \
-  MACKFTP_CONFIG_APPLICATION="$application" \
-    cargo build --release
+  if [ "${#target_list[@]}" -eq 0 ]; then
+    echo "ERROR: at least one macOS build target is required for $label" >&2
+    exit 64
+  fi
+
+  for target in "${target_list[@]}"; do
+    target_arch_name "$target" >/dev/null
+    ensure_rust_target "$target"
+    echo "==> cargo build --release --target $target ($label)"
+    MACKFTP_BUNDLE_ID="$bundle_id" \
+    MACKFTP_CONFIG_QUALIFIER="$qualifier" \
+    MACKFTP_CONFIG_ORGANIZATION="$organization" \
+    MACKFTP_CONFIG_APPLICATION="$application" \
+      cargo build --release --locked --target "$target"
+    binaries+=("$ROOT/target/$target/release/gmacftp")
+  done
 
   rm -rf "$app"
   mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
-  cp target/release/gmacftp "$app/Contents/MacOS/gmacftp"
+  if [ "${#binaries[@]}" -eq 1 ]; then
+    cp "${binaries[0]}" "$app/Contents/MacOS/gmacftp"
+  else
+    lipo -create "${binaries[@]}" -output "$app/Contents/MacOS/gmacftp"
+  fi
+
+  binary_archs="$(lipo -archs "$app/Contents/MacOS/gmacftp")"
+  for target in "${target_list[@]}"; do
+    target_arch="$(target_arch_name "$target")"
+    if ! grep -qw "$target_arch" <<<"$binary_archs"; then
+      echo "ERROR: $app is missing the expected $target_arch architecture" >&2
+      exit 1
+    fi
+    expected_arch_count=$((expected_arch_count + 1))
+  done
+  if [ "$(wc -w <<<"$binary_archs" | tr -d ' ')" -ne "$expected_arch_count" ]; then
+    echo "ERROR: $app contains unexpected architectures: $binary_archs" >&2
+    exit 1
+  fi
+  echo "==> verified executable architectures: $binary_archs"
 
   cat > "$app/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -175,7 +240,8 @@ build_bundle \
   "$PUBLIC_BUNDLE_ID" \
   "$PUBLIC_CONFIG_QUALIFIER" \
   "$PUBLIC_CONFIG_ORGANIZATION" \
-  "$PUBLIC_CONFIG_APPLICATION"
+  "$PUBLIC_CONFIG_APPLICATION" \
+  "$PUBLIC_ARCHS"
 
 if [ "${MACKFTP_PUBLIC_ONLY:-0}" != "1" ] && [ -f .env.personal ]; then
   set -a
@@ -195,7 +261,8 @@ if [ "${MACKFTP_PUBLIC_ONLY:-0}" != "1" ] && [ -f .env.personal ]; then
     "$PERSONAL_BUNDLE_ID" \
     "$PERSONAL_CONFIG_QUALIFIER" \
     "$PERSONAL_CONFIG_ORGANIZATION" \
-    "$PERSONAL_CONFIG_APPLICATION"
+    "$PERSONAL_CONFIG_APPLICATION" \
+    "$PERSONAL_ARCHS"
 else
   echo "==> personal bundle skipped"
   echo "    Public bundle is ready at: target/release/gmacFTP.app"

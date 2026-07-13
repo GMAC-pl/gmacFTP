@@ -1,0 +1,166 @@
+// ── design tokens (macOS Finder light + dark, switchable at runtime) ──
+export global Tokens {
+    in-out property <string> theme: "light";   // "light" | "dark" — set from Rust (settings)
+    // backgrounds
+    out property <color> bg:             theme == "dark" ? #1B1B1D : #FFFFFF;
+    out property <color> bg-alt:         theme == "dark" ? #232325 : #F5F5F7;   // sidebar
+    out property <color> surface:        theme == "dark" ? #28282B : #FAFAFB;   // toolbar / pane header
+    out property <color> surface-raised: theme == "dark" ? #2E2E32 : #FFFFFF;   // dialogs / cards
+    out property <color> card:           theme == "dark" ? #333337 : #FFFFFF;   // Pencil modal/card surface
+    out property <color> field-bg:       theme == "dark" ? #2A2A2D : #FFFFFF;
+    out property <color> pane-active:    theme == "dark" ? #162B40 : #EAF3FF;
+    // hairlines (SOLID — the old alpha-white lines were invisible on near-black)
+    out property <color> border:        theme == "dark" ? #3A3A3E : #E7E7EC;
+    out property <color> border-strong: theme == "dark" ? #515159 : #D3D3D9;
+    // text (macOS label colors — bright secondary text = the readability fix)
+    out property <color> text:        theme == "dark" ? #F2F2F5 : #1D1D1F;
+    out property <color> text-sec:     theme == "dark" ? #AFAFB4 : #6E6E73;
+    out property <color> text-ter:     theme == "dark" ? #86868B : #A1A1A6;
+    // accents (macOS system)
+    out property <color> accent:       theme == "dark" ? #0A84FF : #007AFF;
+    out property <color> accent-hover: theme == "dark" ? #3D9BFF : #0066D6;
+    out property <color> accent-text:  theme == "dark" ? #4DA3FF : #0064D1;  // accent for small TEXT (≥4.5:1; accent itself is for icons/large UI)
+    out property <color> brand:        theme == "dark" ? #BF5AF2 : #8A2BE2;   // remote accent (distinct from local)
+    out property <color> success:      theme == "dark" ? #30D158 : #28B650;
+    out property <color> danger:       theme == "dark" ? #FF453A : #E0382E;
+    // semantic fill/text shades: accent/danger/success are fine for icons & large UI, but small
+    // TEXT and filled-button backgrounds need slightly different shades to clear WCAG 4.5:1.
+    out property <color> primary-fill:       theme == "dark" ? #0A6ED0 : #0064D1;  // filled buttons + row selection (white text ≥ 4.5:1)
+    out property <color> primary-fill-hover: theme == "dark" ? #0A84FF : #0058B0;
+    out property <color> danger-text:        theme == "dark" ? #FF7A70 : #C4291F;  // small destructive text (≥4.5:1 on dialog)
+    out property <color> danger-fill:        theme == "dark" ? #B83A2E : #C4291F;  // filled destructive button (white text ≥ 4.5:1)
+    out property <color> danger-fill-hover:  theme == "dark" ? #C84A3E : #A8231A;
+    out property <color> success-text:       theme == "dark" ? #36D96B : #1A8439;  // small success text
+    // selection / hover (SOLID — replaces the old translucent selection that vanished)
+    out property <color> selection:      theme == "dark" ? #2E63B0 : #0064D1;  // darker blue so white row text clears 4.5:1
+    out property <color> selection-text: #FFFFFF;
+    out property <color> row-hover:      theme == "dark" ? #343438 : #EDF1F7;
+    out property <color> sidebar-active: theme == "dark" ? #2E63B055 : #007AFF22;
+    // icon chips
+    out property <color> folder:  theme == "dark" ? #5AA9F0 : #3B82F6;
+    out property <color> file:    theme == "dark" ? #5A5A5F : #C2C7CF;
+    // soft tinted backgrounds for tags / chips / active toggles (SOLID tints, not alpha-on-white)
+    out property <color> accent-soft:  theme == "dark" ? #0A84FF22 : #EAF2FF;
+    out property <color> brand-soft:   theme == "dark" ? #BF5AF222 : #F3EAFC;
+    out property <color> danger-soft:  theme == "dark" ? #FF453A26 : #FDE3E1;
+    out property <color> success-soft: theme == "dark" ? #30D15826 : #28B6501F;
+    out property <color> warning:      theme == "dark" ? #FFD60A : #F0932B;
+    out property <color> scrim:    theme == "dark" ? #00000073 : #00000040;
+    // radii
+    out property <length> r-row:    8px;
+    out property <length> r-button: 7px;
+    out property <length> r-track:  3px;
+    out property <length> r-chip:   4px;
+}
+export global I18n {
+    in-out property <string> locale: "en";
+    out property <string> connections: @tr("CONNECTIONS");
+    out property <string> local:      @tr("LOCAL");
+    out property <string> remote:     @tr("REMOTE");
+    out property <string> connect:    @tr("Connect");
+    out property <string> disconnect: @tr("Disconnect");
+    out property <string> connected:  @tr("CONNECTED");
+    out property <string> favorites:  @tr("FAVORITES");
+    out property <string> saved:      @tr("SAVED");
+    out property <string> refresh:    @tr("Refresh");
+    out property <string> download:   @tr("Download");
+    out property <string> upload:     @tr("Upload");
+    out property <string> new-cap:    @tr("New");
+    out property <string> save-cap:   @tr("Save");
+    out property <string> cancel-cap: @tr("Cancel");
+    out property <string> close-cap:  @tr("Close");
+    out property <string> edit-cap:   @tr("Edit");
+    out property <string> del-cap:    @tr("Delete");
+    out property <string> delete-dont-ask: @tr("Don't ask again this session");
+    out property <string> overwrite-title: @tr("File or folder already exists");
+    out property <string> overwrite-msg: @tr("A file or folder with this name already exists at the destination. What do you want to do?");
+    out property <string> overwrite-cap: @tr("Overwrite");
+    out property <string> save-new-cap: @tr("Save as new");
+    out property <string> passphrase-set-title: @tr("Set sync passphrase");
+    out property <string> passphrase-enter-title: @tr("Unlock servers");
+    out property <string> passphrase-set-msg: @tr("This passphrase unlocks your servers on your other Macs. Remember it (or save it) — without it, your passwords can't be recovered.");
+    out property <string> passphrase-enter-msg: @tr("Enter your sync passphrase to unlock your saved passwords.");
+    out property <string> encryption-entry-label: @tr("PASSPHRASE");
+    out property <string> encryption-confirm-label: @tr("CONFIRM");
+    out property <string> passphrase-ok-cap: @tr("Set");
+    out property <string> passphrase-unlock-cap: @tr("Unlock");
+    out property <string> import-cap: @tr("Import from ForkLift");
+    out property <string> not-connected: @tr("not connected");
+    out property <string> connecting: @tr("connecting…");
+    out property <string> search:     @tr("search…");
+    out property <string> new-conn:   @tr("New connection");
+    out property <string> edit-conn:  @tr("Edit connection");
+    out property <string> tls-on:     @tr("TLS: any cert");
+    out property <string> tls-off:    @tr("TLS: strict");
+    // context menu
+    out property <string> open-cap:   @tr("Open");
+    out property <string> copy-path:  @tr("Copy Path");
+    out property <string> xfer-here:  @tr("Transfer Here");
+}
+
+export global Fmt {
+    public pure function human-size(bytes: int) -> string {
+        bytes < 1024 ? bytes + " B"
+        : bytes < 1024 * 1024 ? (bytes / 1024) + " KB"
+        : bytes < 1024 * 1024 * 1024 ? (bytes / (1024 * 1024)) + " MB"
+        : (bytes / (1024 * 1024 * 1024)) + " GB"
+    }
+    public pure function favorite-drop-index(y: length, top: length, count: int) -> int {
+        clamp((y - top + 15px) / 30px, 0, count)
+    }
+    public pure function saved-drop-index(y: length, top: length, count: int) -> int {
+        clamp((y - top + 16px) / 32px, 0, count)
+    }
+}
+
+export struct ConnRow { id: int, label: string, sub: string, protocol: string, connected: bool }
+export struct EntryRow {
+    name: string,
+    is-dir: bool,
+    size: int,
+    mtime: int,
+    date: string,
+    size-text: string,
+    permissions: string,
+    owner: string,
+    group: string,
+    metadata-state: string, // "ready" | "loading" | "on_demand" | "unavailable"
+}
+export struct LocalFavoriteRow { label: string, path: string }
+export struct TransferRow {
+    id: int,
+    name: string,        // display name (relative path)
+    direction: string,   // "download" | "upload"
+    route: string,       // "src -> dst" host route (e.g. "ftp.a -> ftp.b" or "local -> ftp.a")
+    done: int,
+    total: int,
+    progress-text: string,
+    fraction: float,
+    state: string,       // "active" | "done" | "failed" | "cancelled" | "queued" | "paused"
+    priority: string,    // "low" | "normal" | "high"
+    message: string,     // ETA string or error text
+}
+export struct SyncRow {
+    included: bool,
+    path: string,
+    action: string,
+    reason: string,
+    size-text: string,
+}
+export struct PathRow {
+    label: string,
+    path: string,
+}
+export struct SearchRow {
+    path: string,
+    is-dir: bool,
+    size-text: string,
+}
+export struct ComparisonRow {
+    name: string,
+    is-dir: bool,
+    left-detail: string,
+    right-detail: string,
+    status: string,
+    status-label: string,
+}

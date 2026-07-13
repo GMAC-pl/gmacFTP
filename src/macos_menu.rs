@@ -38,6 +38,7 @@ mod imp {
     // are only ever touched on the main thread, where menu actions fire.
     static APP: OnceLock<Mutex<Option<Weak<App>>>> = OnceLock::new();
     static SYNC_ITEM_PTR: AtomicPtr<NSMenuItem> = AtomicPtr::new(ptr::null_mut());
+    static METADATA_ITEM_PTR: AtomicPtr<NSMenuItem> = AtomicPtr::new(ptr::null_mut());
     static TARGET_PTR: AtomicPtr<AnyObject> = AtomicPtr::new(ptr::null_mut());
 
     fn app_weak() -> Option<Weak<App>> {
@@ -63,12 +64,28 @@ mod imp {
         }
     }
 
+    fn metadata_title() -> String {
+        if gmacftp::store::settings::load().background_folder_metadata {
+            "Background Folder Sizes: ON".to_string()
+        } else {
+            "Background Folder Sizes: OFF".to_string()
+        }
+    }
+
     pub fn refresh_sync_title() {
         let ptr_item = SYNC_ITEM_PTR.load(Ordering::SeqCst);
         if !ptr_item.is_null() {
             // SAFETY: the pointer is valid for the app lifetime (set in install_once, only
             // accessed from the main thread where menu actions fire).
             unsafe { (&*ptr_item).setTitle(&NSString::from_str(&sync_title())) };
+        }
+    }
+
+    pub fn refresh_metadata_title() {
+        let item = METADATA_ITEM_PTR.load(Ordering::SeqCst);
+        if !item.is_null() {
+            // SAFETY: installed and used exclusively on the main thread for the app lifetime.
+            unsafe { (&*item).setTitle(&NSString::from_str(&metadata_title())) };
         }
     }
 
@@ -116,9 +133,27 @@ mod imp {
                 on_ui(|ui| ui.set_manager_open(true));
             }
 
+            #[unsafe(method(openSettings:))]
+            fn open_settings(&self, _sender: Option<&AnyObject>) {
+                on_ui(|ui| {
+                    ui.invoke_reload_settings();
+                    ui.invoke_refresh_storage_stats();
+                    ui.set_settings_section("general".into());
+                    ui.set_settings_open(true);
+                });
+            }
+
             #[unsafe(method(openPalette:))]
             fn open_palette(&self, _sender: Option<&AnyObject>) {
                 on_ui(|ui| ui.set_palette_open(true));
+            }
+
+            #[unsafe(method(toggleBackgroundMetadata:))]
+            fn toggle_background_metadata(&self, _sender: Option<&AnyObject>) {
+                on_ui(|ui| {
+                    ui.invoke_toggle_background_metadata();
+                    refresh_metadata_title();
+                });
             }
 
             #[unsafe(method(openHelp:))]
@@ -155,46 +190,9 @@ mod imp {
 
             #[unsafe(method(checkUpdates:))]
             fn check_updates(&self, _sender: Option<&AnyObject>) {
-                // Check for a newer release on GitHub, off the UI thread (blocking HTTP).
-                // If one exists, download the notarized DMG to ~/Downloads and open it in Finder
-                // (the user drags gmacFTP to Applications — the standard DMG install).
-                std::thread::spawn(|| {
-                    on_ui(|ui| ui.set_status("Checking for updates…".into()));
-                    match gmacftp::updater::check() {
-                        Ok(Some(upd)) => {
-                            let v = upd.version.clone();
-                            match gmacftp::updater::download(
-                                &upd.dmg_url,
-                                &upd.version,
-                                &upd.sha256,
-                                upd.size,
-                            ) {
-                                Ok(path) => {
-                                    match gmacftp::updater::open_in_finder(&path) {
-                                        Ok(()) => on_ui(move |ui| {
-                                            ui.set_status(
-                                                format!(
-                                                    "Verified update {v} downloaded — drag gmacFTP to Applications, then relaunch."
-                                                )
-                                                .into(),
-                                            )
-                                        }),
-                                        Err(e) => on_ui(move |ui| {
-                                            ui.set_error(
-                                                format!("Could not open verified update: {e}").into(),
-                                            )
-                                        }),
-                                    }
-                                }
-                                Err(e) => on_ui(move |ui| ui.set_error(format!("Update download failed: {e}").into())),
-                            }
-                        }
-                        Ok(None) => on_ui(|ui| {
-                            ui.set_status(format!("gmacFTP is up to date (v{}).", gmacftp::updater::CURRENT).into())
-                        }),
-                        Err(e) => on_ui(move |ui| ui.set_error(format!("Update check failed: {e}").into())),
-                    }
-                });
+                // The app controller performs the blocking request off-thread, displays bounded
+                // release notes, and requires a second explicit action before any download.
+                on_ui(|ui| ui.invoke_check_for_updates());
             }
         }
     );
@@ -337,6 +335,7 @@ mod imp {
                 sel!(checkUpdates:),
                 "",
             ),
+            custom_item(mtm, "Settings…", target_ref, sel!(openSettings:), ","),
             sep(),
             sync_item,
             custom_item(
@@ -390,11 +389,19 @@ mod imp {
         let edit_header = submenu(mtm, "Edit", edit_items);
 
         // ── View menu ──
-        let view_items =
-            vec![
-                custom_item(mtm, "Command Palette…", target_ref, sel!(openPalette:), "p")
-                    .shift_cmd(),
-            ];
+        let metadata_item = custom_item(
+            mtm,
+            &metadata_title(),
+            target_ref,
+            sel!(toggleBackgroundMetadata:),
+            "",
+        );
+        METADATA_ITEM_PTR.store(Retained::into_raw(metadata_item.clone()), Ordering::SeqCst);
+        let view_items = vec![
+            custom_item(mtm, "Command Palette…", target_ref, sel!(openPalette:), "p").shift_cmd(),
+            sep(),
+            metadata_item,
+        ];
         let view_header = submenu(mtm, "View", view_items);
 
         // ── Window menu ──
@@ -480,3 +487,10 @@ pub fn refresh_sync_title() {
 }
 #[cfg(not(target_os = "macos"))]
 pub fn refresh_sync_title() {}
+
+#[cfg(target_os = "macos")]
+pub fn refresh_background_metadata_title() {
+    imp::refresh_metadata_title();
+}
+#[cfg(not(target_os = "macos"))]
+pub fn refresh_background_metadata_title() {}

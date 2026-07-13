@@ -1,0 +1,1404 @@
+msgid ""
+msgstr ""
+"Project-Id-Version: gmacFTP 0.1.1\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Language: pl\n"
+"Plural-Forms: nplurals=3; plural=(n==1 ? 0 : n%10>=2 && n%10<=4 && (n%100<10 || n%100>=20) ? 1 : 2);\n"
+
+msgid "Available only in the public gmacFTP build"
+msgstr "Dostępne tylko w publicznej wersji gmacFTP"
+
+msgid "Check for updates automatically"
+msgstr "Automatycznie sprawdzaj aktualizacje"
+
+msgid "Download & Verify"
+msgstr "Pobierz i zweryfikuj"
+
+msgid "Downloading and verifying…"
+msgstr "Pobieranie i weryfikacja…"
+
+msgid "Later"
+msgstr "Później"
+
+msgid "No release notes were provided."
+msgstr "Nie podano informacji o wydaniu."
+
+msgid "Opt-in: checks GitHub once after launch, sends no telemetry, and asks before every download"
+msgstr "Opcjonalne: raz po uruchomieniu sprawdza GitHub, nie wysyła telemetrii i pyta przed każdym pobraniem"
+
+msgid "Release notes from GitHub (shown as plain text)"
+msgstr "Informacje o wydaniu z GitHuba (wyświetlane jako zwykły tekst)"
+
+msgid "The DMG opens only after its GitHub SHA-256 digest, Developer ID team, and stapled Apple notarization ticket are verified."
+msgstr "Plik DMG zostanie otwarty dopiero po sprawdzeniu sumy SHA-256 z GitHuba, zespołu Developer ID i dołączonego biletu notaryzacji Apple."
+
+msgid "Update available"
+msgstr "Dostępna aktualizacja"
+
+msgid "gmacFTP {} is available."
+msgstr "Dostępna jest wersja gmacFTP {}."
+
+msgid "0 = unlimited; the limit is shared by all active servers."
+msgstr "0 = bez limitu; limit jest wspólny dla wszystkich aktywnych serwerów."
+
+msgid "0 timeout = protocol default; blank keepalive = default, 0 = disabled."
+msgstr "0 timeout = domyślny protokołu; puste keepalive = domyślne, 0 = wyłączone."
+
+msgid "A dry-run always comes first. One-way mode never deletes; mirror mode requires separate confirmation and rechecks every file."
+msgstr "Najpierw zobaczysz dry-run. Tryb jednokierunkowy niczego nie usuwa; tryb lustrzany wymaga osobnego potwierdzenia i ponownej kontroli każdego pliku."
+
+msgid "A file could not be copied"
+msgstr "Nie udało się skopiować pliku"
+
+msgid "A file or folder with this name already exists at the destination. What do you want to do?"
+msgstr "Plik lub folder o tej nazwie już istnieje w miejscu docelowym. Co chcesz zrobić?"
+
+msgid "A missing value means the filesystem or protocol did not expose it."
+msgstr "Brakująca wartość oznacza, że system plików lub protokół jej nie udostępnił."
+
+msgid "A new certificate requires fingerprint review before trust is saved."
+msgstr "Nowy certyfikat wymaga porównania odcisku przed zapisaniem zaufania."
+
+msgid "A per-connection override is available in the Connection Manager."
+msgstr "Dla każdego połączenia można ustawić osobny limit w Menedżerze serwerów."
+
+msgid "ACTION"
+msgstr "DZIAŁANIE"
+
+msgid "ADVANCED TLS TRUST"
+msgstr "ZAAWANSOWANE ZAUFANIE TLS"
+
+msgid "ALWAYS KEEP"
+msgstr "ZAWSZE ZACHOWAJ"
+
+msgid "ASK"
+msgstr "PYTAJ"
+
+msgid "Absolute local path or ~/…"
+msgstr "Lokalna ścieżka bezwzględna lub ~/…"
+
+msgid "Absolute path on the active server"
+msgstr "Ścieżka bezwzględna na aktywnym serwerze"
+
+msgid "Active mode opens a temporary inbound port and commonly needs firewall/NAT configuration."
+msgstr "Tryb aktywny otwiera tymczasowy port przychodzący i zwykle wymaga konfiguracji zapory/NAT."
+
+msgid "Add Current to Places"
+msgstr "Dodaj bieżące do Places"
+
+msgid "All"
+msgstr "Wszyst."
+
+msgid "Always enabled — destination changes only after success"
+msgstr "Zawsze włączone — plik docelowy zmienia się dopiero po sukcesie"
+
+msgid "Appearance"
+msgstr "Wygląd"
+
+msgid "Applies to local Trash and remote quarantine; permanent deletion always requires confirmation"
+msgstr "Dotyczy Kosza lokalnego i zdalnej kwarantanny; trwałe usuwanie zawsze wymaga potwierdzenia"
+
+msgid "Apply this decision to remaining conflicts in this queue"
+msgstr "Zastosuj tę decyzję do pozostałych konfliktów w tej kolejce"
+
+msgid "At least 2 characters"
+msgstr "Co najmniej 2 znaki"
+
+msgid "Atomic transfers"
+msgstr "Transfery atomowe"
+
+msgid "Automatic iCloud Drive folder"
+msgstr "Automatyczny folder iCloud Drive"
+
+msgid "Availability depends on metadata exposed by the FTP/SFTP server"
+msgstr "Dane zależą od informacji udostępnianych przez serwer FTP/SFTP"
+
+msgid "BACKOFF (MS)"
+msgstr "OPÓŹNIENIE (MS)"
+
+msgid "Background folder sizes"
+msgstr "Rozmiary folderów w tle"
+
+msgid "Batch Rename"
+msgstr "Zmień nazwy wielu pozycji"
+
+msgid "Batch Rename…"
+msgstr "Zmień nazwy wielu…"
+
+msgid "Both files are required. The key must be unencrypted PKCS#8 with mode 600; paths stay on this Mac only."
+msgstr "Wymagane są oba pliki. Klucz musi być niezaszyfrowany, w formacie PKCS#8 i z uprawnieniami 600; ścieżki pozostają tylko na tym Macu."
+
+msgid "CLEAN UP"
+msgstr "USUWAJ"
+
+msgid "CLOCK TOLERANCE (SECONDS)"
+msgstr "TOLERANCJA CZASU (SEK.)"
+
+msgid "COMPARE"
+msgstr "PORÓW."
+
+msgid "COMPARISON"
+msgstr "PORÓWNANIE"
+
+msgid "CONFIRM"
+msgstr "POWTÓRZ HASŁO"
+
+msgid "CONNECT TIMEOUT (SECONDS)"
+msgstr "TIMEOUT POŁĄCZENIA (SEK.)"
+
+msgid "CONNECTED"
+msgstr "POŁĄCZONE"
+
+msgid "CONNECTIONS"
+msgstr "POŁĄCZENIA"
+
+msgid "Calculate Size"
+msgstr "Oblicz rozmiar"
+
+msgid "Cancel"
+msgstr "Anuluj"
+
+msgid "Certificate verification disabled (unsafe)"
+msgstr "Weryfikacja certyfikatu wyłączona (niebezpieczne)"
+
+msgid "Change Permissions"
+msgstr "Zmień uprawnienia"
+
+msgid "Choose…"
+msgstr "Wybierz…"
+
+msgid "Clean Abandoned Temp"
+msgstr "Usuń osierocone temp"
+
+msgid "Clear"
+msgstr "Wyczyść"
+
+msgid "Clear Caches"
+msgstr "Wyczyść cache"
+
+msgid "Close"
+msgstr "Zamknij"
+
+msgid "Columns"
+msgstr "Kolumny"
+
+msgid "Comparing folders…"
+msgstr "Porównuję foldery…"
+
+msgid "Confirm deletions"
+msgstr "Potwierdzaj usuwanie"
+
+msgid "Connect"
+msgstr "Połącz"
+
+msgid "Connections"
+msgstr "Połączenia"
+
+msgid "Copy"
+msgstr "Kopiuj"
+
+msgid "Copy Path"
+msgstr "Kopiuj ścieżkę"
+
+msgid "Create"
+msgstr "Utwórz"
+
+msgid "Current Directory Comparison"
+msgstr "Porównanie bieżących katalogów"
+
+msgid "DARK"
+msgstr "CIEMNY"
+
+msgid "DATE TOLERANCE (SECONDS)"
+msgstr "TOLERANCJA DATY (SEKUNDY)"
+
+msgid "DEFAULT"
+msgstr "DOMYŚLNY"
+
+msgid "DEFAULT EXCLUSIONS"
+msgstr "DOMYŚLNE WYKLUCZENIA"
+
+msgid "DIRECTION"
+msgstr "KIERUNEK"
+
+msgid "DISCARD"
+msgstr "ODRZUĆ"
+
+msgid "Decrypt Settings Import"
+msgstr "Odszyfruj import ustawień"
+
+msgid "Default"
+msgstr "Domyślny"
+
+msgid "Default comparison"
+msgstr "Domyślne porównanie"
+
+msgid "Default per server"
+msgstr "Domyślnie na serwer"
+
+msgid "Delete"
+msgstr "Usuń"
+
+msgid "Delete Permanently"
+msgstr "Usuń trwale"
+
+msgid "Delete file?"
+msgstr "Usunąć plik?"
+
+msgid "Delete folder?"
+msgstr "Usunąć folder?"
+
+msgid "Deletion runs only after successful copies and a fresh metadata check."
+msgstr "Usuwanie nastąpi dopiero po udanym kopiowaniu i ponownej kontroli metadanych."
+
+msgid "Diagnostics are redacted. Settings exports are passphrase-encrypted and never include server passwords or vault keys."
+msgstr "Diagnostyka jest zanonimizowana. Eksport ustawień jest szyfrowany hasłem i nigdy nie zawiera haseł serwerów ani kluczy sejfu."
+
+msgid "Differences only"
+msgstr "Tylko różnice"
+
+msgid "Disconnect"
+msgstr "Rozłącz"
+
+msgid "Don't ask again this session"
+msgstr "Nie pytaj ponownie w tej sesji"
+
+msgid "Double-click a row to select that name in both panes."
+msgstr "Kliknij dwukrotnie wiersz, aby zaznaczyć tę nazwę w panelach."
+
+msgid "Download"
+msgstr "Pobierz"
+
+msgid "Dry-run Preview"
+msgstr "Podgląd dry-run"
+
+msgid "Duplicate"
+msgstr "Duplikuj"
+
+msgid "EDITORS"
+msgstr "EDYTORY"
+
+msgid "EXCLUDE (COMMA-SEPARATED; * AND ? SUPPORTED)"
+msgstr "POMIŃ (PRZECINKI; * I ? SĄ OBSŁUGIWANE)"
+
+msgid "EXTENSION MAPPINGS (EXT=APPLICATION; …)"
+msgstr "MAPOWANIA ROZSZERZEŃ (EXT=APLIKACJA; …)"
+
+msgid "Edit"
+msgstr "Edytuj"
+
+msgid "Edit connection"
+msgstr "Edytuj połączenie"
+
+msgid "Edit in Default App"
+msgstr "Edytuj lokalnie"
+
+msgid "Editors"
+msgstr "Edytory"
+
+msgid "Encrypt Settings Export"
+msgstr "Zaszyfruj eksport ustawień"
+
+msgid "Endpoint, authentication, file-lane limit and TLS/SSH trust are stored per connection. Passwords never enter settings."
+msgstr "Parametry serwera, metoda logowania, limit plików i zaufanie TLS/SSH są przechowywane oddzielnie dla każdego połączenia. Hasła nigdy nie trafiają do ustawień."
+
+msgid "Enter the passphrase used when the settings were exported."
+msgstr "Wpisz hasło użyte podczas eksportu ustawień."
+
+msgid "Enter your sync passphrase to unlock your saved passwords."
+msgstr "Wpisz hasło synchronizacji, aby odblokować zapisane hasła."
+
+msgid "Error details remain inside the app"
+msgstr "Szczegóły błędu pozostają wyłącznie w aplikacji"
+
+msgid "Explicit is recommended. Implicit is for legacy servers and normally uses port 990."
+msgstr "Explicit jest zalecany. Implicit służy starszym serwerom i zwykle używa portu 990."
+
+msgid "Export"
+msgstr "Eksportuj"
+
+msgid "Export Diagnostics"
+msgstr "Eksport diagnostyki"
+
+msgid "Export Report"
+msgstr "Eksportuj raport"
+
+msgid "Export Settings"
+msgstr "Eksport ustawień"
+
+msgid "FAVORITES"
+msgstr "ULUBIONE"
+
+msgid "FILE"
+msgstr "PLIK"
+
+msgid "FIND IN NAME"
+msgstr "ZNAJDŹ W NAZWIE"
+
+msgid "FTP DATA MODE"
+msgstr "TRYB DANYCH FTP"
+
+msgid "FTP FILENAME ENCODING"
+msgstr "KODOWANIE NAZW FTP"
+
+msgid "FTPS TLS MODE"
+msgstr "TRYB SZYFROWANIA FTPS"
+
+msgid "FTPS certificate changed"
+msgstr "Certyfikat FTPS uległ zmianie"
+
+msgid "File or folder already exists"
+msgstr "Plik lub folder już istnieje"
+
+msgid "Filter this folder…"
+msgstr "Filtruj ten folder…"
+
+msgid "Folder Synchronization"
+msgstr "Synchronizacja folderów"
+
+msgid "Folder name"
+msgstr "Nazwa folderu"
+
+msgid "GENERAL"
+msgstr "OGÓLNE"
+
+msgid "GROUP"
+msgstr "GRUPA"
+
+msgid "General"
+msgstr "Ogólne"
+
+msgid "Go"
+msgstr "Przejdź"
+
+msgid "Go to Folder"
+msgstr "Przejdź do folderu"
+
+msgid "Group"
+msgstr "Grupa"
+
+msgid "HIGH"
+msgstr "WYS."
+
+msgid "HTTP/SOCKS5 PROXY (OPTIONAL)"
+msgstr "PROXY HTTP/SOCKS5 (OPCJONALNIE)"
+
+msgid "HostName, User, Port, IdentityFile, timeout, keepalive and ProxyJump."
+msgstr "HostName, User, Port, IdentityFile, timeout, keepalive i ProxyJump."
+
+msgid "I confirm deletion of selected files that exist only at the target"
+msgstr "Potwierdzam usunięcie zaznaczonych plików istniejących tylko w miejscu docelowym"
+
+msgid "INITIAL REMOTE PATH"
+msgstr "KATALOG STARTOWY"
+
+msgid "Import"
+msgstr "Importuj"
+
+msgid "Import Settings"
+msgstr "Import ustawień"
+
+msgid "Import from ForkLift"
+msgstr "Import z ForkLift"
+
+msgid "Inspector"
+msgstr "Inspektor"
+
+msgid "KEEP BOTH"
+msgstr "ZACHOWAJ OBA"
+
+msgid "KEEP ON ERROR"
+msgstr "ZACHOWAJ PO BŁĘDZIE"
+
+msgid "KEEPALIVE (SECONDS)"
+msgstr "KEEPALIVE (SEK.)"
+
+msgid "Keep Local"
+msgstr "Zachowaj lokalną"
+
+msgid "Kind"
+msgstr "Typ"
+
+msgid "LEFT PANE"
+msgstr "LEWY PANEL"
+
+msgid "LEFT PANE PATH"
+msgstr "ŚCIEŻKA LEWEGO PANELU"
+
+msgid "LIGHT"
+msgstr "JASNY"
+
+msgid "LIMIT (KiB/S)"
+msgstr "LIMIT (KIB/S)"
+
+msgid "LOCAL"
+msgstr "LOKALNY"
+
+msgid "LOCAL  →  SERVER"
+msgstr "LOKALNY  →  SERWER"
+
+msgid "LOW"
+msgstr "NIS."
+
+msgid "Language"
+msgstr "Język"
+
+msgid "Legacy exception: certificate verification disabled"
+msgstr "Starszy wyjątek: weryfikacja certyfikatu wyłączona"
+
+msgid "Local edit: "
+msgstr "Lokalna edycja: "
+
+msgid "MAX AUTOMATIC DOWNLOAD (MiB)"
+msgstr "MAKS. AUTOMATYCZNE POBRANIE (MIB)"
+
+msgid "MIRROR — DELETE TARGET-ONLY"
+msgstr "LUSTRZANA — USUŃ NADMIAROWE"
+
+msgid "MODE"
+msgstr "TRYB"
+
+msgid "Metadata Inspector"
+msgstr "Inspektor metadanych"
+
+msgid "Modified"
+msgstr "Zmodyfikowano"
+
+msgid "Move to Other Pane"
+msgstr "Przenieś do drugiego panelu"
+
+msgid "Move to Remote Trash?"
+msgstr "Przenieść do zdalnego Kosza?"
+
+msgid "Move to Trash"
+msgstr "Przenieś do Kosza"
+
+msgid "Moves items to a hidden .gmacftp-trash folder; failure never falls back to permanent deletion"
+msgstr "Przenosi element do ukrytego folderu .gmacftp-trash; błąd nigdy nie powoduje trwałego usunięcia"
+
+msgid "NAME"
+msgstr "NAZWA"
+
+msgid "NEW SHA-256 FINGERPRINT"
+msgstr "NOWY ODCISK SHA-256"
+
+msgid "NONE"
+msgstr "BRAK"
+
+msgid "NORMAL"
+msgstr "NOR."
+
+msgid "Names are matched exactly; files use type, size, and modified time."
+msgstr "Nazwy są porównywane dokładnie; pliki według typu, rozmiaru i daty."
+
+msgid "New"
+msgstr "Nowy"
+
+msgid "New Folder"
+msgstr "Nowy folder"
+
+msgid "New connection"
+msgstr "Nowe połączenie"
+
+msgid "No earlier paths yet."
+msgstr "Brak wcześniejszych ścieżek."
+
+msgid "No entries for the selected filter."
+msgstr "Brak pozycji dla wybranego filtra."
+
+msgid "No results."
+msgstr "Brak wyników."
+
+msgid "No saved places for this server."
+msgstr "Brak zapisanych miejsc dla tego serwera."
+
+msgid "Normal system verification rejected this certificate. Compare the fingerprint with your hosting panel or administrator. Your password has not been sent."
+msgstr "Normalna weryfikacja systemowa odrzuciła ten certyfikat. Porównaj odcisk z panelem hostingu lub administratorem. Hasło nie zostało wysłane."
+
+msgid "Notify when a transfer fails"
+msgstr "Powiadom o błędzie transferu"
+
+msgid "Notify when the queue completes"
+msgstr "Powiadom po zakończeniu kolejki"
+
+msgid "ONE-WAY — KEEP TARGET-ONLY"
+msgstr "JEDNOKIERUNKOWA — BEZ USUWANIA"
+
+msgid "OVERWRITE"
+msgstr "NADPISZ"
+
+msgid "OVERWRITE REMOTE"
+msgstr "NADPISZ SERWER"
+
+msgid "Octal mode (for example 644 or 755)"
+msgstr "Tryb ósemkowy (np. 644 lub 755)"
+
+msgid "Off by default; at most two bounded scans"
+msgstr "Wyłączone domyślnie; maksymalnie dwa ograniczone skany"
+
+msgid "One bastion or SSH alias. ProxyCommand and multi-hop chains are rejected."
+msgstr "Jeden bastion lub alias SSH. ProxyCommand i łańcuch wielu skoków są odrzucane."
+
+msgid "One file fails in a batch"
+msgstr "Błąd jednego pliku w partii"
+
+msgid "Only after verifying the remote version did not change"
+msgstr "Dopiero po sprawdzeniu, że wersja na serwerze się nie zmieniła"
+
+msgid "Open"
+msgstr "Otwórz"
+
+msgid "Open Connection Manager"
+msgstr "Otwórz Menedżer serwerów"
+
+msgid "Open Connection Manager on launch"
+msgstr "Otwórz Menedżer serwerów po uruchomieniu"
+
+msgid "Overwrite"
+msgstr "Nadpisz"
+
+msgid "Overwrite after recheck"
+msgstr "Nadpisz po sprawdzeniu"
+
+msgid "Owner"
+msgstr "Właściciel"
+
+msgid "PANE SPLIT (PX)"
+msgstr "PODZIAŁ PANELI (PX)"
+
+msgid "PASSPHRASE"
+msgstr "HASŁO"
+
+msgid "PAUSE"
+msgstr "PAUZA"
+
+msgid "PEM certificate chain"
+msgstr "łańcuch certyfikatów PEM"
+
+msgid "PKCS#8 PEM private key"
+msgstr "prywatny klucz PKCS#8 PEM"
+
+msgid "PRESET:"
+msgstr "ZESTAW:"
+
+msgid "PREVIOUS FINGERPRINT"
+msgstr "POPRZEDNI ODCISK"
+
+msgid "PRIORITY "
+msgstr "PRIORYTET "
+
+msgid "PRIVACY & STORAGE"
+msgstr "PRYWATNOŚĆ I PAMIĘĆ"
+
+msgid "Pane paths and layout after relaunch"
+msgstr "Ścieżki paneli i układ po ponownym uruchomieniu"
+
+msgid "Parallel"
+msgstr "Równol."
+
+msgid "Paste"
+msgstr "Wklej"
+
+msgid "Permissions"
+msgstr "Uprawnienia"
+
+msgid "Pin & Save"
+msgstr "Przypnij i zapisz"
+
+msgid "Pinned server certificate"
+msgstr "Przypięty certyfikat serwera"
+
+msgid "Preserve file permissions"
+msgstr "Zachowuj uprawnienia plików"
+
+msgid "Preserve modification times"
+msgstr "Zachowuj czas modyfikacji"
+
+msgid "Privacy & Storage"
+msgstr "Prywatność"
+
+msgid "Production"
+msgstr "Produkcja"
+
+msgid "Profile name"
+msgstr "Nazwa profilu"
+
+msgid "Queue"
+msgstr "Kolejka"
+
+msgid "Queue recovered after a crash"
+msgstr "Kolejka odzyskana po awarii"
+
+msgid "REASON"
+msgstr "POWÓD"
+
+msgid "RECENT IN THIS SESSION"
+msgstr "OSTATNIE W TEJ SESJI"
+
+msgid "REMOTE"
+msgstr "ZDALNY"
+
+msgid "REPLACE WITH (MAY BE EMPTY)"
+msgstr "ZAMIEŃ NA (MOŻE BYĆ PUSTE)"
+
+msgid "RESPONSE 1"
+msgstr "ODPOWIEDŹ 1"
+
+msgid "RESPONSE 2"
+msgstr "ODPOWIEDŹ 2"
+
+msgid "RESPONSE 3"
+msgstr "ODPOWIEDŹ 3"
+
+msgid "RESPONSE 4"
+msgstr "ODPOWIEDŹ 4"
+
+msgid "RESULT"
+msgstr "WYNIK"
+
+msgid "RESUME"
+msgstr "WZNÓW"
+
+msgid "RETAIN LOCAL"
+msgstr "ZACHOWAJ LOKALNIE"
+
+msgid "RETRIES"
+msgstr "PONOWIENIA"
+
+msgid "RIGHT PANE"
+msgstr "PRAWY PANEL"
+
+msgid "RIGHT PANE PATH"
+msgstr "ŚCIEŻKA PRAWEGO PANELU"
+
+msgid "Recheck & Apply"
+msgstr "Sprawdź ponownie i zastosuj"
+
+msgid "Rechecking the server…"
+msgstr "Ponowne sprawdzanie serwera…"
+
+msgid "Recursive"
+msgstr "Rekurencyjnie"
+
+msgid "Refresh"
+msgstr "Odśwież"
+
+msgid "Refresh Preview"
+msgstr "Odśwież podgląd"
+
+msgid "Refresh Sizes"
+msgstr "Odśwież rozmiary"
+
+msgid "Remote edit conflict"
+msgstr "Konflikt edycji zdalnej"
+
+msgid "Rename"
+msgstr "Zmień nazwę"
+
+msgid "Rename All"
+msgstr "Zmień nazwy"
+
+msgid "Replacement"
+msgstr "Nowy fragment"
+
+msgid "Required text"
+msgstr "Fragment wymagany"
+
+msgid "Reset Saved Trust"
+msgstr "Usuń zapisane zaufanie"
+
+msgid "Respond"
+msgstr "Odpowiedz"
+
+msgid "Responses are never saved or logged."
+msgstr "Odpowiedzi nie są zapisywane ani logowane."
+
+msgid "Restore from Trash"
+msgstr "Przywróć z Kosza"
+
+msgid "Restore workspace"
+msgstr "Przywracaj przestrzeń roboczą"
+
+msgid "Retain-local conflicts always protect your edit regardless of the cleanup policy."
+msgstr "Konflikt w trybie „zachowaj lokalnie” zawsze chroni zmiany, niezależnie od zasad czyszczenia."
+
+msgid "Run Preview to see the plan."
+msgstr "Uruchom podgląd, aby zobaczyć plan."
+
+msgid "SAVED"
+msgstr "ZAPISANE"
+
+msgid "SERVER"
+msgstr "SERWER"
+
+msgid "SERVER  →  LOCAL"
+msgstr "SERWER  →  LOKALNY"
+
+msgid "SERVER CLOCK OFFSET (S)"
+msgstr "PRZESUNIĘCIE ZEGARA SERWERA (S)"
+
+msgid "SFTP Authentication / 2FA"
+msgstr "Uwierzytelnianie SFTP / 2FA"
+
+msgid "SFTP: upload and download; FTP: download when the server supports MDTM"
+msgstr "SFTP: wysyłanie i pobieranie; FTP: pobieranie, jeśli serwer obsługuje MDTM"
+
+msgid "SIZE"
+msgstr "ROZMIAR"
+
+msgid "SIZE + MODIFIED"
+msgstr "ROZMIAR + DATA"
+
+msgid "SIZE ONLY"
+msgstr "TYLKO ROZMIAR"
+
+msgid "SKIP"
+msgstr "POMIŃ"
+
+msgid "SKIP & CONTINUE"
+msgstr "POMIŃ I KONTYNUUJ"
+
+msgid "STOP BATCH"
+msgstr "PRZERWIJ PARTIĘ"
+
+msgid "SYNC FOLDER (ICLOUD DRIVE / DROPBOX / OTHER)"
+msgstr "FOLDER SYNCHRONIZACJI (ICLOUD DRIVE / DROPBOX / INNY)"
+
+msgid "SYNC PROFILES"
+msgstr "PROFILE SYNCHRONIZACJI"
+
+msgid "SYSTEM"
+msgstr "SYSTEM"
+
+msgid "Save"
+msgstr "Zapisz"
+
+msgid "Save as new"
+msgstr "Zapisz jako nowy"
+
+msgid "Scanning directories…"
+msgstr "Przeszukuję katalogi…"
+
+msgid "Search"
+msgstr "Szukaj"
+
+msgid "Search Remote Tree"
+msgstr "Wyszukaj na serwerze"
+
+msgid "Set"
+msgstr "Ustaw"
+
+msgid "Set a separate passphrase for this file. The export contains no server passwords or vault keys."
+msgstr "Ustaw osobne hasło dla tego pliku. Eksport nie zawiera haseł serwerów ani kluczy sejfu."
+
+msgid "Set sync passphrase"
+msgstr "Ustaw hasło synchronizacji"
+
+msgid "Show hidden files"
+msgstr "Pokaż ukryte pliki"
+
+msgid "Show owner, group and permission columns"
+msgstr "Pokaż kolumny właściciela, grupy i uprawnień"
+
+msgid "Size"
+msgstr "Rozmiar"
+
+msgid "Skip and continue"
+msgstr "Pomiń i kontynuuj"
+
+msgid "Skip this file and continue, or stop the entire batch?"
+msgstr "Czy pominąć ten plik i kontynuować, czy przerwać całą partię?"
+
+msgid "Stop batch"
+msgstr "Przerwij partię"
+
+msgid "Strict certificate verification"
+msgstr "Ścisła weryfikacja certyfikatu"
+
+msgid "Supported: http://host:port and socks5://host:port. Credentials in URLs are rejected."
+msgstr "Obsługiwane: http://host:port i socks5://host:port. Dane logowania w URL są odrzucane."
+
+msgid "Sync always previews changes and never deletes without an explicit mirror mode."
+msgstr "Synchronizacja zawsze pokazuje podgląd i nigdy nie usuwa plików bez jawnego trybu lustrzanego."
+
+msgid "TEMPORARY FILES AFTER THE EDITOR CLOSES"
+msgstr "PLIKI TYMCZASOWE PO ZAMKNIĘCIU EDYTORA"
+
+msgid "TLS CLIENT CERTIFICATE (OPTIONAL)"
+msgstr "CERTYFIKAT KLIENTA TLS (OPCJONALNIE)"
+
+msgid "TLS: any cert"
+msgstr "TLS: dowolny cert"
+
+msgid "TLS: strict"
+msgstr "TLS: restrykcyjny"
+
+msgid "TRANSFERS"
+msgstr "TRANSFERY"
+
+msgid "Test Connection"
+msgstr "Testuj połączenie"
+
+msgid "Testing…"
+msgstr "Testowanie…"
+
+msgid "The alert contains no file names, paths or server details"
+msgstr "Komunikat nie zawiera nazw plików, ścieżek ani danych serwera"
+
+msgid "The fingerprint differs from the saved pin. This may be a certificate renewal or an attack. Do not continue without independent verification."
+msgstr "Odcisk różni się od zapisanego przypięcia. Może to oznaczać odnowienie certyfikatu albo atak. Nie kontynuuj bez niezależnej weryfikacji."
+
+msgid "The recursive scan is bounded, time-limited, and cancellable."
+msgstr "Przeszukiwanie jest ograniczone, ma limit czasu i można je anulować."
+
+msgid "The server file changed while you were editing. Neither version has been overwritten."
+msgstr "Plik na serwerze zmienił się podczas edycji. Żadna wersja nie została nadpisana."
+
+msgid "This file transfer was stopped. Details remain available in the transfer panel."
+msgstr "Transfer tego pliku został zatrzymany. Pozostałe szczegóły są widoczne w panelu transferów."
+
+msgid "This passphrase unlocks your servers on your other Macs. Remember it (or save it) — without it, your passwords can't be recovered."
+msgstr "To hasło odblokowuje Twoje serwery na innych Macach. Zapamiętaj je (lub zapisz) — bez niego nie odzyskasz haseł."
+
+msgid "Total concurrent transfers"
+msgstr "Łączna liczba równoległych transferów"
+
+msgid "Transfer Here"
+msgstr "Prześlij tutaj"
+
+msgid "Transfers"
+msgstr "Transfery"
+
+msgid "Trash"
+msgstr "Kosz"
+
+msgid "Trust Once"
+msgstr "Zaufaj raz"
+
+msgid "UPLOAD COPY"
+msgstr "WYŚLIJ KOPIĘ"
+
+msgid "Unlock"
+msgstr "Odblokuj"
+
+msgid "Unlock servers"
+msgstr "Odblokuj serwery"
+
+msgid "Upload"
+msgstr "Wyślij"
+
+msgid "Upload after save"
+msgstr "Wyślij po zapisaniu"
+
+msgid "Upload as Copy"
+msgstr "Wyślij jako kopię"
+
+msgid "Use alias from ~/.ssh/config"
+msgstr "Użyj aliasu z ~/.ssh/config"
+
+msgid "Use remote quarantine"
+msgstr "Używaj zdalnej kwarantanny"
+
+msgid "Verify FTPS certificate"
+msgstr "Zweryfikuj certyfikat FTPS"
+
+msgid "WHEN THE REMOTE FILE CHANGED WHILE EDITING"
+msgstr "GDY PLIK NA SERWERZE ZMIENIŁ SIĘ W TRAKCIE EDYCJI"
+
+msgid "WINDOW HEIGHT"
+msgstr "WYSOKOŚĆ OKNA"
+
+msgid "WINDOW WIDTH"
+msgstr "SZEROKOŚĆ OKNA"
+
+msgid "When a file already exists"
+msgstr "Gdy plik już istnieje"
+
+msgid "Window position is saved after a clean exit and restored only when it remains visible on a connected display."
+msgstr "Pozycja okna jest zapisywana automatycznie po poprawnym zamknięciu i przywracana tylko, gdy pozostaje widoczna na podłączonym ekranie."
+
+msgid "connecting…"
+msgstr "łączenie…"
+
+msgid "gmacFTP Settings"
+msgstr "Ustawienia gmacFTP"
+
+msgid "gmacFTP has no telemetry. Passwords remain in Keychain or the encrypted vault; the transfer queue contains no credentials."
+msgstr "gmacFTP nie ma telemetrii. Hasła pozostają w Pęku kluczy lub zaszyfrowanym sejfie; kolejka transferów nie zawiera poświadczeń."
+
+msgid "not connected"
+msgstr "brak połączenia"
+
+msgid "rwx bits only; owner, group and special bits are never copied"
+msgstr "Tylko bity rwx; właściciel, grupa i bity specjalne nigdy nie są kopiowane"
+
+msgid "search…"
+msgstr "szukaj…"
+
+msgid "+ favorite  {}"
+msgstr "+ ulubione  {}"
+
+msgid "2FA / KBD"
+msgstr "2FA / KBD"
+
+msgid "< download  {}"
+msgstr "< pobierz  {}"
+
+msgid "ACTIONS"
+msgstr "DZIAŁANIA"
+
+msgid "ACTIVE"
+msgstr "AKTYWNY"
+
+msgid "AUTHENTICATION"
+msgstr "UWIERZYTELNIANIE"
+
+msgid "AUTO"
+msgstr "AUTO"
+
+msgid "Active"
+msgstr "Aktywny"
+
+msgid "Allow plaintext FTP (unsafe)"
+msgstr "Zezwól na nieszyfrowany FTP (niebezpieczne)"
+
+msgid "CONNECT"
+msgstr "POŁĄCZ"
+
+msgid "Connected · {}"
+msgstr "Połączono · {}"
+
+msgid "Copy here"
+msgstr "Kopiuj tutaj"
+
+msgid "Done"
+msgstr "Zakończony"
+
+msgid "ENGLISH"
+msgstr "ANGIELSKI"
+
+msgid "EXPLICIT (AUTH TLS)"
+msgstr "JAWNY (AUTH TLS)"
+
+msgid "FILES / SERVER"
+msgstr "PLIKI / SERWER"
+
+msgid "Failed"
+msgstr "BŁĄD"
+
+msgid "Filter servers…"
+msgstr "Filtruj serwery…"
+
+msgid "HOST"
+msgstr "HOST"
+
+msgid "IMPLICIT TLS"
+msgstr "TLS NIEJAWNY"
+
+msgid "KEY PASSPHRASE (OPTIONAL)"
+msgstr "HASŁO KLUCZA (OPCJONALNE)"
+
+msgid "LINK"
+msgstr "POWIĄŻ"
+
+msgid "Loading…"
+msgstr "Ładowanie…"
+
+msgid "Navigate"
+msgstr "Nawiguj"
+
+msgid "No matching servers."
+msgstr "Brak pasujących serwerów."
+
+msgid "No servers yet.\nUse CONNECTIONS to add\nor import from ForkLift."
+msgstr "Brak zapisanych serwerów.\nUżyj POŁĄCZEŃ, aby dodać\nlub zaimportować z ForkLift."
+
+msgid "No transfers yet.\nDrag between panes or use the center arrows."
+msgstr "Brak transferów.\nPrzeciągnij między panelami lub użyj środkowych strzałek."
+
+msgid "Only for a trusted legacy/LAN server — password and files are readable on the network."
+msgstr "Tylko dla zaufanego starszego serwera/LAN — hasło i pliki są widoczne w sieci."
+
+msgid "PASSIVE"
+msgstr "PASYWNY"
+
+msgid "PASSWORD"
+msgstr "HASŁO"
+
+msgid "PLACES"
+msgstr "MIEJSCA"
+
+msgid "POLISH"
+msgstr "POLSKI"
+
+msgid "PORT"
+msgstr "PORT"
+
+msgid "PRIVATE KEY"
+msgstr "KLUCZ PRYWATNY"
+
+msgid "PRIVATE KEY FILE"
+msgstr "PLIK KLUCZA PRYWATNEGO"
+
+msgid "PROTOCOL"
+msgstr "PROTOKÓŁ"
+
+msgid "PROXYJUMP (OPTIONAL)"
+msgstr "PROXYJUMP (OPCJONALNIE)"
+
+msgid "Pause all"
+msgstr "Wstrzymaj wszystko"
+
+msgid "Paused"
+msgstr "Wstrzymany"
+
+msgid "Queued"
+msgstr "W kolejce"
+
+msgid "Recovered"
+msgstr "Odzyskany"
+
+msgid "Resume all"
+msgstr "Wznów wszystko"
+
+msgid "SERVERS"
+msgstr "SERWERY"
+
+msgid "SHA-256 FINGERPRINT"
+msgstr "ODCISK SHA-256"
+
+msgid "SIZE + TIME"
+msgstr "ROZMIAR + CZAS"
+
+msgid "SORT BY"
+msgstr "SORTUJ WEDŁUG"
+
+msgid "SSH AGENT"
+msgstr "AGENT SSH"
+
+msgid "SYNC"
+msgstr "SYNCHRONIZACJA"
+
+msgid "Select"
+msgstr "Wybierz"
+
+msgid "Servers"
+msgstr "Serwery"
+
+msgid "Stopped"
+msgstr "Zatrzymany"
+
+msgid "Sync"
+msgstr "Synchronizacja"
+
+msgid "TAGS"
+msgstr "TAGI"
+
+msgid "The server is new to gmacFTP. Confirm this fingerprint with the server administrator or another trusted channel before trusting it. Your password has not been sent."
+msgstr "Ten serwer jest nowy dla gmacFTP. Przed zaufaniem potwierdź odcisk u administratora serwera lub innym zaufanym kanałem. Hasło nie zostało wysłane."
+
+msgid "Toggle theme"
+msgstr "Przełącz motyw"
+
+msgid "Trust and connect"
+msgstr "Zaufaj i połącz"
+
+msgid "USER"
+msgstr "UŻYTKOWNIK"
+
+msgid "Verify SFTP host key"
+msgstr "Zweryfikuj klucz hosta SFTP"
+
+msgid "\"{}\" will be moved to the Trash. You can restore it later from Finder."
+msgstr "„{}” zostanie przeniesiony do Kosza. Możesz go później odtworzyć w Finderze."
+
+msgid "\"{}\" will be moved to the hidden .gmacftp-trash folder on this server."
+msgstr "„{}” zostanie przeniesiony do ukrytego folderu .gmacftp-trash na tym serwerze."
+
+msgid "\"{}\" will be permanently deleted from the server. This cannot be undone."
+msgstr "„{}” zostanie trwale usunięty z serwera. Tej operacji nie można cofnąć."
+
+msgid "error: {}"
+msgstr "błąd: {}"
+
+msgid "move favorite  {}"
+msgstr "przenieś ulubione  {}"
+
+msgid "move server  {}"
+msgstr "przenieś serwer  {}"
+
+msgid "my server"
+msgstr "mój serwer"
+
+msgid "passphrase"
+msgstr "hasło"
+
+msgid "remove from Favorites  {}"
+msgstr "usuń z Ulubionych  {}"
+
+msgid "size"
+msgstr "rozmiar"
+
+msgid "upload >  {}"
+msgstr "wyślij >  {}"
+
+msgid "username"
+msgstr "użytkownik"
+
+msgid "{n} item"
+msgid_plural "{n} items"
+msgstr[0] "{n} element"
+msgstr[1] "{n} elementy"
+msgstr[2] "{n} elementów"
+msgid "Allow unsafe TLS certificates for this server"
+msgstr "Zezwól na niezaufane certyfikaty TLS dla tego serwera"
+
+msgid "Apply this decision to all conflicts"
+msgstr "Zastosuj tę decyzję do wszystkich konfliktów"
+
+msgid "Back in left pane"
+msgstr "Wstecz w lewym panelu"
+
+msgid "Back in right pane"
+msgstr "Wstecz w prawym panelu"
+
+msgid "Close Connection Manager"
+msgstr "Zamknij Menedżera połączeń"
+
+msgid "Close Settings"
+msgstr "Zamknij Ustawienia"
+
+msgid "Close connection editor"
+msgstr "Zamknij edytor połączenia"
+
+msgid "Close synchronization"
+msgstr "Zamknij synchronizację"
+
+msgid "Close transfer queue"
+msgstr "Zamknij kolejkę transferów"
+
+msgid "Close window"
+msgstr "Zamknij okno"
+
+msgid "Copy selected items to left pane"
+msgstr "Skopiuj zaznaczone elementy do lewego panelu"
+
+msgid "Copy selected items to right pane"
+msgstr "Skopiuj zaznaczone elementy do prawego panelu"
+
+msgid "File"
+msgstr "Plik"
+
+msgid "Files in left pane"
+msgstr "Pliki w lewym panelu"
+
+msgid "Files in right pane"
+msgstr "Pliki w prawym panelu"
+
+msgid "Filter files in left pane"
+msgstr "Filtruj pliki w lewym panelu"
+
+msgid "Filter files in right pane"
+msgstr "Filtruj pliki w prawym panelu"
+
+msgid "Folder"
+msgstr "Folder"
+
+msgid "Forward in left pane"
+msgstr "Dalej w lewym panelu"
+
+msgid "Forward in right pane"
+msgstr "Dalej w prawym panelu"
+
+msgid "Minimize window"
+msgstr "Minimalizuj okno"
+
+msgid "Not currently sorted"
+msgstr "Obecnie nie sortuje"
+
+msgid "Open local home in left pane"
+msgstr "Otwórz lokalny katalog domowy w lewym panelu"
+
+msgid "Open local home in right pane"
+msgstr "Otwórz lokalny katalog domowy w prawym panelu"
+
+msgid "Parent folder in left pane"
+msgstr "Folder nadrzędny w lewym panelu"
+
+msgid "Parent folder in right pane"
+msgstr "Folder nadrzędny w prawym panelu"
+
+msgid "Select all items"
+msgstr "Zaznacz wszystkie elementy"
+
+msgid "Select all items in left pane"
+msgstr "Zaznacz wszystkie elementy w lewym panelu"
+
+msgid "Select all items in right pane"
+msgstr "Zaznacz wszystkie elementy w prawym panelu"
+
+msgid "Sorted ascending"
+msgstr "Sortowanie rosnące"
+
+msgid "Sorted descending"
+msgstr "Sortowanie malejące"
+
+msgid "Toggle full screen"
+msgstr "Przełącz tryb pełnoekranowy"
+
+msgid "Toggle light and dark theme"
+msgstr "Przełącz jasny i ciemny motyw"
+
+msgid "Transfer progress"
+msgstr "Postęp transferu"
+
+msgid "Add server"
+msgstr "Dodaj serwer"
+
+msgid "Ascending"
+msgstr "Rosnąco"
+
+msgid "Connect to {}"
+msgstr "Połącz z {}"
+
+msgid "Copy selected path"
+msgstr "Skopiuj zaznaczoną ścieżkę"
+
+msgid "Date"
+msgstr "Data"
+
+msgid "Descending"
+msgstr "Malejąco"
+
+msgid "Disconnect {}"
+msgstr "Rozłącz {}"
+
+msgid "Edit path in left pane"
+msgstr "Edytuj ścieżkę w lewym panelu"
+
+msgid "Edit path in right pane"
+msgstr "Edytuj ścieżkę w prawym panelu"
+
+msgid "Name"
+msgstr "Nazwa"
+
+msgid "OK"
+msgstr "OK"
+
+msgid "Open favorite {}"
+msgstr "Otwórz ulubione {}"
+
+msgid "Select server {}"
+msgstr "Wybierz serwer {}"
+
+msgid "Switch to connected server {}"
+msgstr "Przełącz na połączony serwer {}"
+
+msgid "Cancel transfer {}"
+msgstr "Anuluj transfer {}"
+
+msgid "Change priority for {}"
+msgstr "Zmień priorytet transferu {}"
+
+msgid "Clear finished transfers"
+msgstr "Wyczyść zakończone transfery"
+
+msgid "Command palette search"
+msgstr "Wyszukiwanie w palecie poleceń"
+
+msgid "Confirm mirror deletions"
+msgstr "Potwierdź usuwanie w trybie lustrzanym"
+
+msgid "Date tolerance in seconds"
+msgstr "Tolerancja czasu w sekundach"
+
+msgid "Decrease parallel transfers"
+msgstr "Zmniejsz liczbę równoległych transferów"
+
+msgid "Delete synchronization profile {}"
+msgstr "Usuń profil synchronizacji {}"
+
+msgid "Destination path"
+msgstr "Ścieżka docelowa"
+
+msgid "Directory comparison results"
+msgstr "Wyniki porównania katalogów"
+
+msgid "Dismiss transfer {}"
+msgstr "Usuń transfer {} z listy"
+
+msgid "Excluded file patterns"
+msgstr "Wzorce wykluczonych plików"
+
+msgid "Export transfer report"
+msgstr "Eksportuj raport transferów"
+
+msgid "Import connections"
+msgstr "Importuj połączenia"
+
+msgid "Increase parallel transfers"
+msgstr "Zwiększ liczbę równoległych transferów"
+
+msgid "Load synchronization profile {}"
+msgstr "Wczytaj profil synchronizacji {}"
+
+msgid "Move transfer {} down"
+msgstr "Przenieś transfer {} niżej"
+
+msgid "Move transfer {} up"
+msgstr "Przenieś transfer {} wyżej"
+
+msgid "New name"
+msgstr "Nowa nazwa"
+
+msgid "Open place {}"
+msgstr "Otwórz miejsce {}"
+
+msgid "Open recent path {}"
+msgstr "Otwórz ostatnią ścieżkę {}"
+
+msgid "Pane divider position"
+msgstr "Położenie separatora paneli"
+
+msgid "Pause transfer {}"
+msgstr "Wstrzymaj transfer {}"
+
+msgid "Progress for {}"
+msgstr "Postęp transferu {}"
+
+msgid "Remote search query"
+msgstr "Zapytanie wyszukiwania zdalnego"
+
+msgid "Remote search results"
+msgstr "Wyniki wyszukiwania zdalnego"
+
+msgid "Remove place {}"
+msgstr "Usuń miejsce {}"
+
+msgid "Replacement text"
+msgstr "Tekst zastępczy"
+
+msgid "Resume transfer {}"
+msgstr "Wznów transfer {}"
+
+msgid "Retry transfer {}"
+msgstr "Ponów transfer {}"
+
+msgid "Search servers and actions"
+msgstr "Szukaj serwerów i poleceń"
+
+msgid "Server clock offset in seconds"
+msgstr "Korekta zegara serwera w sekundach"
+
+msgid "Synchronization profile name"
+msgstr "Nazwa profilu synchronizacji"
+
+msgid "Synchronization profiles"
+msgstr "Profile synchronizacji"
+
+msgid "Text to find in file names"
+msgstr "Tekst do znalezienia w nazwach plików"
+
+msgid "Use exclusion preset {}"
+msgstr "Użyj zestawu wykluczeń {}"

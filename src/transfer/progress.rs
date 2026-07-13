@@ -5,6 +5,13 @@ use crate::model::TransferId;
 #[derive(Debug, Clone)]
 pub enum TransferState {
     Active,
+    /// A transient failure will be retried after a cancellable, bounded delay.
+    Retrying {
+        attempt: usize,
+        max_attempts: usize,
+        delay_ms: u64,
+        error: String,
+    },
     Done,
     Failed(String),
     /// Explicitly cancelled by the user; resumable download data is retained for Retry/Resume.

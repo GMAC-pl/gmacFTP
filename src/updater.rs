@@ -10,6 +10,7 @@
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 use ureq::ResponseExt;
@@ -24,9 +25,19 @@ const GH_REDIRECT_HOSTS: &[&str] = &[
     "release-assets.githubusercontent.com",
 ];
 const EXPECTED_TEAM_ID: &str = "SY4HQ4PWVU";
+const EXPECTED_APP_BUNDLE_ID: &str = "app.mackftp.client";
 const EXPECTED_DMG_IDENTIFIER: &str = "app.mackftp.client.dmg";
 const MAX_API_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_RELEASE_NOTES_BYTES: usize = 64 * 1024;
 const MAX_DMG_BYTES: u64 = 300 * 1024 * 1024;
+const CHECK_TIMEOUT: Duration = Duration::from_secs(30);
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+
+/// Personal/local bundles use a separate identity and must never offer to replace themselves with
+/// the public app. This also keeps the updater unavailable on non-macOS development targets.
+pub fn supported() -> bool {
+    cfg!(target_os = "macos") && env!("MACKFTP_BUNDLE_ID") == EXPECTED_APP_BUNDLE_ID
+}
 
 fn https_host(url: &str) -> Result<&str, String> {
     let after = url
@@ -109,39 +120,36 @@ pub struct LatestUpdate {
     pub notes: String,
 }
 
-/// Query GitHub for the latest release and require the exact DMG asset, size, and digest.
-pub fn check() -> Result<Option<LatestUpdate>, String> {
-    let url = format!("https://{GH_API_HOST}/repos/{REPO}/releases/latest");
-    validate_url_host(&url, &[GH_API_HOST])?;
-    let response = ureq::get(&url)
-        .header("User-Agent", "gmacFTP-updater")
-        .header("Accept", "application/vnd.github+json")
-        .config()
-        .https_only(true)
-        .save_redirect_history(true)
-        .build()
-        .call()
-        .map_err(|e| format!("GitHub request failed: {e}"))?;
-    validate_response_hosts(&response, &[GH_API_HOST])?;
-    if response
-        .body()
-        .content_length()
-        .is_some_and(|n| n > MAX_API_BYTES)
-    {
-        return Err("GitHub release response is unexpectedly large".into());
+fn sanitize_release_notes(raw: &str) -> String {
+    let mut notes = String::with_capacity(raw.len().min(MAX_RELEASE_NOTES_BYTES));
+    let mut truncated = false;
+    for character in raw.chars() {
+        let character = match character {
+            '\r' => continue,
+            '\n' | '\t' => character,
+            value if value.is_control() => continue,
+            value => value,
+        };
+        if notes.len().saturating_add(character.len_utf8()) > MAX_RELEASE_NOTES_BYTES {
+            truncated = true;
+            break;
+        }
+        notes.push(character);
     }
-    let mut api_bytes = Vec::new();
-    response
-        .into_body()
-        .into_reader()
-        .take(MAX_API_BYTES.saturating_add(1))
-        .read_to_end(&mut api_bytes)
-        .map_err(|e| format!("could not read GitHub response: {e}"))?;
-    if api_bytes.len() as u64 > MAX_API_BYTES {
-        return Err("GitHub release response is unexpectedly large".into());
+    let trimmed = notes.trim();
+    if trimmed.is_empty() {
+        return "No release notes were provided.".into();
     }
+    let mut notes = trimmed.to_string();
+    if truncated {
+        notes.push_str("\n\n…");
+    }
+    notes
+}
+
+fn parse_release_response(api_bytes: &[u8]) -> Result<Option<LatestUpdate>, String> {
     let body: serde_json::Value =
-        serde_json::from_slice(&api_bytes).map_err(|e| format!("invalid GitHub response: {e}"))?;
+        serde_json::from_slice(api_bytes).map_err(|e| format!("invalid GitHub response: {e}"))?;
 
     let tag = body
         .get("tag_name")
@@ -185,11 +193,7 @@ pub fn check() -> Result<Option<LatestUpdate>, String> {
             .and_then(|v| v.as_str())
             .ok_or_else(|| "release asset has no GitHub SHA-256 digest".to_string())?,
     )?;
-    let notes = body
-        .get("body")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
+    let notes = sanitize_release_notes(body.get("body").and_then(|v| v.as_str()).unwrap_or(""));
     Ok(Some(LatestUpdate {
         version: version.to_string(),
         dmg_url,
@@ -197,6 +201,44 @@ pub fn check() -> Result<Option<LatestUpdate>, String> {
         size,
         notes,
     }))
+}
+
+/// Query GitHub for the latest release and require the exact DMG asset, size, and digest.
+pub fn check() -> Result<Option<LatestUpdate>, String> {
+    if !supported() {
+        return Err("updates are available only in the public macOS build".into());
+    }
+    let url = format!("https://{GH_API_HOST}/repos/{REPO}/releases/latest");
+    validate_url_host(&url, &[GH_API_HOST])?;
+    let response = ureq::get(&url)
+        .header("User-Agent", "gmacFTP-updater")
+        .header("Accept", "application/vnd.github+json")
+        .config()
+        .https_only(true)
+        .save_redirect_history(true)
+        .timeout_global(Some(CHECK_TIMEOUT))
+        .build()
+        .call()
+        .map_err(|e| format!("GitHub request failed: {e}"))?;
+    validate_response_hosts(&response, &[GH_API_HOST])?;
+    if response
+        .body()
+        .content_length()
+        .is_some_and(|n| n > MAX_API_BYTES)
+    {
+        return Err("GitHub release response is unexpectedly large".into());
+    }
+    let mut api_bytes = Vec::new();
+    response
+        .into_body()
+        .into_reader()
+        .take(MAX_API_BYTES.saturating_add(1))
+        .read_to_end(&mut api_bytes)
+        .map_err(|e| format!("could not read GitHub response: {e}"))?;
+    if api_bytes.len() as u64 > MAX_API_BYTES {
+        return Err("GitHub release response is unexpectedly large".into());
+    }
+    parse_release_response(&api_bytes)
 }
 
 pub fn is_newer(latest: &str, current: &str) -> bool {
@@ -210,6 +252,9 @@ pub fn download(
     expected_sha256: &str,
     expected_size: u64,
 ) -> Result<PathBuf, String> {
+    if !supported() {
+        return Err("updates are available only in the public macOS build".into());
+    }
     validate_url_host(url, &[GH_ASSET_HOST])?;
     parse_version(version).ok_or_else(|| format!("invalid release version: {version:?}"))?;
     let expected_sha256 = normalized_sha256(expected_sha256)?;
@@ -234,6 +279,10 @@ pub fn download(
             .config()
             .https_only(true)
             .save_redirect_history(true)
+            .timeout_global(Some(DOWNLOAD_TIMEOUT))
+            .timeout_connect(Some(CHECK_TIMEOUT))
+            .timeout_recv_response(Some(CHECK_TIMEOUT))
+            .timeout_recv_body(Some(CHECK_TIMEOUT))
             .build()
             .call()
             .map_err(|e| format!("download failed: {e}"))?;
@@ -386,5 +435,59 @@ mod tests {
         assert!(normalized_sha256("sha256:abcd").is_err());
         assert!(normalized_sha256(&"z".repeat(64)).is_err());
         assert_eq!(encode_hex(&[0x00, 0x0f, 0xa5, 0xff]), "000fa5ff");
+    }
+
+    fn valid_newer_release(notes: &str) -> Vec<u8> {
+        let version = "18446744073709551615.0.0";
+        serde_json::to_vec(&serde_json::json!({
+            "tag_name": format!("v{version}"),
+            "body": notes,
+            "assets": [{
+                "name": format!("gmacFTP-{version}.dmg"),
+                "browser_download_url": format!(
+                    "https://github.com/{REPO}/releases/download/v{version}/gmacFTP-{version}.dmg"
+                ),
+                "size": 1234,
+                "digest": format!("sha256:{}", "a".repeat(64)),
+            }],
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn release_response_requires_one_exact_trusted_asset() {
+        let update = parse_release_response(&valid_newer_release("Fixes\n\0Details"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(update.version, "18446744073709551615.0.0");
+        assert_eq!(update.size, 1234);
+        assert_eq!(update.sha256, "a".repeat(64));
+        assert_eq!(update.notes, "Fixes\nDetails");
+
+        let mut body: serde_json::Value =
+            serde_json::from_slice(&valid_newer_release("notes")).unwrap();
+        let duplicate = body["assets"][0].clone();
+        body["assets"].as_array_mut().unwrap().push(duplicate);
+        assert!(parse_release_response(&serde_json::to_vec(&body).unwrap()).is_err());
+
+        body["assets"].as_array_mut().unwrap().pop();
+        body["assets"][0]["browser_download_url"] =
+            serde_json::json!("https://github.com.evil.test/gmacFTP.dmg");
+        assert!(parse_release_response(&serde_json::to_vec(&body).unwrap()).is_err());
+    }
+
+    #[test]
+    fn release_notes_are_plain_bounded_text() {
+        assert_eq!(
+            sanitize_release_notes("\r\n\0\u{7}"),
+            "No release notes were provided."
+        );
+        let notes = sanitize_release_notes(&"ę".repeat(MAX_RELEASE_NOTES_BYTES));
+        assert!(notes.starts_with('ę'));
+        assert!(notes.ends_with('…'));
+        assert!(notes.len() <= MAX_RELEASE_NOTES_BYTES + 64);
+        assert!(!notes
+            .chars()
+            .any(|character| { character.is_control() && !matches!(character, '\n' | '\t') }));
     }
 }

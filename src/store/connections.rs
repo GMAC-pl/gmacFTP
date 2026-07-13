@@ -3,15 +3,20 @@
 
 use std::fs;
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use crate::model::{ConnectionId, ConnectionSpec, Protocol};
+use crate::model::{ConnectionId, ConnectionSpec, FtpTlsMode, Protocol};
 
 use super::creds::{CredentialError, CredentialKey, CredentialStore};
 use zeroize::Zeroize;
 
 const MAX_IMPORT_BYTES: usize = 1_048_576;
 const MAX_IMPORT_CONNECTIONS: usize = 10_000;
+pub const MIN_CONNECTION_TIMEOUT_SECS: u64 = 5;
+pub const MAX_CONNECTION_TIMEOUT_SECS: u64 = 300;
+pub const MIN_KEEPALIVE_INTERVAL_SECS: u64 = 5;
+pub const MAX_KEEPALIVE_INTERVAL_SECS: u64 = 300;
+const MAX_CONNECTION_TAGS: usize = 32;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ImportError {
@@ -110,10 +115,24 @@ pub fn load_seed(
             port,
             user: s.username,
             initial_path,
+            group: String::new(),
+            tags: Vec::new(),
+            timeout_secs: None,
+            keepalive_interval_secs: None,
+            ftp_data_mode: Default::default(),
+            ftp_filename_encoding: Default::default(),
+            ftp_tls_mode: Default::default(),
+            proxy_url: None,
+            use_ssh_config: false,
+            ssh_proxy_jump: None,
             allow_plaintext_ftp: false,
             accept_invalid_tls: false,
+            tls_pinned_sha256: None,
+            tls_client_cert: None,
+            tls_client_key: None,
             sftp_auth: Default::default(),
             sftp_private_key: None,
+            transfer_concurrency: None,
         });
     }
     Ok(specs)
@@ -125,9 +144,8 @@ pub fn load_seed(
 /// password it is encrypted and the user re-enters it after import.
 ///
 /// `<Protocol>` mapping (FileZilla): 0 = FTP, 1 = SFTP (SSH2), 3 = explicit FTPS and 4 =
-/// implicit FTPS. gmacFTP supports FTP/explicit FTPS through `Protocol::Ftp`; implicit FTPS is
-/// rejected instead of being silently connected with the wrong transport. Other unsupported
-/// protocols (WebDAV/S3/HTTP, etc.) are skipped.
+/// implicit FTPS. Both FTPS modes retain their transport during import; unsupported protocols
+/// (WebDAV/S3/HTTP, etc.) are skipped.
 pub fn load_filezilla(
     xml: &str,
     store: &dyn CredentialStore,
@@ -151,18 +169,18 @@ pub fn load_filezilla(
         }
         let user = child_text(&server, "User");
         let port: u16 = child_text(&server, "Port").trim().parse().unwrap_or(0);
-        let protocol = match child_text(&server, "Protocol").trim() {
-            "1" => Protocol::Sftp,
-            "0" | "3" | "" => Protocol::Ftp, // "" defaults to FTP (FileZilla omits it)
-            "4" => {
-                return Err(ImportError::Unsupported(
-                    "implicit FTPS is not supported; use explicit FTPS".to_string(),
-                ))
-            }
+        let (protocol, ftp_tls_mode) = match child_text(&server, "Protocol").trim() {
+            "1" => (Protocol::Sftp, FtpTlsMode::Explicit),
+            "0" | "3" | "" => (Protocol::Ftp, FtpTlsMode::Explicit),
+            "4" => (Protocol::Ftp, FtpTlsMode::Implicit),
             _ => continue, // WebDAV/S3/HTTP etc. — gmacFTP can't speak these; skip
         };
         let port = if port == 0 {
-            protocol.default_port()
+            if protocol == Protocol::Ftp && ftp_tls_mode == FtpTlsMode::Implicit {
+                990
+            } else {
+                protocol.default_port()
+            }
         } else {
             port
         };
@@ -196,10 +214,24 @@ pub fn load_filezilla(
             port,
             user,
             initial_path: String::new(),
+            group: String::new(),
+            tags: Vec::new(),
+            timeout_secs: None,
+            keepalive_interval_secs: None,
+            ftp_data_mode: Default::default(),
+            ftp_filename_encoding: Default::default(),
+            ftp_tls_mode,
+            proxy_url: None,
+            use_ssh_config: false,
+            ssh_proxy_jump: None,
             allow_plaintext_ftp: false,
             accept_invalid_tls: false,
+            tls_pinned_sha256: None,
+            tls_client_cert: None,
+            tls_client_key: None,
             sftp_auth: Default::default(),
             sftp_private_key: None,
+            transfer_concurrency: None,
         });
         idx += 1;
     }
@@ -368,11 +400,14 @@ pub(crate) fn normalize_sync_metadata_bytes(bytes: &[u8]) -> Result<Vec<u8>, Imp
     for spec in &mut specs {
         spec.allow_plaintext_ftp = false;
         spec.accept_invalid_tls = false;
+        spec.tls_pinned_sha256 = None;
         // A private-key path describes this Mac's filesystem and can reveal a local account
         // name. Never put it into the cross-device metadata file. Preserve the auth mode so the
         // destination Mac asks for its own key path instead of misusing the synced key passphrase
         // as a server password.
         spec.sftp_private_key = None;
+        spec.tls_client_cert = None;
+        spec.tls_client_key = None;
     }
     serde_json::to_vec_pretty(&specs).map_err(ImportError::Json)
 }
@@ -383,22 +418,155 @@ fn validate_specs(specs: &[ConnectionSpec]) -> Result<(), ImportError> {
     }
     for spec in specs {
         if spec.name.len() > 1024
+            || spec.name.chars().any(char::is_control)
             || spec.initial_path.len() > 4096
+            || spec.initial_path.chars().any(char::is_control)
+            || spec.group.len() > 256
+            || spec.group.chars().any(char::is_control)
+            || spec.tags.len() > MAX_CONNECTION_TAGS
+            || spec
+                .tags
+                .iter()
+                .any(|tag| tag.is_empty() || tag.len() > 128 || tag.chars().any(char::is_control))
             || spec
                 .sftp_private_key
                 .as_ref()
                 .is_some_and(|path| path.len() > 4096 || path.chars().any(char::is_control))
+            || spec.tls_client_cert.as_ref().is_some_and(|path| {
+                path.is_empty() || path.len() > 4096 || path.chars().any(char::is_control)
+            })
+            || spec.tls_client_key.as_ref().is_some_and(|path| {
+                path.is_empty() || path.len() > 4096 || path.chars().any(char::is_control)
+            })
+            || spec
+                .proxy_url
+                .as_ref()
+                .is_some_and(|proxy| proxy.len() > 512 || proxy.chars().any(char::is_control))
+            || spec.ssh_proxy_jump.as_ref().is_some_and(|jump| {
+                jump.is_empty() || jump.len() > 512 || jump.chars().any(char::is_control)
+            })
         {
             return Err(ImportError::Metadata(
                 "connection field exceeds limit".to_string(),
             ));
         }
+        let mut unique_tags = std::collections::HashSet::with_capacity(spec.tags.len());
+        if spec
+            .tags
+            .iter()
+            .any(|tag| !unique_tags.insert(tag.to_lowercase()))
+        {
+            return Err(ImportError::Metadata(
+                "connection contains duplicate tags".to_string(),
+            ));
+        }
+        if spec.timeout_secs.is_some_and(|seconds| {
+            !(MIN_CONNECTION_TIMEOUT_SECS..=MAX_CONNECTION_TIMEOUT_SECS).contains(&seconds)
+        }) {
+            return Err(ImportError::Metadata(
+                "connection timeout is outside safe bounds".to_string(),
+            ));
+        }
+        if spec.keepalive_interval_secs.is_some_and(|seconds| {
+            seconds != 0
+                && !(MIN_KEEPALIVE_INTERVAL_SECS..=MAX_KEEPALIVE_INTERVAL_SECS).contains(&seconds)
+        }) {
+            return Err(ImportError::Metadata(
+                "connection keepalive interval is outside safe bounds".to_string(),
+            ));
+        }
         if spec.protocol == Protocol::Ftp
             && (spec.sftp_auth != crate::model::SftpAuth::Password
-                || spec.sftp_private_key.is_some())
+                || spec.sftp_private_key.is_some()
+                || spec.use_ssh_config
+                || spec.ssh_proxy_jump.is_some())
         {
             return Err(ImportError::Metadata(
                 "FTP connection contains invalid SSH authentication settings".to_string(),
+            ));
+        }
+        if spec.protocol == Protocol::Ftp
+            && spec.allow_plaintext_ftp
+            && spec.ftp_tls_mode == FtpTlsMode::Implicit
+        {
+            return Err(ImportError::Metadata(
+                "plaintext FTP cannot use implicit TLS mode".to_string(),
+            ));
+        }
+        if spec.tls_client_cert.is_some() != spec.tls_client_key.is_some() {
+            return Err(ImportError::Metadata(
+                "FTPS client certificate and private key must be configured together".to_string(),
+            ));
+        }
+        if spec
+            .tls_client_cert
+            .iter()
+            .chain(spec.tls_client_key.iter())
+            .any(|path| !Path::new(path).is_absolute())
+        {
+            return Err(ImportError::Metadata(
+                "FTPS client identity paths must be absolute".to_string(),
+            ));
+        }
+        if (spec.tls_client_cert.is_some() || spec.tls_client_key.is_some())
+            && (spec.protocol != Protocol::Ftp || spec.allow_plaintext_ftp)
+        {
+            return Err(ImportError::Metadata(
+                "TLS client identity is valid only for encrypted FTPS".to_string(),
+            ));
+        }
+        if spec.protocol == Protocol::Ftp && spec.keepalive_interval_secs.is_some() {
+            return Err(ImportError::Metadata(
+                "FTP connection contains an SFTP keepalive setting".to_string(),
+            ));
+        }
+        if spec.protocol == Protocol::Ftp
+            && spec.ftp_data_mode == crate::model::FtpDataMode::Active
+            && (spec.allow_plaintext_ftp || spec.proxy_url.is_some())
+        {
+            return Err(ImportError::Metadata(
+                "active FTP mode requires encrypted FTPS and cannot use a proxy".to_string(),
+            ));
+        }
+        if let Some(proxy) = spec.proxy_url.as_deref() {
+            crate::net::proxy::validate_proxy_url(proxy).map_err(|error| {
+                ImportError::Metadata(format!("connection proxy is invalid: {error}"))
+            })?;
+        }
+        if let Some(jump) = spec.ssh_proxy_jump.as_deref() {
+            crate::net::validate_ssh_proxy_jump(jump).map_err(|error| {
+                ImportError::Metadata(format!("connection ProxyJump is invalid: {error}"))
+            })?;
+        }
+        if spec.protocol == Protocol::Sftp
+            && (spec.ftp_data_mode != crate::model::FtpDataMode::Passive
+                || spec.ftp_filename_encoding != crate::model::FtpFilenameEncoding::Auto
+                || spec.ftp_tls_mode != FtpTlsMode::Explicit
+                || spec.allow_plaintext_ftp
+                || spec.accept_invalid_tls
+                || spec.tls_pinned_sha256.is_some()
+                || spec.tls_client_cert.is_some()
+                || spec.tls_client_key.is_some())
+        {
+            return Err(ImportError::Metadata(
+                "SFTP connection contains FTP-only settings".to_string(),
+            ));
+        }
+        if spec.tls_pinned_sha256.as_ref().is_some_and(|pin| {
+            spec.protocol != Protocol::Ftp
+                || crate::net::ftp::normalize_certificate_pin(pin).is_none()
+        }) {
+            return Err(ImportError::Metadata(
+                "connection contains an invalid FTPS certificate pin".to_string(),
+            ));
+        }
+        if spec.transfer_concurrency.is_some_and(|limit| {
+            !(crate::store::settings::MIN_SERVER_TRANSFER_CONCURRENCY
+                ..=crate::store::settings::MAX_SERVER_TRANSFER_CONCURRENCY)
+                .contains(&limit)
+        }) {
+            return Err(ImportError::Metadata(
+                "connection contains an invalid transfer concurrency limit".to_string(),
             ));
         }
         CredentialKey::new(spec.protocol, &spec.host, spec.port, &spec.user)
@@ -477,6 +645,52 @@ mod tests {
         // and are NOT carried on the spec
         let json = serde_json::to_string(&specs[0]).unwrap();
         assert!(!json.contains("p1"));
+    }
+
+    #[test]
+    fn connection_proxy_and_ssh_config_settings_are_strictly_validated() {
+        let store = InMemoryStore::default();
+        let mut specs = load_seed(SAMPLE, &store).unwrap();
+        let sftp = specs
+            .iter_mut()
+            .find(|spec| spec.protocol == Protocol::Sftp)
+            .unwrap();
+        sftp.proxy_url = Some("socks5://127.0.0.1:1080".into());
+        sftp.use_ssh_config = true;
+        sftp.ssh_proxy_jump = Some("deploy@bastion.example:2222".into());
+        assert!(validate_specs(&specs).is_ok());
+
+        let mut invalid_credentials = specs.clone();
+        invalid_credentials[1].proxy_url =
+            Some(["http://", "user", ":", "secret", "@proxy.example:8080"].concat());
+        assert!(validate_specs(&invalid_credentials).is_err());
+
+        let mut invalid_chain = specs.clone();
+        invalid_chain[1].ssh_proxy_jump = Some("one.example,two.example".into());
+        assert!(validate_specs(&invalid_chain).is_err());
+
+        let mut ftp_only_violation = specs.clone();
+        ftp_only_violation[0].use_ssh_config = true;
+        assert!(validate_specs(&ftp_only_violation).is_err());
+
+        let mut incomplete_identity = specs.clone();
+        incomplete_identity[0].tls_client_cert = Some("/tmp/client.pem".into());
+        assert!(validate_specs(&incomplete_identity).is_err());
+
+        let mut implicit_plaintext = specs.clone();
+        implicit_plaintext[0].ftp_tls_mode = FtpTlsMode::Implicit;
+        implicit_plaintext[0].allow_plaintext_ftp = true;
+        assert!(validate_specs(&implicit_plaintext).is_err());
+
+        let mut valid_client_identity = specs.clone();
+        valid_client_identity[0].tls_client_cert = Some("/tmp/client.pem".into());
+        valid_client_identity[0].tls_client_key = Some("/tmp/client-key.pem".into());
+        assert!(validate_specs(&valid_client_identity).is_ok());
+
+        let mut active_proxy = specs;
+        active_proxy[0].proxy_url = Some("http://proxy.example:8080".into());
+        active_proxy[0].ftp_data_mode = crate::model::FtpDataMode::Active;
+        assert!(validate_specs(&active_proxy).is_err());
     }
 
     #[test]
@@ -579,7 +793,7 @@ mod tests {
     }
 
     #[test]
-    fn imports_filezilla_base64_password_and_rejects_implicit_ftps() {
+    fn imports_filezilla_base64_password_and_preserves_implicit_ftps() {
         let base64 = r#"<FileZilla3><Servers><Server>
           <Host>ftp.example.com</Host><Port>21</Port><Protocol>3</Protocol>
           <User>u</User><Pass encoding="base64">c2VjcmV0</Pass>
@@ -594,11 +808,18 @@ mod tests {
             b"secret"
         );
 
-        let implicit = base64.replace("<Protocol>3</Protocol>", "<Protocol>4</Protocol>");
-        assert!(matches!(
-            load_filezilla(&implicit, &store),
-            Err(ImportError::Unsupported(_))
-        ));
+        let implicit = base64
+            .replace("<Port>21</Port>", "<Port>0</Port>")
+            .replace("<Protocol>3</Protocol>", "<Protocol>4</Protocol>");
+        let implicit_specs = load_filezilla(&implicit, &store).unwrap();
+        assert_eq!(implicit_specs[0].ftp_tls_mode, FtpTlsMode::Implicit);
+        assert_eq!(implicit_specs[0].port, 990);
+        assert_eq!(
+            store
+                .get_for(&key(Protocol::Ftp, "ftp.example.com", 990, "u"))
+                .unwrap(),
+            b"secret"
+        );
     }
 
     #[test]
@@ -620,26 +841,82 @@ mod tests {
 
     #[test]
     fn sync_metadata_clears_local_security_state() {
-        let specs = vec![ConnectionSpec {
-            id: ConnectionId(0),
-            name: "legacy".into(),
-            protocol: Protocol::Sftp,
-            host: "example.com".into(),
-            port: 22,
-            user: "alice".into(),
-            initial_path: String::new(),
-            allow_plaintext_ftp: true,
-            accept_invalid_tls: true,
-            sftp_auth: crate::model::SftpAuth::PrivateKey,
-            sftp_private_key: Some("/Users/demo/.ssh/id_ed25519".into()),
-        }];
+        let mut specs = vec![
+            ConnectionSpec {
+                id: ConnectionId(0),
+                name: "ssh-key".into(),
+                protocol: Protocol::Sftp,
+                host: "sftp.example.com".into(),
+                port: 22,
+                user: "alice".into(),
+                initial_path: String::new(),
+                group: String::new(),
+                tags: Vec::new(),
+                timeout_secs: None,
+                keepalive_interval_secs: None,
+                ftp_data_mode: Default::default(),
+                ftp_filename_encoding: Default::default(),
+                ftp_tls_mode: Default::default(),
+                proxy_url: None,
+                use_ssh_config: false,
+                ssh_proxy_jump: None,
+                allow_plaintext_ftp: false,
+                accept_invalid_tls: false,
+                tls_pinned_sha256: None,
+                tls_client_cert: None,
+                tls_client_key: None,
+                sftp_auth: crate::model::SftpAuth::PrivateKey,
+                sftp_private_key: Some("/Users/demo/.ssh/id_ed25519".into()),
+                transfer_concurrency: None,
+            },
+            ConnectionSpec {
+                id: ConnectionId(1),
+                name: "legacy-ftps".into(),
+                protocol: Protocol::Ftp,
+                host: "ftp.example.com".into(),
+                port: 21,
+                user: "alice".into(),
+                initial_path: String::new(),
+                group: String::new(),
+                tags: Vec::new(),
+                timeout_secs: None,
+                keepalive_interval_secs: None,
+                ftp_data_mode: Default::default(),
+                ftp_filename_encoding: Default::default(),
+                ftp_tls_mode: Default::default(),
+                proxy_url: None,
+                use_ssh_config: false,
+                ssh_proxy_jump: None,
+                allow_plaintext_ftp: true,
+                accept_invalid_tls: true,
+                tls_pinned_sha256: Some(format!("sha256:{}", "a".repeat(64))),
+                tls_client_cert: None,
+                tls_client_key: None,
+                sftp_auth: crate::model::SftpAuth::Password,
+                sftp_private_key: None,
+                transfer_concurrency: None,
+            },
+        ];
+        let mut client_auth = specs[1].clone();
+        client_auth.id = ConnectionId(2);
+        client_auth.name = "client-auth-ftps".into();
+        client_auth.allow_plaintext_ftp = false;
+        client_auth.tls_client_cert = Some("/Users/demo/client-chain.pem".into());
+        client_auth.tls_client_key = Some("/Users/demo/client-key.pem".into());
+        specs.push(client_auth);
         let normalized =
             normalize_sync_metadata_bytes(&serde_json::to_vec(&specs).unwrap()).unwrap();
         let decoded: Vec<ConnectionSpec> = serde_json::from_slice(&normalized).unwrap();
         assert!(!decoded[0].allow_plaintext_ftp);
         assert!(!decoded[0].accept_invalid_tls);
+        assert_eq!(decoded[0].tls_pinned_sha256, None);
         assert_eq!(decoded[0].sftp_auth, crate::model::SftpAuth::PrivateKey);
         assert_eq!(decoded[0].sftp_private_key, None);
+        assert!(!decoded[1].allow_plaintext_ftp);
+        assert!(!decoded[1].accept_invalid_tls);
+        assert_eq!(decoded[1].tls_pinned_sha256, None);
+        assert_eq!(decoded[2].tls_client_cert, None);
+        assert_eq!(decoded[2].tls_client_key, None);
     }
 
     #[test]

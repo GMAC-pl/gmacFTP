@@ -8,6 +8,12 @@ pub struct RemoteEntry {
     pub size: u64,
     /// Modification time as a Unix timestamp (seconds), if reported.
     pub mtime: Option<i64>,
+    /// Unix permission bits, when exposed by the server listing.
+    pub permissions: Option<u32>,
+    /// Owner name or numeric uid, when exposed by the server listing.
+    pub owner: Option<String>,
+    /// Group name or numeric gid, when exposed by the server listing.
+    pub group: Option<String>,
 }
 
 impl RemoteEntry {
@@ -34,24 +40,36 @@ mod tests {
                 is_dir: false,
                 size: 1,
                 mtime: None,
+                permissions: None,
+                owner: None,
+                group: None,
             },
             RemoteEntry {
                 name: "adir".into(),
                 is_dir: true,
                 size: 0,
                 mtime: None,
+                permissions: None,
+                owner: None,
+                group: None,
             },
             RemoteEntry {
                 name: "Bdir".into(),
                 is_dir: true,
                 size: 0,
                 mtime: None,
+                permissions: None,
+                owner: None,
+                group: None,
             },
             RemoteEntry {
                 name: "afile".into(),
                 is_dir: false,
                 size: 1,
                 mtime: None,
+                permissions: None,
+                owner: None,
+                group: None,
             },
         ];
         sort_entries(&mut e);

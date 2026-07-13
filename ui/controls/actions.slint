@@ -1,0 +1,140 @@
+import { Tokens } from "../foundation.slint";
+
+// ── reusable controls ──
+// TouchArea does not participate in keyboard focus traversal. Keep pointer and keyboard activation
+// in one reusable primitive so every custom control behaves like a native macOS control.
+export component KeyboardActionArea {
+    in property <bool> enabled: true;
+    in property <bool> pointer-activates: true;
+    in property <string> accessible-name: "";
+    in property <string> accessible-help: "";
+    out property <bool> has-hover <=> touch.has-hover;
+    out property <bool> pressed <=> touch.pressed;
+    out property <bool> has-focus <=> keyboard.has-focus;
+    out property <length> mouse-x <=> touch.mouse-x;
+    out property <length> mouse-y <=> touch.mouse-y;
+    callback clicked();
+    callback double-clicked <=> touch.double-clicked;
+    callback pointer-event <=> touch.pointer-event;
+    forward-focus: keyboard;
+    accessible-role: button;
+    accessible-label: root.accessible-name;
+    accessible-description: root.accessible-help;
+    accessible-enabled: root.enabled;
+    accessible-action-default => { if (root.enabled) { root.clicked(); } }
+    touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? pointer : not-allowed;
+        clicked => { if (root.pointer-activates) { root.clicked(); } }
+    }
+    keyboard := FocusScope {
+        width: 0px;
+        height: 0px;
+        enabled: root.enabled;
+        key-pressed(event) => {
+            if event.text == " " || event.text == "\n" || event.text == Key.Return {
+                root.clicked();
+                accept
+            } else {
+                reject
+            }
+        }
+    }
+}
+
+export component PrimaryButton inherits Rectangle {
+    in property <string> text;
+    in property <string> icon: "";
+    in property <bool> disabled: false;
+    callback clicked();
+    height: 34px; min-width: 88px;
+    background: action.has-hover ? Tokens.primary-fill-hover : Tokens.primary-fill;
+    border-width: action.has-focus ? 2px : 0px;
+    border-color: #FFFFFF;
+    border-radius: Tokens.r-button;
+    forward-focus: action;
+    accessible-role: button;
+    accessible-label: root.text;
+    accessible-enabled: !root.disabled;
+    accessible-action-default => { if (!root.disabled) { root.clicked(); } }
+    HorizontalLayout { alignment: center; padding-left: 14px; padding-right: 14px; spacing: 8px;
+        Text { text: root.text; color: root.disabled ? #FFFFFF99 : #FFFFFF; font-size: 13px; font-weight: 600; vertical-alignment: center; }
+    }
+    action := KeyboardActionArea { enabled: !root.disabled; clicked => { root.clicked(); } }
+}
+export component GhostButton inherits Rectangle {
+    in property <string> text;
+    in property <string> icon: "";
+    in property <color> text-color: Tokens.text-sec;
+    in property <color> text-color-hover: Tokens.text;
+    in property <bool> active: false;
+    in property <bool> checkable: false;
+    in property <bool> disabled: false;
+    callback clicked();
+    height: 34px; min-width: 48px;
+    background: root.active ? Tokens.row-hover : (action.has-hover ? Tokens.row-hover : transparent);
+    border-width: action.has-focus ? 2px : 0px;
+    border-color: Tokens.accent;
+    border-radius: Tokens.r-button;
+    forward-focus: action;
+    accessible-role: button;
+    accessible-label: root.text;
+    accessible-enabled: !root.disabled;
+    accessible-checkable: root.checkable;
+    accessible-checked: root.active;
+    accessible-action-default => { if (!root.disabled) { root.clicked(); } }
+    HorizontalLayout { alignment: center; padding-left: 11px; padding-right: 11px; spacing: 7px;
+        Text { text: root.text; color: root.disabled ? Tokens.text-ter : (root.active ? Tokens.accent : (action.has-hover ? root.text-color-hover : root.text-color)); font-size: 13px; font-weight: 500; vertical-alignment: center; }
+    }
+    action := KeyboardActionArea { enabled: !root.disabled; clicked => { root.clicked(); } }
+}
+
+// Radio-style segment used by protocol, direction, mode and preference groups.
+export component ChoiceSegment inherits Rectangle {
+    in property <string> text;
+    in property <bool> selected: false;
+    in property <bool> enabled: true;
+    in property <bool> danger: false;
+    in property <length> text-size: 10px;
+    callback chosen();
+    horizontal-stretch: 1;
+    border-radius: 5px;
+    background: root.selected ? (root.danger ? Tokens.danger-fill : Tokens.primary-fill) : (action.has-hover ? Tokens.row-hover : transparent);
+    border-width: action.has-focus ? 2px : 0px;
+    border-color: root.danger ? Tokens.danger : Tokens.accent;
+    forward-focus: action;
+    accessible-role: radio-button;
+    accessible-label: root.text;
+    accessible-enabled: root.enabled;
+    accessible-checkable: true;
+    accessible-checked: root.selected;
+    accessible-action-default => { if (root.enabled) { root.chosen(); } }
+    Text {
+        text: root.text;
+        color: !root.enabled ? Tokens.text-ter : (root.selected ? #FFFFFF : (root.danger ? Tokens.danger-text : Tokens.text-sec));
+        font-size: root.text-size;
+        font-weight: 700;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+    action := KeyboardActionArea { enabled: root.enabled; clicked => { root.chosen(); } }
+}
+// progress bar (transfer progress)
+export component ProgressBar inherits Rectangle {
+    in property <float> fraction;
+    in property <string> accessible-name: @tr("Transfer progress");
+    height: 3px;
+    background: Tokens.border;
+    border-radius: Tokens.r-track;
+    accessible-role: progress-indicator;
+    accessible-label: root.accessible-name;
+    accessible-value: clamp(root.fraction, 0, 1);
+    accessible-value-minimum: 0;
+    accessible-value-maximum: 1;
+    Rectangle {
+        height: parent.height; y: 0; x: 0;
+        width: parent.width * clamp(root.fraction, 0, 1);
+        background: Tokens.accent; border-radius: Tokens.r-track;
+    }
+}
