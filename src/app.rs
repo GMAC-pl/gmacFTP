@@ -11540,6 +11540,17 @@ mod path_safety_tests {
         assert_eq!(close.accessible_role(), Some(AccessibleRole::Button));
         assert_eq!(close.accessible_enabled(), Some(true));
 
+        // Exercise the real pointer route as well as the semantic accessibility action. Custom
+        // controls wrap their mouse and keyboard handling in KeyboardActionArea; a zero-sized
+        // inner TouchArea leaves the controls keyboard/VoiceOver accessible but ignores physical
+        // mouse clicks (the v0.2.0 release regression).
+        closed.set(false);
+        close.mock_single_click(slint::platform::PointerEventButton::Left);
+        assert!(
+            closed.get(),
+            "a physical pointer click must reach custom toolbar controls"
+        );
+
         let filter = ElementHandle::find_by_accessible_label(&ui, "Filter files in left pane")
             .next()
             .expect("the left file filter must be exposed as a text field");

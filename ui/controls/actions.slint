@@ -4,6 +4,11 @@ import { Tokens } from "../foundation.slint";
 // TouchArea does not participate in keyboard focus traversal. Keep pointer and keyboard activation
 // in one reusable primitive so every custom control behaves like a native macOS control.
 export component KeyboardActionArea {
+    // A custom component otherwise keeps its implicit 0×0 preferred size when it is layered over
+    // a visual parent. The accessible action would still work, but physical pointer events would
+    // miss every control that uses this primitive.
+    width: 100%;
+    height: 100%;
     in property <bool> enabled: true;
     in property <bool> pointer-activates: true;
     in property <string> accessible-name: "";
@@ -23,6 +28,8 @@ export component KeyboardActionArea {
     accessible-enabled: root.enabled;
     accessible-action-default => { if (root.enabled) { root.clicked(); } }
     touch := TouchArea {
+        width: parent.width;
+        height: parent.height;
         enabled: root.enabled;
         mouse-cursor: root.enabled ? pointer : not-allowed;
         clicked => { if (root.pointer-activates) { root.clicked(); } }

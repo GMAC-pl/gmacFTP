@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.1 — 2026-07-13
+
+- Fixed a critical pointer-input regression from 0.2.0 that left custom toolbar buttons, sidebar
+  server rows, dialog actions, and other custom controls reachable by keyboard and VoiceOver but
+  unresponsive to physical mouse clicks.
+- Added a headless pointer-delivery regression test and verified the corrected toolbar, connection
+  manager, sidebar session switching, toggles, dialogs, and native macOS menu in the running app.
+
 ## 0.2.0 — 2026-07-13
 
 The reliability, power-user workflow, accessibility, and universal-Mac release.
