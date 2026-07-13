@@ -6,6 +6,7 @@ Built in **Rust**. No Electron. No web view. No telemetry. Just a real macOS app
 files — quickly and safely.
 
 [![macOS 11+](https://img.shields.io/badge/platform-macOS%2011%2B-000000?logo=apple&logoColor=white)](#)
+[![Apple Silicon](https://img.shields.io/badge/architecture-Apple%20Silicon-555555?logo=apple&logoColor=white)](#)
 [![Rust](https://img.shields.io/badge/built%20with-Rust-dea584?logo=rust&logoColor=white)](#)
 [![License: GPL v3](https://img.shields.io/badge/license-GPL%20v3-blue.svg)](LICENSE)
 [![Commercial](https://img.shields.io/badge/commercial-license-available-success)](#commercial-license)
@@ -16,7 +17,7 @@ files — quickly and safely.
 
 ## ⬇️ Download & install
 
-**[↓ Download gmacFTP for Mac — gmacFTP-0.2.1.dmg](https://github.com/GMAC-pl/gmacftp/releases/download/v0.2.1/gmacFTP-0.2.1.dmg)** · macOS 11+, Apple Silicon and Intel
+**[↓ Download gmacFTP for Mac — gmacFTP-0.2.1.dmg](https://github.com/GMAC-pl/gmacftp/releases/download/v0.2.1/gmacFTP-0.2.1.dmg)** · macOS 11+, Apple Silicon
 
 1. Download the `.dmg`.
 2. Open it and **drag gmacFTP into the Applications folder** (a shortcut is inside).
@@ -45,8 +46,8 @@ Signed with an **Apple Developer ID** and **notarized by Apple** — opens clean
   overhead — it cold-starts instantly and stays responsive under heavy transfers.
 - 🔒 **Secure by design.** Passwords live in the macOS **Keychain** inside an AES-256-GCM vault;
   the master key never touches disk. FTPS is strict-by-default; SFTP verifies host keys.
-- 🍎 **Genuinely native.** A universal macOS app: custom titlebar, native menu bar, drag-and-drop,
-  light/dark themes, Apple Silicon and Intel. Not a web page in disguise.
+- 🍎 **Genuinely native.** An Apple Silicon macOS app with a custom titlebar, native menu bar,
+  drag-and-drop, and light/dark themes. Not a web page in disguise.
 - ☁️ **Yours everywhere.** Optionally sync your saved servers across your Macs via iCloud —
   passwords travel only as AES-256 ciphertext, with the master key in your Keychain.
 - 🔓 **Open & private.** GPL-3.0 licensed (with a commercial option). No accounts, no cloud dependency you didn't ask for, no
@@ -95,10 +96,12 @@ Prefer to build it yourself? See [Build](#build).
 |                 Light workspace                  |                  Dark workspace                   |
 | ![Connections](docs/screenshots/connections.png) | ![Editor](docs/screenshots/connection-editor.png) |
 |                Connection manager                |               New connection editor               |
-|   ![Transfers](docs/screenshots/transfers.png)   |                                                   |
-|                  Transfer queue                  |                                                   |
+|   ![Transfers](docs/screenshots/transfers.png)   |       ![Updater](docs/screenshots/update.png)      |
+|                  Transfer queue                  |          Verified update workflow                  |
 
-All screenshots use sample server names and placeholder credentials — never real data.
+All screenshots are generated from the isolated demo fixture (`example.com`, `demo`, and
+`/Users/demo`). It never opens saved connections, the Keychain, or the network. Regenerate the
+complete set with `bash scripts/capture-demo-screenshots.sh`.
 
 ### Tech stack
 
@@ -127,8 +130,10 @@ bash scripts/build-app.sh
 open target/release/gmacFTP.app
 ```
 
-The public bundle is universal (`arm64 + x86_64`). The script installs a missing Rust target when
-`rustup` is available, verifies both architectures with `lipo`, and only then signs the app.
+The public bundle targets Apple Silicon (`arm64`). The script installs the Rust target when needed,
+verifies the executable architecture with `lipo`, and only then signs the app. An explicit
+`MACKFTP_PUBLIC_ARCHS` override remains available for local compatibility experiments; it is not
+part of the supported public release path.
 
 Both panes start as your local filesystem, so you can try navigation, selection, sorting, the
 connection manager, and local copy flows with no server at all.
@@ -149,7 +154,7 @@ More in [`docs/PRIVACY.md`](docs/PRIVACY.md) and [`SECURITY.md`](SECURITY.md).
 ### Status
 
 gmacFTP is a **development preview (pre-1.0)**. Version 0.2 adds resilient transactional transfers,
-power-user file management, native settings, accessibility, and universal Mac support; feedback now
+power-user file management, native settings, accessibility, and Apple Silicon support; feedback now
 focuses on broad server compatibility and UI polish before 1.0.
 
 ### Support gmacFTP
@@ -195,8 +200,8 @@ która po prostu przenosi Twoje pliki — szybko i bezpiecznie.
   narzutu Electrona. Uruchamia się natychmiast i nie zacina przy dużych transferach.
 - 🔒 **Bezpieczny.** Hasła w macOS **Keychain** w zaszyfrowanym vaultcie AES-256-GCM; klucz główny
   nigdy nie ląduje na dysku. FTPS strict-by-default; SFTP weryfikuje klucze hostów.
-- 🍎 **Natywny.** Uniwersalna apka macOS: własny titlebar, natywne menu, drag-and-drop,
-  jasny/ciemny motyw, Apple Silicon i Intel.
+- 🍎 **Natywny.** Apka dla Apple Silicon z własnym titlebarem, natywnym menu, drag-and-drop
+  oraz jasnym i ciemnym motywem.
 - ☁️ **Twój wszędzie.** Opcjonalna synchronizacja zapisanych serwerów przez iCloud — hasła
   przesyłane są tylko jako zaszyfrowany szyfrogram (AES-256), a klucz mistrzowski zostaje w
   Keychainie.
@@ -204,7 +209,7 @@ która po prostu przenosi Twoje pliki — szybko i bezpiecznie.
 
 ### Pobranie i instalacja
 
-**[⬇ Pobierz gmacFTP dla Maca — gmacFTP-0.2.1.dmg](https://github.com/GMAC-pl/gmacftp/releases/download/v0.2.1/gmacFTP-0.2.1.dmg)** · macOS 11+, Apple Silicon i Intel
+**[⬇ Pobierz gmacFTP dla Maca — gmacFTP-0.2.1.dmg](https://github.com/GMAC-pl/gmacftp/releases/download/v0.2.1/gmacFTP-0.2.1.dmg)** · macOS 11+, Apple Silicon
 
 1. Pobierz plik `.dmg`.
 2. Otwórz go i **przeciągnij gmacFTP do folderu Aplikacje** (skrót jest w środku).
@@ -257,10 +262,12 @@ Podpisana **Apple Developer ID** i **zanotaryzowana przez Apple** — uruchamia 
 |               Jasny obszar roboczy               |               Ciemny obszar roboczy               |
 | ![Connections](docs/screenshots/connections.png) | ![Editor](docs/screenshots/connection-editor.png) |
 |                Menedżer połączeń                 |             Edytor nowego połączenia              |
-|   ![Transfers](docs/screenshots/transfers.png)   |                                                   |
-|                Kolejka transferów                |                                                   |
+|   ![Transfers](docs/screenshots/transfers.png)   |       ![Updater](docs/screenshots/update.png)      |
+|                Kolejka transferów                |       Weryfikowany proces aktualizacji             |
 
-Wszystkie zrzuty używają przykładowych nazw serwerów i zastępczych danych — nigdy realnych.
+Wszystkie zrzuty są generowane z odizolowanych danych demo (`example.com`, `demo` i
+`/Users/demo`). Generator nie otwiera zapisanych połączeń, Pęku kluczy ani sieci. Cały zestaw można
+odtworzyć poleceniem `bash scripts/capture-demo-screenshots.sh`.
 
 ### Stos techniczny
 
@@ -285,8 +292,9 @@ bash scripts/build-app.sh
 open target/release/gmacFTP.app
 ```
 
-Publiczny bundle jest uniwersalny (`arm64 + x86_64`); przed podpisaniem skrypt sprawdza obie
-architektury przez `lipo`.
+Publiczny bundle jest przeznaczony dla Apple Silicon (`arm64`); przed podpisaniem skrypt sprawdza
+architekturę przez `lipo`. Jawny override `MACKFTP_PUBLIC_ARCHS` pozostaje dostępny wyłącznie do
+lokalnych eksperymentów zgodności i nie jest częścią wspieranej ścieżki wydawniczej.
 
 Oba panele startują jako Twój lokalny filesystem, więc możesz wypróbować nawigację, zaznaczanie,
 sortowanie, menedżer połączeń i lokalne kopiowanie bez żadnego serwera.

@@ -31,17 +31,15 @@ Pure-FTPd still uses its normal privilege-separation implementation and a dedica
 
 ## macOS architectures
 
-The public distribution is a universal macOS binary containing both `arm64` and `x86_64`, with a
-minimum deployment target of macOS 11. Earlier public builds served only Apple Silicon, which
-excluded otherwise supported Intel Macs. No repository issue established a measurable volume of
-Intel demand, but the native Rust/Slint stack cross-compiles cleanly and the ongoing cost of testing
-the second target is small, so broad compatibility is the safer product decision.
+The supported public distribution targets Apple Silicon (`arm64`) with a minimum deployment target
+of macOS 11. Intel support was evaluated and cross-compiles successfully, but there is no measured
+user demand that justifies a larger artifact, a second release architecture, and its continuing
+verification burden. CI therefore compiles the public arm64 release target, while the bundle script
+rejects missing or unexpected architectures before code signing.
 
-On 2026-07-13, `cargo check --all-targets --target x86_64-apple-darwin` passed from an Apple Silicon
-host with Rust 1.93.1 and Xcode 26.3. CI compiles release binaries for both Apple targets. The app
-bundle script joins them with `lipo`, rejects missing or unexpected architectures, and performs this
-verification before code signing. Personal/local builds remain native by default to avoid doubling
-development build time; `MACKFTP_PERSONAL_ARCHS` can opt them into the universal build.
+`MACKFTP_PUBLIC_ARCHS` and `MACKFTP_PERSONAL_ARCHS` remain explicit local overrides for compatibility
+experiments. They do not expand the supported public release matrix and must not be used for a
+public artifact without restoring corresponding CI, smoke, signing, and update verification.
 
 Plain FTP remains disabled by default. These fixtures deliberately enable it only for an isolated
 localhost connection. Explicit/implicit FTPS, certificate pinning, changed-certificate rejection,
@@ -70,6 +68,6 @@ wyłączony; wyjątek istnieje tylko w konfiguracji konkretnego serwera testoweg
 zakończyła się powodzeniem 2026-07-13, bez użycia zapisanych serwerów ani danych logowania
 użytkownika.
 
-Publiczna aplikacja jest budowana jako jeden uniwersalny plik dla Apple Silicon i Intela
-(`arm64 + x86_64`, macOS 11+). Obie architektury są kompilowane w CI, a skrypt wydania sprawdza
-zawartość pliku przed podpisaniem.
+Publiczna aplikacja jest budowana dla Apple Silicon (`arm64`, macOS 11+). CI kompiluje właśnie ten
+target, a skrypt wydania sprawdza architekturę pliku przed podpisaniem. Wsparcie Intela nie jest
+częścią publicznej macierzy; override pozostaje wyłącznie do lokalnych eksperymentów zgodności.

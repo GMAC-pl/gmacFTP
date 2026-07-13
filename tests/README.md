@@ -77,20 +77,39 @@ For the repeatable OpenSSH/vsftpd/ProFTPD/Pure-FTPd matrix, see
 
 ## 3. Headless render verification (for layout / styling)
 
-`gmacftp-render-check/` renders the real `ui/app.slint` to PNGs headlessly (Slint software
-renderer), so UI changes can be verified without launching the window:
+The render check compiles the real `ui/app.slint` with Slint's software renderer and writes
+deterministic PNGs without launching the application controller:
 
 ```
-cd gmacftp-render-check && cargo build && ./target/debug/gmacftp-render-check
-# → /tmp/mackftp_render_{en,pl,manager,editor,ctx,panel,drag,dark}.png
+bash scripts/check-ui-render.sh
+# → /tmp/gmacftp-render-check/gmacftp_render_{en,pl,manager,editor,ctx,panel,drag,dark,update}.png
 ```
 
 Open those PNGs to confirm overlays (manager, editor, context menu, transfer panel) and
-both themes render correctly after a change.
+both themes render correctly after a change. The fixture uses only `example.com` hosts and
+`/Users/demo` paths; it never loads user settings, Keychain credentials, or a network client.
+To replace the six Retina screenshots referenced by README with the same isolated fixture, run:
+
+```
+bash scripts/capture-demo-screenshots.sh
+```
+
+Before shipping an artifact, also complete the
+[`macOS release-candidate smoke test`](../docs/RELEASE_SMOKE_TEST.md) on the exact packaged app.
 
 ---
 
-## 4. Automated relay regression
+## 4. Clean-install and migration fixtures
+
+The password-free documents under `tests/fixtures/migrations/` reproduce settings and connection
+metadata written by representative 0.0.x, 0.1.x, and 0.2.x releases. Unit tests deserialize them
+through the current validation path and verify strict TLS defaults, bounded resource settings,
+endpoint-bound metadata, and legacy field normalization. Every endpoint is below `example.com`,
+and every absolute path starts with `/Users/demo`; never replace a fixture with a real export.
+
+---
+
+## 5. Automated relay regression
 
 ```
 # (with one test server already on 127.0.0.1:2210, e.g. from run-test-servers.sh)

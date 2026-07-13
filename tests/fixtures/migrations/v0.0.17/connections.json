@@ -1,0 +1,11 @@
+[
+  {
+    "id": 0,
+    "name": "Demo Website",
+    "protocol": "ftp",
+    "host": "ftp.example.com",
+    "port": 21,
+    "user": "demo",
+    "initial_path": "/public_html"
+  }
+]

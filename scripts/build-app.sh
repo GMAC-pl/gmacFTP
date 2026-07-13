@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # Assemble two macOS bundles:
-#   - target/release/gmacFTP.app          public universal build (arm64 + x86_64)
+#   - target/release/gmacFTP.app          public Apple Silicon build (arm64)
 #   - target/release/gmacFTP-Personal.app personal/local native build (uses .env.personal)
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 ENTITLEMENTS="${MACKFTP_ENTITLEMENTS:-$ROOT/gmacFTP.entitlements}"
 EXPECTED_TEAM_ID="${MACKFTP_EXPECTED_TEAM_ID:-SY4HQ4PWVU}"
+PRIVATE_SYMBOLS_DIR="${MACKFTP_SYMBOLS_DIR:-$ROOT/target/release/private-symbols}"
 # Strip the developer's absolute home + project paths from the shipped binary (panic locations +
 # debug symbols) so the .app never leaks /Users/<name>/... . --remap-path-prefix only rewrites
 # paths embedded by file!()/env!()/panic locations — purely cosmetic, zero behavior change.
@@ -18,7 +19,9 @@ export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }--remap-path-prefix $ROOT=gmacftp --r
 PKG_VER="${MACKFTP_VERSION:-$(grep '^version' "$ROOT/Cargo.toml" | head -1 | sed 's/.*"\([^"]*\)".*/\1/')}"
 PKG_BUILD="${MACKFTP_BUILD_NUMBER:-$(git -C "$ROOT" rev-list --count HEAD 2>/dev/null || echo 1)}"
 NATIVE_TARGET="$(rustc -vV | sed -n 's/^host: //p')"
-PUBLIC_ARCHS="${MACKFTP_PUBLIC_ARCHS:-aarch64-apple-darwin x86_64-apple-darwin}"
+# Public releases intentionally target Apple Silicon only. The override remains available for
+# local compatibility experiments, but CI and the documented release path build arm64.
+PUBLIC_ARCHS="${MACKFTP_PUBLIC_ARCHS:-aarch64-apple-darwin}"
 PERSONAL_ARCHS="${MACKFTP_PERSONAL_ARCHS:-$NATIVE_TARGET}"
 
 ensure_rust_target() {
@@ -42,6 +45,89 @@ target_arch_name() {
     x86_64-apple-darwin) printf '%s\n' x86_64 ;;
     *) echo "ERROR: unsupported macOS release target: $1" >&2; exit 64 ;;
   esac
+}
+
+create_private_dsym() {
+  local label="$1"
+  local binary="$2"
+  shift 2
+  local dsym="$PRIVATE_SYMBOLS_DIR/gmacFTP-${PKG_VER}-${PKG_BUILD}-${label}.dSYM"
+  local binary_uuids
+  local dsym_uuids
+  local source_dsym
+  local resolved_dsym
+  local source_dwarf
+  local source_dwarf_count
+  local -a source_dsyms
+  local -a resolved_dsyms
+  local -a source_dwarfs
+  source_dsyms=("$@")
+  resolved_dsyms=()
+  source_dwarfs=()
+
+  command -v dsymutil >/dev/null 2>&1 || {
+    echo "ERROR: dsymutil is required to preserve private release symbols." >&2
+    exit 1
+  }
+  command -v dwarfdump >/dev/null 2>&1 || {
+    echo "ERROR: dwarfdump is required to verify private release symbols." >&2
+    exit 1
+  }
+
+  mkdir -p "$PRIVATE_SYMBOLS_DIR"
+  chmod 700 "$PRIVATE_SYMBOLS_DIR"
+  rm -rf "$dsym"
+  echo "==> preserving private crash symbols: $dsym"
+  if [ "${#source_dsyms[@]}" -eq 0 ]; then
+    echo "ERROR: Cargo did not provide a packed dSYM for $label" >&2
+    exit 1
+  fi
+  for source_dsym in "${source_dsyms[@]}"; do
+    resolved_dsym="$(cd "$source_dsym" 2>/dev/null && pwd -P)" || {
+      echo "ERROR: packed release symbol bundle is missing: $source_dsym" >&2
+      exit 1
+    }
+    source_dwarf_count="$(find "$resolved_dsym/Contents/Resources/DWARF" -maxdepth 1 -type f -print | wc -l | tr -d ' ')"
+    if [ "$source_dwarf_count" -ne 1 ]; then
+      echo "ERROR: expected exactly one DWARF image in $source_dsym; found $source_dwarf_count" >&2
+      exit 1
+    fi
+    source_dwarf="$(find "$resolved_dsym/Contents/Resources/DWARF" -maxdepth 1 -type f -print | head -1)"
+    test -n "$source_dwarf" && test -s "$source_dwarf" || {
+      echo "ERROR: packed release symbols are missing from $source_dsym" >&2
+      exit 1
+    }
+    resolved_dsyms+=("$resolved_dsym")
+    source_dwarfs+=("$source_dwarf")
+  done
+  cp -R "${resolved_dsyms[0]}" "$dsym"
+  local private_dwarf="$dsym/Contents/Resources/DWARF/$(basename "${source_dwarfs[0]}")"
+  if [ "${#source_dwarfs[@]}" -gt 1 ]; then
+    lipo -create "${source_dwarfs[@]}" -output "$private_dwarf"
+    local index
+    for ((index = 1; index < ${#resolved_dsyms[@]}; index++)); do
+      if [ -d "${resolved_dsyms[$index]}/Contents/Resources/Relocations" ]; then
+        cp -R "${resolved_dsyms[$index]}/Contents/Resources/Relocations/." \
+          "$dsym/Contents/Resources/Relocations/"
+      fi
+    done
+  fi
+  test -s "$private_dwarf" || {
+    echo "ERROR: packed symbols could not be assembled for $label" >&2
+    exit 1
+  }
+  chmod -R go-rwx "$dsym"
+
+  # The public executable keeps no local/debug symbols. UUIDs are stable across stripping, so the
+  # private dSYM remains an exact symbolication match without being copied into the app or DMG.
+  strip -S -x "$binary"
+  binary_uuids="$(dwarfdump --uuid "$binary" | awk '{print $2, $3}' | LC_ALL=C sort)"
+  dsym_uuids="$(dwarfdump --uuid "$dsym" | awk '{print $2, $3}' | LC_ALL=C sort)"
+  if [ -z "$binary_uuids" ] || [ "$binary_uuids" != "$dsym_uuids" ]; then
+    echo "ERROR: private dSYM UUIDs do not match the stripped $label executable" >&2
+    exit 1
+  fi
+  echo "==> private dSYM UUIDs verified (not included in the app or DMG)"
 }
 
 sign_app() {
@@ -105,8 +191,10 @@ build_bundle() {
   local expected_arch_count=0
   local -a target_list
   local -a binaries
+  local -a packed_dsyms
   target_list=()
   binaries=()
+  packed_dsyms=()
   read -r -a target_list <<<"$targets"
 
   if [ "${#target_list[@]}" -eq 0 ]; then
@@ -122,8 +210,12 @@ build_bundle() {
     MACKFTP_CONFIG_QUALIFIER="$qualifier" \
     MACKFTP_CONFIG_ORGANIZATION="$organization" \
     MACKFTP_CONFIG_APPLICATION="$application" \
+    CARGO_PROFILE_RELEASE_DEBUG=1 \
+    CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO=packed \
+    CARGO_PROFILE_RELEASE_STRIP=none \
       cargo build --release --locked --target "$target"
     binaries+=("$ROOT/target/$target/release/gmacftp")
+    packed_dsyms+=("$ROOT/target/$target/release/gmacftp.dSYM")
   done
 
   rm -rf "$app"
@@ -148,6 +240,8 @@ build_bundle() {
     exit 1
   fi
   echo "==> verified executable architectures: $binary_archs"
+
+  create_private_dsym "$label" "$app/Contents/MacOS/gmacftp" "${packed_dsyms[@]}"
 
   cat > "$app/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -219,6 +313,11 @@ CREDITS
     if [ "${MACKFTP_STRICT_SIGN:-0}" = "1" ]; then
       exit 1
     fi
+  fi
+
+  if find "$app" -name '*.dSYM' -print -quit | grep -q .; then
+    echo "ERROR: a private dSYM was accidentally placed inside $app" >&2
+    exit 1
   fi
 
   sign_app "$app" "$bundle_id"

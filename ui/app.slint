@@ -26,6 +26,9 @@ export component App inherits Window {
     default-font-family: "Inter";
 
     in property <string> app-version: "";
+    // Headless documentation renders use the real component but disable GPU-only shadows that
+    // the deterministic RGB software renderer cannot alpha-composite correctly.
+    in property <bool> snapshot-mode: false;
     in property <[ConnRow]> connections;
     in property <[ConnRow]> sessions;   // active background sessions (CONNECTED section)
     in property <[ConnRow]> filtered-connections;
@@ -360,7 +363,7 @@ export component App inherits Window {
     out property <bool> saved-dragging:
         root.drag-active && root.drag-source == "server";
     out property <bool> saved-drag-over-list:
-        root.saved-dragging && root.drag-x < 240px && root.drag-y >= root.saved-list-y - 8px && root.drag-y <= root.saved-list-y + root.filtered-connections.length * 32px + 8px;
+        root.saved-dragging && root.drag-x < 240px && root.drag-y >= root.saved-list-y - 8px && root.drag-y <= root.saved-list-y + root.filtered-connections.length * 36px + 8px;
 
     callback connect-to(int);
     callback disconnect();
@@ -544,7 +547,7 @@ export component App inherits Window {
                 }
 
                 HorizontalLayout {
-                    padding-left: 13px; padding-right: 14px; padding-top: 11px; padding-bottom: 11px; spacing: 6px;
+                    padding-left: 13px; padding-right: 14px; padding-top: 10px; padding-bottom: 10px; spacing: 5px;
                     VerticalLayout {
                         width: 14px; alignment: center;
                         TrafficButton { fill: #FF5F57; mark: "x"; accessible-name: @tr("Close window"); clicked => { root.close-window(); } }
@@ -563,11 +566,13 @@ export component App inherits Window {
                     VerticalLayout {
                         width: 188px; alignment: center;
                         Rectangle {
-                            width: 188px; height: 26px; border-radius: 13px;
-                            background: Tokens.accent-soft;
+                            width: 188px; height: 28px; border-radius: Tokens.r-button;
+                            background: Tokens.field-bg;
+                            border-width: 1px;
+                            border-color: Tokens.border;
                             HorizontalLayout { padding-left: 10px; padding-right: 10px; spacing: 8px; alignment: center;
                                 Rectangle {
-                                    width: 7px; height: 26px; background: transparent;
+                                    width: 7px; height: 28px; background: transparent;
                                     VerticalLayout { alignment: center;
                                         Rectangle {
                                             width: 7px; height: 7px; border-radius: 4px;
@@ -581,46 +586,39 @@ export component App inherits Window {
                                         : (root.active-pane == "remote" && root.right-kind == "remote" ? root.right-host
                                         : (root.left-kind == "remote" ? root.left-host
                                         : (root.right-kind == "remote" ? root.right-host : I18n.not-connected))));
-                                    color: (root.left-kind == "remote" || root.right-kind == "remote" || root.active-host != "") ? Tokens.accent-text : Tokens.text-sec;
+                                    color: (root.left-kind == "remote" || root.right-kind == "remote" || root.active-host != "") ? Tokens.text : Tokens.text-sec;
                                     font-family: "JetBrains Mono"; font-size: 10px; vertical-alignment: center;
                                     horizontal-stretch: 1;
                                     overflow: elide;
                                 }
                                 Rectangle {
-                                    width: 1px; height: 26px; background: transparent;
-                                    Rectangle { y: 7px; width: 1px; height: 13px; background: Tokens.accent; opacity: 0.45; }
+                                    width: 1px; height: 28px; background: transparent;
+                                    Rectangle { y: 7px; width: 1px; height: 14px; background: Tokens.border-strong; }
                                 }
                                 Text {
                                     text: (root.active-pane == "local" && root.left-protocol != "") ? root.left-protocol
                                         : ((root.active-pane == "remote" && root.right-protocol != "") ? root.right-protocol
                                         : (root.left-protocol != "" ? root.left-protocol : (root.right-protocol != "" ? root.right-protocol : "FTP")));
                                     color: (root.left-kind == "remote" || root.right-kind == "remote" || root.active-host != "") ? Tokens.accent-text : Tokens.text-sec;
-                                    font-size: 10px; font-weight: 600; vertical-alignment: center;
+                                    font-size: 9px; font-weight: 700; vertical-alignment: center;
                                 }
                             }
                         }
                     }
                     Rectangle { horizontal-stretch: 1; }
-                    LabeledToolButton { width: 88px; icon: "refresh"; text: I18n.refresh; clicked => { root.refresh(); } }
-                    LabeledToolButton { width: 78px; icon: "transfer"; text: @tr("Sync"); disabled: !((root.left-kind == "local" && root.right-kind == "remote") || (root.left-kind == "remote" && root.right-kind == "local")); clicked => { root.open-folder-sync(); } }
+                    LabeledToolButton { width: 94px; icon: "refresh"; text: I18n.refresh; clicked => { root.refresh(); } }
+                    LabeledToolButton { width: 122px; icon: "transfer"; text: @tr("Sync"); disabled: !((root.left-kind == "local" && root.right-kind == "remote") || (root.left-kind == "remote" && root.right-kind == "local")); clicked => { root.open-folder-sync(); } }
                     ToolDivider { }
-                    LabeledToolButton { width: 124px; icon: "activity"; text: @tr("Transfers"); badge: root.transfer-pending-count; clicked => { root.transfer-panel-open = !root.transfer-panel-open; } }
-                    if root.transfer-jobs.length > 0 : VerticalLayout {
-                        width: 18px; alignment: center;
-                        Rectangle {
-                            width: 18px; height: 18px; border-radius: 9px; background: Tokens.accent;
-                            Text { text: root.transfer-jobs.length; color: #FFFFFF; font-size: 10px; font-weight: 800; horizontal-alignment: center; vertical-alignment: center; }
-                        }
-                    }
+                    LabeledToolButton { width: 116px; icon: "activity"; text: @tr("Transfers"); badge: root.transfer-pending-count; clicked => { root.transfer-panel-open = !root.transfer-panel-open; } }
                     ToolDivider { }
-                    LabeledToolButton { width: 95px; icon: "plug-zap"; text: I18n.connect; emphasized: true; disabled: root.selected-connection < 0 || (root.active-pane == "local" && root.local-loading) || (root.active-pane == "remote" && root.remote-loading); clicked => { root.connect-selected-to-pane(root.active-pane); } }
-                    LabeledToolButton { width: 111px; icon: "log-out"; text: I18n.disconnect; emphasized: true; danger-emphasis: true; disabled: (root.active-pane == "local" && root.local-loading) || (root.active-pane == "remote" && root.remote-loading) || !((root.active-pane == "local" && root.left-kind == "remote") || (root.active-pane == "remote" && root.right-kind == "remote")); clicked => { root.disconnect(); } }
+                    LabeledToolButton { width: 95px; icon: "log-in"; text: I18n.connect; emphasized: true; disabled: root.selected-connection < 0 || (root.active-pane == "local" && root.local-loading) || (root.active-pane == "remote" && root.remote-loading); clicked => { root.connect-selected-to-pane(root.active-pane); } }
+                    LabeledToolButton { width: 111px; icon: "log-out"; text: I18n.disconnect; danger-emphasis: true; disabled: (root.active-pane == "local" && root.local-loading) || (root.active-pane == "remote" && root.remote-loading) || !((root.active-pane == "local" && root.left-kind == "remote") || (root.active-pane == "remote" && root.right-kind == "remote")); clicked => { root.disconnect(); } }
                     ToolDivider { }
                     IconButton { icon: "shield"; accessible-name: @tr("Allow unsafe TLS certificates for this server"); checkable: true; on: root.accept-any-cert; clicked => { root.toggle-tls(); } }
                     IconButton { icon: "eye"; accessible-name: @tr("Show hidden files"); checkable: true; on: root.show-hidden; clicked => { root.toggle-hidden(); } }
                     IconButton { icon: Tokens.theme == "dark" ? "sun" : "moon"; accessible-name: @tr("Toggle light and dark theme"); clicked => { root.toggle-theme(); } }
                     ToolDivider { }
-                    LabeledToolButton { width: 89px; icon: "server"; text: @tr("Servers"); clicked => { root.manager-open = true; root.manager-message = ""; } }
+                    LabeledToolButton { width: 94px; icon: "server"; text: @tr("Servers"); clicked => { root.manager-open = true; root.manager-message = ""; } }
                 }
             }
 
@@ -641,13 +639,13 @@ export component App inherits Window {
                                 // pane (the previous session stays alive); click the eject icon to disconnect it. ──
                                 if (root.filtered-sessions.length > 0) : Rectangle {
                                     height: 26px;
-                                    Text { text: I18n.connected + " · " + root.filtered-sessions.length; color: Tokens.text-ter; font-size: 11px; font-weight: 800; vertical-alignment: bottom; }
+                                    Text { text: I18n.connected + " · " + root.filtered-sessions.length; color: Tokens.text-ter; font-size: 10px; font-weight: 700; vertical-alignment: bottom; }
                                 }
                                 for s in root.filtered-sessions : Rectangle {
-                                    height: 42px; border-radius: Tokens.r-row;
+                                    height: 44px; border-radius: Tokens.r-row;
                                     background: (s.id == root.left-conn-id || s.id == root.right-conn-id) ? Tokens.sidebar-active : (session_action.has-hover || session_action.has-focus ? Tokens.row-hover : transparent);
                                     // status dot — absolute, on the SAME x-axis as the CONNECTIONS rows (x16)
-                                    Rectangle { x: 12px; y: 17px; width: 7px; height: 7px; border-radius: 4px; background: Tokens.success; }
+                                    Rectangle { x: 12px; y: 19px; width: 6px; height: 6px; border-radius: 3px; background: Tokens.success; }
                                     session_action := KeyboardActionArea {
                                         accessible-name: @tr("Switch to connected server {}", s.label);
                                         accessible-help: s.sub;
@@ -655,24 +653,17 @@ export component App inherits Window {
                                     }
                                     HorizontalLayout { padding-left: 29px; padding-right: 5px; padding-top: 5px; padding-bottom: 5px; spacing: 6px; alignment: center;
                                         VerticalLayout { spacing: 2px; horizontal-stretch: 1;
-                                            Text { text: s.label; color: Tokens.text; font-size: 12px; font-weight: 800; vertical-alignment: center; overflow: elide; }
+                                            Text { text: s.label; color: Tokens.text; font-size: 12px; font-weight: 700; vertical-alignment: center; overflow: elide; }
                                             Text { text: s.sub; color: Tokens.text-sec; font-family: "JetBrains Mono"; font-size: 9px; overflow: elide; }
                                         }
                                         ProtocolBadge { protocol: s.protocol; compact: true; }
-                                        Rectangle {
-                                            width: 30px; height: 30px;
-                                            border-radius: 6px;
-                                            background: disconnect_action.has-hover || disconnect_action.has-focus ? Tokens.danger-soft : transparent;
-                                            Icon {
-                                                kind: "eject";
-                                                fg: disconnect_action.has-hover ? Tokens.danger : Tokens.text-ter;
-                                                x: (parent.width - self.width) / 2;
-                                                y: (parent.height - self.height) / 2;
-                                            }
-                                            disconnect_action := KeyboardActionArea {
-                                                accessible-name: @tr("Disconnect {}", s.label);
-                                                clicked => { root.disconnect-session(s.id); }
-                                            }
+                                        IconButton {
+                                            width: Tokens.control-compact; height: Tokens.control-compact;
+                                            icon: "eject"; icon-size: Tokens.icon-small;
+                                            fg: Tokens.text-ter; hover-fg: Tokens.danger;
+                                            hover-background: Tokens.danger-soft; focus-color: Tokens.danger;
+                                            accessible-name: @tr("Disconnect {}", s.label);
+                                            clicked => { root.disconnect-session(s.id); }
                                         }
                                     }
                                 }
@@ -680,7 +671,7 @@ export component App inherits Window {
                                     height: 28px;
                                     background: root.drag-over-favorites || root.favorite-drag-over-list ? Tokens.accent-soft : transparent;
                                     border-radius: Tokens.r-row;
-                                    Text { x: 10px; width: parent.width - 20px; text: I18n.favorites; color: root.drag-over-favorites || root.favorite-drag-over-list ? Tokens.accent-text : Tokens.text-ter; font-size: 11px; font-weight: 800; horizontal-alignment: left; vertical-alignment: bottom; }
+                                    Text { x: 10px; width: parent.width - 20px; text: I18n.favorites; color: root.drag-over-favorites || root.favorite-drag-over-list ? Tokens.accent-text : Tokens.text-ter; font-size: 10px; font-weight: 700; horizontal-alignment: left; vertical-alignment: bottom; }
                                 }
                                 if root.server-filter == "" : Rectangle {
                                     height: root.local-favorites.length * 30px + (root.favorite-drag-over-list ? 2px : 0px);
@@ -749,48 +740,47 @@ export component App inherits Window {
                                 }
                                 Rectangle {
                                     height: 28px;
-                                    Text { x: 10px; width: parent.width - 56px; text: @tr("SERVERS"); color: Tokens.text-ter; font-size: 11px; font-weight: 800; horizontal-alignment: left; vertical-alignment: bottom; }
-                                    Rectangle {
+                                    Text { x: 10px; width: parent.width - 56px; text: @tr("SERVERS"); color: Tokens.text-ter; font-size: 10px; font-weight: 700; horizontal-alignment: left; vertical-alignment: bottom; }
+                                    IconButton {
                                         x: parent.width - 34px; y: 2px; width: 28px; height: 24px;
-                                        border-radius: 6px;
-                                        background: add_server_action.has-hover || add_server_action.has-focus ? Tokens.row-hover : transparent;
-                                        Icon { kind: "plus"; width: 15px; height: 15px; fg: add_server_action.has-hover ? Tokens.text : Tokens.text-sec; x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2; }
-                                        add_server_action := KeyboardActionArea { accessible-name: @tr("Add server"); clicked => { root.new-connection(); } }
+                                        icon: "plus"; icon-size: Tokens.icon-small;
+                                        accessible-name: @tr("Add server");
+                                        clicked => { root.new-connection(); }
                                     }
                                 }
                                 // ── SAVED ──
                                 Rectangle {
                                     height: 28px;
-                                    Text { x: 10px; width: parent.width - 20px; text: I18n.saved + " · " + root.filtered-connections.length; color: Tokens.text-ter; font-size: 11px; font-weight: 800; horizontal-alignment: left; vertical-alignment: bottom; }
+                                    Text { x: 10px; width: parent.width - 20px; text: I18n.saved + " · " + root.filtered-connections.length; color: Tokens.text-ter; font-size: 10px; font-weight: 700; horizontal-alignment: left; vertical-alignment: bottom; }
                                 }
                                 if root.filtered-connections.length == 0 : Rectangle {
                                     height: 64px;
                                     Text { text: root.server-filter == "" ? @tr("No servers yet.\nUse CONNECTIONS to add\nor import from ForkLift.") : @tr("No matching servers."); color: Tokens.text-sec; font-size: 11px; horizontal-alignment: center; vertical-alignment: center; wrap: word-wrap; }
                                 }
                                 if root.filtered-connections.length > 0 : Rectangle {
-                                    height: root.filtered-connections.length * 32px + (root.saved-drag-over-list ? 2px : 0px);
+                                    height: root.filtered-connections.length * 36px + (root.saved-drag-over-list ? 2px : 0px);
                                     border-radius: Tokens.r-row;
                                     background: root.saved-drag-over-list ? Tokens.accent-soft : transparent;
                                     if root.saved-drag-over-list : Rectangle {
-                                        x: 8px; y: root.saved-drop-index * 32px; width: parent.width - 16px; height: 2px;
+                                        x: 8px; y: root.saved-drop-index * 36px; width: parent.width - 16px; height: 2px;
                                         background: Tokens.accent;
                                         border-radius: 1px;
                                     }
                                     VerticalLayout {
                                         spacing: 0px;
                                         for c[i] in root.filtered-connections : Rectangle {
-                                            height: 32px;
+                                            height: 36px;
                                             opacity: root.saved-dragging && root.saved-drag-id == c.id ? 0.36 : 1.0;
                                             animate opacity { duration: 120ms; easing: ease-out; }
                                             // connected saved-servers show just the green dot here; the live "active" tint lives
                                             // in the CONNECTED section above, so the two states no longer look identical.
                                             background: root.saved-dragging && root.saved-drag-id == c.id ? Tokens.accent-soft : (c.id == root.selected-connection ? Tokens.row-hover : (server_action.has-hover || server_action.has-focus ? Tokens.row-hover : transparent));
                                             border-radius: Tokens.r-row;
-                                            if (c.id == root.left-conn-id || c.id == root.right-conn-id) : Rectangle { x: 0; y: 8px; width: 3px; height: 16px; background: Tokens.accent; border-radius: 2px; }
-                                            if c.id == root.selected-connection && !(c.id == root.left-conn-id || c.id == root.right-conn-id) : Rectangle { x: 0; y: 8px; width: 3px; height: 16px; background: Tokens.text-ter; border-radius: 2px; }
+                                            if (c.id == root.left-conn-id || c.id == root.right-conn-id) : Rectangle { x: 0; y: 10px; width: 3px; height: 16px; background: Tokens.accent; border-radius: 2px; }
+                                            if c.id == root.selected-connection && !(c.id == root.left-conn-id || c.id == root.right-conn-id) : Rectangle { x: 0; y: 10px; width: 3px; height: 16px; background: Tokens.text-ter; border-radius: 2px; }
                                             // Connection-status dot. Positioned absolutely (like the stripe above) because a
                                             // y-pinned child of the HorizontalLayout did not render in the software renderer.
-                                            Rectangle { x: 12px; y: 13px; width: 7px; height: 7px; border-radius: 4px; background: (c.id == root.left-conn-id || c.id == root.right-conn-id) ? Tokens.success : Tokens.border-strong; }
+                                            Rectangle { x: 12px; y: 15px; width: 6px; height: 6px; border-radius: 3px; background: (c.id == root.left-conn-id || c.id == root.right-conn-id) ? Tokens.success : Tokens.border-strong; }
                                             server_action := KeyboardActionArea {
                                                 accessible-name: @tr("Select server {}", c.label);
                                                 accessible-help: c.sub;
@@ -804,7 +794,7 @@ export component App inherits Window {
                                                             root.drag-pressed = true; root.drag-active = false;
                                                             root.drag-start-x = self.absolute-position.x + self.mouse-x;
                                                             root.drag-start-y = self.absolute-position.y + self.mouse-y;
-                                                            root.saved-list-y = self.absolute-position.y - i * 32px;
+                                                            root.saved-list-y = self.absolute-position.y - i * 36px;
                                                         } else if (pe.kind == PointerEventKind.move && root.drag-pressed && root.drag-source == "server") {
                                                             root.drag-x = self.absolute-position.x + self.mouse-x;
                                                             root.drag-y = self.absolute-position.y + self.mouse-y;
@@ -827,23 +817,19 @@ export component App inherits Window {
                                                 }
                                             }
                                             Text {
-                                                x: 29px; y: 0px; width: parent.width - 106px; height: parent.height;
+                                                x: 29px; y: 0px; width: parent.width - 110px; height: parent.height;
                                                 text: c.label; color: Tokens.text; font-size: 12px; font-weight: c.id == root.active-connection ? 800 : 600;
                                                 vertical-alignment: center; overflow: elide;
                                             }
-                                            ProtocolBadge { x: parent.width - 72px; y: 7px; protocol: c.protocol; compact: true; }
-                                            Rectangle {
-                                                x: parent.width - 30px; y: 1px; width: 28px; height: 30px;
-                                                border-radius: 6px;
-                                                background: connect_server_action.has-hover || connect_server_action.has-focus ? Tokens.primary-fill : Tokens.accent-soft;
-                                                Icon {
-                                                    kind: "plug-zap"; fg: connect_server_action.has-hover ? #FFFFFF : Tokens.accent-text;
-                                                    x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
-                                                }
-                                                connect_server_action := KeyboardActionArea {
-                                                    accessible-name: @tr("Connect to {}", c.label);
-                                                    clicked => { root.selected-connection = c.id; root.connect-selected-to-pane(root.active-pane); }
-                                                }
+                                            ProtocolBadge { x: parent.width - 72px; y: 10px; protocol: c.protocol; compact: true; }
+                                            IconButton {
+                                                x: parent.width - 31px; y: 4px;
+                                                width: Tokens.control-compact; height: Tokens.control-compact;
+                                                icon: "log-in"; icon-size: Tokens.icon-small;
+                                                fg: Tokens.text-ter; hover-fg: Tokens.accent;
+                                                hover-background: Tokens.accent-soft;
+                                                accessible-name: @tr("Connect to {}", c.label);
+                                                clicked => { root.selected-connection = c.id; root.connect-selected-to-pane(root.active-pane); }
                                             }
                                         }
                                     }
@@ -2499,7 +2485,7 @@ export component App inherits Window {
                 y: 165px;
                 width: 580px; height: 400px;
                     background: Tokens.card; border-radius: 14px; border-width: 1px; border-color: Tokens.border-strong;
-                    drop-shadow-blur: 60px; drop-shadow-offset-y: 24px; drop-shadow-color: #00000066;
+                    drop-shadow-blur: 60px; drop-shadow-offset-y: 24px; drop-shadow-color: root.snapshot-mode ? transparent : #00000066;
                     clip: true;
                     TouchArea { clicked => { } }
                     VerticalLayout { padding: 0px; spacing: 0px;
@@ -2624,19 +2610,7 @@ export component App inherits Window {
                             }
                             Text { x: 58px; y: 0px; width: 120px; height: parent.height; text: @tr("Connections"); color: Tokens.text; font-size: 15px; font-weight: 700; vertical-alignment: center; horizontal-alignment: left; }
                             LabeledToolButton { x: 497px; y: 13px; width: 72px; icon: "plus"; icon-y-offset: 1px; text: I18n.new-cap; emphasized: true; clicked => { root.new-connection(); } }
-                            Rectangle {
-                                x: 579px; y: 13px; width: 83px; height: 30px; border-radius: 6px;
-                                background: import_manager_action.has-hover ? Tokens.row-hover : Tokens.surface-raised;
-                                border-width: 1px; border-color: import_manager_action.has-focus ? Tokens.accent : Tokens.border;
-                                HorizontalLayout { padding-left: 12px; padding-right: 12px; spacing: 6px; alignment: center;
-                                    Rectangle {
-                                        width: 15px; height: 17px; background: transparent;
-                                        Icon { kind: "download"; width: 15px; height: 15px; x: 0px; y: 7px; fg: Tokens.text-sec; }
-                                    }
-                                    Text { text: @tr("Import"); color: Tokens.text; font-size: 12px; font-weight: 500; vertical-alignment: center; }
-                                }
-                                import_manager_action := KeyboardActionArea { accessible-name: @tr("Import connections"); clicked => { root.import-forklift(); } }
-                            }
+                            LabeledToolButton { x: 579px; y: 13px; width: 83px; icon: "download"; text: @tr("Import"); clicked => { root.import-forklift(); } }
                             IconButton { icon: "x"; accessible-name: @tr("Close Connection Manager"); x: 672px; y: 13px; clicked => { root.manager-open = false; } }
                             Rectangle { y: parent.height - 1px; width: parent.width; height: 1px; background: Tokens.border; }
                         }
@@ -2651,7 +2625,7 @@ export component App inherits Window {
                                     ProtocolBadge { x: 10px; y: 15px; protocol: c.protocol; }
                                     Text { x: 68px; y: 10px; width: 362px; height: 16px; text: c.label; color: Tokens.text; font-size: 13px; font-weight: 600; vertical-alignment: center; horizontal-alignment: left; overflow: elide; }
                                     Text { x: 68px; y: 28px; width: 362px; height: 14px; text: c.sub; color: Tokens.text-sec; font-family: "JetBrains Mono"; font-size: 10px; vertical-alignment: center; horizontal-alignment: left; overflow: elide; }
-                                    ManagerActionButton { x: 442px; y: 12px; width: 88px; icon: "plug-zap"; text: I18n.connect; emphasized: true; clicked => { root.connect-to(c.id); root.manager-open = false; } }
+                                    ManagerActionButton { x: 442px; y: 12px; width: 88px; icon: "log-in"; text: I18n.connect; text-color: Tokens.accent-text; accent-color: Tokens.accent-text; clicked => { root.connect-to(c.id); root.manager-open = false; } }
                                     ManagerActionButton { x: 542px; y: 12px; width: 59px; icon: "edit"; text: I18n.edit-cap; text-color: Tokens.text-sec; accent-color: Tokens.text-sec; clicked => { root.edit-connection(c.id); } }
                                     ManagerActionButton { x: 613px; y: 12px; width: 73px; icon: "trash"; text: I18n.del-cap; text-color: Tokens.danger; accent-color: Tokens.danger; clicked => { root.delete-connection(c.id); } }
                                 }
@@ -2670,7 +2644,7 @@ export component App inherits Window {
                 y: (root.height - self.height) / 2;
                 width: 820px; height: 620px; background: Tokens.card;
                 border-radius: 14px; border-width: 1px; border-color: Tokens.border-strong;
-                drop-shadow-blur: 60px; drop-shadow-offset-y: 24px; drop-shadow-color: #00000066;
+                drop-shadow-blur: 60px; drop-shadow-offset-y: 24px; drop-shadow-color: root.snapshot-mode ? transparent : #00000066;
                 clip: true;
                 TouchArea { clicked => { } }
                 VerticalLayout { spacing: 0px;
@@ -2879,7 +2853,7 @@ export component App inherits Window {
                 y: (root.height - self.height) / 2;
                 width: 520px; height: min(root.height - 24px, 696px); background: Tokens.card;
                     border-radius: 14px; border-width: 1px; border-color: Tokens.border-strong;
-                    drop-shadow-blur: 60px; drop-shadow-offset-y: 24px; drop-shadow-color: #00000066;
+                    drop-shadow-blur: 60px; drop-shadow-offset-y: 24px; drop-shadow-color: root.snapshot-mode ? transparent : #00000066;
                     clip: true;
                     TouchArea { clicked => { } }
                     VerticalLayout { padding: 0px; spacing: 0px;
@@ -2887,7 +2861,7 @@ export component App inherits Window {
                             height: 52px; background: transparent;
                             Rectangle {
                                 x: 20px; y: 11px; width: 30px; height: 30px; border-radius: 6px; background: Tokens.accent-soft;
-                                Icon { kind: "plug-zap"; fg: Tokens.accent; width: 16px; height: 16px; x: 7px; y: 7px; }
+                                Icon { kind: "plug"; fg: Tokens.accent; width: Tokens.icon-regular; height: Tokens.icon-regular; x: 7px; y: 7px; }
                             }
                             Text { x: 60px; y: 0px; width: 260px; height: 52px; text: root.editor-id < 0 ? I18n.new-conn : I18n.edit-conn; color: Tokens.text; font-size: 15px; font-weight: 700; vertical-alignment: center; horizontal-alignment: left; }
                             IconButton { icon: "x"; accessible-name: @tr("Close connection editor"); x: parent.width - 50px; y: 11px; clicked => { root.editor-password = ""; root.editor-sftp-key-path = ""; root.editor-tls-client-cert = ""; root.editor-tls-client-key = ""; root.editor-open = false; } }
@@ -3100,7 +3074,7 @@ export component App inherits Window {
                 width: 620px; height: 500px;
                 background: Tokens.surface-raised;
                 border-radius: 14px; border-width: 1px; border-color: Tokens.border-strong;
-                drop-shadow-blur: 60px; drop-shadow-offset-y: 24px; drop-shadow-color: #00000066;
+                drop-shadow-blur: 60px; drop-shadow-offset-y: 24px; drop-shadow-color: root.snapshot-mode ? transparent : #00000066;
                 clip: true;
                 TouchArea { clicked => { } }
                 VerticalLayout { padding: 22px; spacing: 12px;

@@ -157,23 +157,30 @@ impl QueueControls {
 enum EndpointQueueEvent {
     Run(Box<QueuedTransfer>),
     Abort,
+    EnvironmentChanged,
 }
 
 struct EndpointQueue {
     pending: Mutex<Vec<QueuedTransfer>>,
     controls: Arc<QueueControls>,
     globally_paused: Arc<AtomicBool>,
+    environment_generation: Arc<AtomicU64>,
     desired_lanes: AtomicUsize,
     abort_serial: AtomicU64,
     notify: Notify,
 }
 
 impl EndpointQueue {
-    fn new(controls: Arc<QueueControls>, globally_paused: Arc<AtomicBool>) -> Arc<Self> {
+    fn new(
+        controls: Arc<QueueControls>,
+        globally_paused: Arc<AtomicBool>,
+        environment_generation: Arc<AtomicU64>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             pending: Mutex::new(Vec::new()),
             controls,
             globally_paused,
+            environment_generation,
             desired_lanes: AtomicUsize::new(1),
             abort_serial: AtomicU64::new(0),
             notify: Notify::new(),
@@ -201,7 +208,12 @@ impl EndpointQueue {
         self.notify.notify_waiters();
     }
 
-    async fn next(&self, lane: usize, seen_abort: &mut u64) -> EndpointQueueEvent {
+    async fn next(
+        &self,
+        lane: usize,
+        seen_abort: &mut u64,
+        seen_environment: &mut u64,
+    ) -> EndpointQueueEvent {
         loop {
             // Register before inspecting state so a wake between inspection and await is retained.
             let notified = self.notify.notified();
@@ -209,6 +221,11 @@ impl EndpointQueue {
             if abort_serial != *seen_abort {
                 *seen_abort = abort_serial;
                 return EndpointQueueEvent::Abort;
+            }
+            let environment_generation = self.environment_generation.load(Ordering::Acquire);
+            if environment_generation != *seen_environment {
+                *seen_environment = environment_generation;
+                return EndpointQueueEvent::EnvironmentChanged;
             }
             if lane < self.desired_lanes.load(Ordering::Relaxed)
                 && !self.globally_paused.load(Ordering::Relaxed)
@@ -428,10 +445,14 @@ impl BandwidthLimiter {
     fn set_limit(&self, limit_kib_per_sec: u64) -> u64 {
         let limit = normalize_bandwidth_limit(limit_kib_per_sec);
         self.limit_kib_per_sec.store(limit, Ordering::Relaxed);
+        self.reset_schedule();
+        limit
+    }
+
+    fn reset_schedule(&self) {
         if let Ok(mut next) = self.next_available.lock() {
             *next = Instant::now();
         }
-        limit
     }
 
     fn throttle(&self, bytes: u64, cancelled: &AtomicBool) {
@@ -497,6 +518,8 @@ struct EndpointWorkerContext {
     retry_count: Arc<AtomicUsize>,
     retry_backoff_ms: Arc<AtomicU64>,
     bandwidth_limiter: Arc<BandwidthLimiter>,
+    environment_generation: Arc<AtomicU64>,
+    reconnect_generation: Arc<AtomicU64>,
     persistence: Arc<QueuePersistence>,
 }
 
@@ -534,6 +557,12 @@ pub struct TransferEngine {
     retry_count: Arc<AtomicUsize>,
     retry_backoff_ms: Arc<AtomicU64>,
     bandwidth_limiter: Arc<BandwidthLimiter>,
+    /// Incremented whenever sleep/wake or an interface transition may have invalidated an
+    /// authenticated socket. This never changes a connection epoch and therefore never skips work.
+    environment_generation: Arc<AtomicU64>,
+    /// Incremented only when a usable interface is present, allowing retry backoff to end early
+    /// after connectivity returns without burning attempts while the machine remains offline.
+    reconnect_generation: Arc<AtomicU64>,
     cancelled_jobs: Arc<Mutex<HashSet<usize>>>,
     jobs: Arc<Mutex<HashMap<usize, (TransferJob, ConnectionSpec)>>>,
     queue_controls: Arc<QueueControls>,
@@ -576,6 +605,8 @@ impl TransferEngine {
         let retry_backoff_ms = Arc::new(AtomicU64::new(settings.transfer_retry_backoff_ms));
         let bandwidth_limiter =
             Arc::new(BandwidthLimiter::new(settings.transfer_bandwidth_limit_kib));
+        let environment_generation = Arc::new(AtomicU64::new(0));
+        let reconnect_generation = Arc::new(AtomicU64::new(0));
         let queue_controls = Arc::new(QueueControls::default());
         let endpoint_queues: EndpointQueues = Arc::new(Mutex::new(HashMap::new()));
         let worker_context = EndpointWorkerContext {
@@ -592,12 +623,15 @@ impl TransferEngine {
             retry_count: retry_count.clone(),
             retry_backoff_ms: retry_backoff_ms.clone(),
             bandwidth_limiter: bandwidth_limiter.clone(),
+            environment_generation: environment_generation.clone(),
+            reconnect_generation: reconnect_generation.clone(),
             persistence: persistence.clone(),
         };
         let dispatcher_default_server_concurrency = default_server_concurrency.clone();
         let dispatcher_controls = queue_controls.clone();
         let dispatcher_paused = paused.clone();
         let dispatcher_queues = endpoint_queues.clone();
+        let dispatcher_environment_generation = environment_generation.clone();
         tokio::spawn(async move {
             struct EndpointPool {
                 queue: Arc<EndpointQueue>,
@@ -623,8 +657,11 @@ impl TransferEngine {
                     })
                     .clamp(MIN_SERVER_CONCURRENCY, MAX_SERVER_CONCURRENCY);
                 let pool = workers.entry(cid).or_insert_with(|| {
-                    let queue =
-                        EndpointQueue::new(dispatcher_controls.clone(), dispatcher_paused.clone());
+                    let queue = EndpointQueue::new(
+                        dispatcher_controls.clone(),
+                        dispatcher_paused.clone(),
+                        dispatcher_environment_generation.clone(),
+                    );
                     if let Ok(mut queues) = dispatcher_queues.lock() {
                         queues.insert(cid, Arc::downgrade(&queue));
                     }
@@ -650,6 +687,8 @@ impl TransferEngine {
             retry_count,
             retry_backoff_ms,
             bandwidth_limiter,
+            environment_generation,
+            reconnect_generation,
             cancelled_jobs,
             jobs,
             queue_controls,
@@ -828,6 +867,19 @@ impl TransferEngine {
     /// Set an aggregate ceiling shared by every endpoint lane. Zero disables throttling.
     pub fn set_bandwidth_limit_kib(&self, limit_kib_per_sec: u64) -> u64 {
         self.bandwidth_limiter.set_limit(limit_kib_per_sec)
+    }
+
+    /// Invalidate reusable protocol sessions after sleep/wake or a network-interface transition.
+    /// Queued and active jobs keep their connection epochs and resumable fragments. When a usable
+    /// link is present, sleeping retries are also released immediately so recovery does not wait
+    /// for the remainder of an exponential backoff.
+    pub fn network_environment_changed(&self, network_available: bool) {
+        self.environment_generation.fetch_add(1, Ordering::AcqRel);
+        if network_available {
+            self.reconnect_generation.fetch_add(1, Ordering::AcqRel);
+        }
+        self.bandwidth_limiter.reset_schedule();
+        wake_endpoint_queues(&self.endpoint_queues);
     }
 
     pub fn cancel_job(&self, id: TransferId) {
@@ -1033,11 +1085,13 @@ fn spawn_endpoint_worker(context: EndpointWorkerContext, queue: Arc<EndpointQueu
     tokio::spawn(async move {
         let mut active_session: Option<ActiveTransferSession> = None;
         let mut seen_abort = queue.abort_serial.load(Ordering::Relaxed);
+        let mut seen_environment = queue.environment_generation.load(Ordering::Acquire);
+        let mut session_environment = seen_environment;
         loop {
             let event = if active_session.is_some() {
                 match tokio::time::timeout(
                     TRANSFER_SESSION_IDLE_TIMEOUT,
-                    queue.next(lane, &mut seen_abort),
+                    queue.next(lane, &mut seen_abort, &mut seen_environment),
                 )
                 .await
                 {
@@ -1050,7 +1104,9 @@ fn spawn_endpoint_worker(context: EndpointWorkerContext, queue: Arc<EndpointQueu
                     }
                 }
             } else {
-                queue.next(lane, &mut seen_abort).await
+                queue
+                    .next(lane, &mut seen_abort, &mut seen_environment)
+                    .await
             };
 
             let (job, spec, epoch) = match event {
@@ -1058,6 +1114,13 @@ fn spawn_endpoint_worker(context: EndpointWorkerContext, queue: Arc<EndpointQueu
                     if let Some(session) = active_session.take() {
                         session.close().await;
                     }
+                    continue;
+                }
+                EndpointQueueEvent::EnvironmentChanged => {
+                    if let Some(session) = active_session.take() {
+                        session.close().await;
+                    }
+                    session_environment = seen_environment;
                     continue;
                 }
                 EndpointQueueEvent::Run(queued) => (queued.job, queued.spec, queued.epoch),
@@ -1159,6 +1222,15 @@ fn spawn_endpoint_worker(context: EndpointWorkerContext, queue: Arc<EndpointQueu
             let mut permit = Some(permit);
             let mut retry_number = 0usize;
             let outcome = loop {
+                let current_environment = context.environment_generation.load(Ordering::Acquire);
+                if current_environment != session_environment {
+                    if let Some(session) = active_session.take() {
+                        session.close().await;
+                    }
+                    session_environment = current_environment;
+                }
+                let attempt_reconnect_generation =
+                    context.reconnect_generation.load(Ordering::Acquire);
                 let outcome = run_one(
                     &context.store,
                     &context.updates,
@@ -1212,6 +1284,7 @@ fn spawn_endpoint_worker(context: EndpointWorkerContext, queue: Arc<EndpointQueu
                     &flag,
                     connection_id,
                     epoch,
+                    attempt_reconnect_generation,
                 )
                 .await
                 {
@@ -1319,6 +1392,7 @@ async fn wait_for_retry(
     flag: &AtomicBool,
     connection_id: usize,
     epoch: u64,
+    attempt_reconnect_generation: u64,
 ) -> bool {
     let deadline = tokio::time::Instant::now() + delay;
     loop {
@@ -1327,11 +1401,27 @@ async fn wait_for_retry(
         {
             return false;
         }
-        if tokio::time::Instant::now() >= deadline && !context.paused.load(Ordering::Relaxed) {
+        let deadline_reached = tokio::time::Instant::now() >= deadline;
+        let reconnect_generation = context.reconnect_generation.load(Ordering::Acquire);
+        if retry_wait_complete(
+            context.paused.load(Ordering::Relaxed),
+            deadline_reached,
+            attempt_reconnect_generation,
+            reconnect_generation,
+        ) {
             return true;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+fn retry_wait_complete(
+    paused: bool,
+    deadline_reached: bool,
+    attempt_reconnect_generation: u64,
+    current_reconnect_generation: u64,
+) -> bool {
+    !paused && (deadline_reached || attempt_reconnect_generation != current_reconnect_generation)
 }
 
 async fn run_one(
@@ -1693,6 +1783,14 @@ mod batch_failure_tests {
     }
 
     #[test]
+    fn restored_connectivity_releases_backoff_but_offline_state_does_not() {
+        assert!(!retry_wait_complete(false, false, 7, 7));
+        assert!(retry_wait_complete(false, true, 7, 7));
+        assert!(retry_wait_complete(false, false, 7, 8));
+        assert!(!retry_wait_complete(true, true, 7, 8));
+    }
+
+    #[test]
     fn bandwidth_limit_supports_unlimited_and_safe_bounds() {
         assert_eq!(normalize_bandwidth_limit(0), 0);
         assert_eq!(
@@ -1952,6 +2050,50 @@ mod batch_failure_tests {
             .unwrap();
         assert_eq!(new.id, TransferId(2));
         assert!(matches!(new.state, TransferState::Failed(_)));
+    }
+
+    #[tokio::test]
+    async fn network_loss_and_recovery_keep_queued_work_resumable() {
+        let (updates, mut rx) = mpsc::channel(8);
+        let engine = TransferEngine::start(Arc::new(InMemoryStore::default()), updates);
+        let connection = spec();
+        let epoch = engine.connection_epoch(connection.id);
+        let environment = engine.environment_generation.load(Ordering::Acquire);
+        let reconnect = engine.reconnect_generation.load(Ordering::Acquire);
+
+        engine.set_paused(true);
+        engine
+            .enqueue(job(30, 130, false), connection.clone())
+            .await;
+        engine.network_environment_changed(false);
+        assert_eq!(engine.connection_epoch(connection.id), epoch);
+        assert_eq!(
+            engine.environment_generation.load(Ordering::Acquire),
+            environment + 1
+        );
+        assert_eq!(
+            engine.reconnect_generation.load(Ordering::Acquire),
+            reconnect
+        );
+
+        engine.network_environment_changed(true);
+        assert_eq!(engine.connection_epoch(connection.id), epoch);
+        assert_eq!(
+            engine.environment_generation.load(Ordering::Acquire),
+            environment + 2
+        );
+        assert_eq!(
+            engine.reconnect_generation.load(Ordering::Acquire),
+            reconnect + 1
+        );
+        engine.set_paused(false);
+
+        let result = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.id, TransferId(30));
+        assert!(matches!(result.state, TransferState::Failed(_)));
     }
 
     #[tokio::test]

@@ -6,6 +6,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=MACKFTP_CONFIG_QUALIFIER");
     println!("cargo:rerun-if-env-changed=MACKFTP_CONFIG_ORGANIZATION");
     println!("cargo:rerun-if-env-changed=MACKFTP_CONFIG_APPLICATION");
+    println!("cargo:rerun-if-env-changed=MACKFTP_RENDER_CHECK");
 
     let bundle_id =
         std::env::var("MACKFTP_BUNDLE_ID").unwrap_or_else(|_| "app.mackftp.client".to_string());
@@ -25,9 +26,15 @@ fn main() {
     // Slint's UI-tree test API needs compiler metadata. Keep it in development/test builds only;
     // signed release binaries do not carry this introspection data.
     let include_ui_debug_info = std::env::var("PROFILE").is_ok_and(|profile| profile != "release");
-    let config = slint_build::CompilerConfiguration::new()
+    let mut config = slint_build::CompilerConfiguration::new()
         .with_bundled_translations("translations")
         .with_default_translation_context(slint_build::DefaultTranslationContext::None)
         .with_debug_info(include_ui_debug_info);
+    // The tracked render-check example uses Slint's headless software renderer. Optimize and
+    // embed fonts only for that explicit development command; public release builds keep the
+    // normal FemtoVG/wgpu resource path and binary footprint.
+    if std::env::var_os("MACKFTP_RENDER_CHECK").is_some() {
+        config = config.embed_resources(slint_build::EmbedResourcesKind::EmbedForSoftwareRenderer);
+    }
     slint_build::compile_with_config("ui/app.slint", config).expect("Slint UI compilation failed");
 }

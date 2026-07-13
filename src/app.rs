@@ -131,7 +131,83 @@ const REMOTE_FOLDER_STATS_CACHE_TTL: Duration = Duration::from_secs(15);
 const REMOTE_METADATA_IDLE_DELAY: Duration = Duration::from_millis(300);
 const REMOTE_METADATA_CONCURRENCY: usize = 2;
 const MAX_RECURSIVE_METADATA_JOBS: usize = 2;
+#[cfg(target_os = "macos")]
+const NETWORK_ENVIRONMENT_POLL_INTERVAL: Duration = Duration::from_secs(2);
+#[cfg(target_os = "macos")]
+const SYSTEM_SUSPENSION_GAP: Duration = Duration::from_secs(8);
 static RECURSIVE_METADATA_ACTIVE: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy)]
+struct EnvironmentChangeDetector {
+    last_tick: SystemTime,
+    network_available: bool,
+}
+
+#[cfg(target_os = "macos")]
+impl EnvironmentChangeDetector {
+    fn new(now: SystemTime, network_available: bool) -> Self {
+        Self {
+            last_tick: now,
+            network_available,
+        }
+    }
+
+    fn observe(&mut self, now: SystemTime, network_available: bool) -> bool {
+        let resumed_after_gap = now
+            .duration_since(self.last_tick)
+            .map_or(true, |elapsed| elapsed > SYSTEM_SUSPENSION_GAP);
+        let interface_changed = network_available != self.network_available;
+        self.last_tick = now;
+        self.network_available = network_available;
+        resumed_after_gap || interface_changed
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn is_route_capable_interface_name(name: &str) -> bool {
+    ["en", "bridge", "bond", "utun", "ppp", "ipsec", "tap", "tun"]
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+}
+
+/// Inspect local interface state only. `getifaddrs` reads the kernel's current interface table and
+/// sends no DNS query or network packet. On an inspection failure we fail open: retaining the
+/// normal retry schedule is safer than declaring an otherwise healthy Mac offline.
+#[cfg(target_os = "macos")]
+fn network_link_available() -> bool {
+    use std::ffi::CStr;
+
+    let mut head = std::ptr::null_mut();
+    // SAFETY: `getifaddrs` initializes a linked list owned by libc. Every pointer is checked before
+    // dereferencing and `freeifaddrs` is called exactly once for a successful allocation.
+    if unsafe { libc::getifaddrs(&mut head) } != 0 {
+        return true;
+    }
+    let mut cursor = head;
+    let mut available = false;
+    while !cursor.is_null() {
+        // SAFETY: `cursor` comes from the live list returned by `getifaddrs`.
+        let interface = unsafe { &*cursor };
+        if !interface.ifa_addr.is_null() && !interface.ifa_name.is_null() {
+            let flags = interface.ifa_flags as i32;
+            // SAFETY: `ifa_addr` and `ifa_name` were checked and remain valid until freeifaddrs.
+            let family = unsafe { (*interface.ifa_addr).sa_family as i32 };
+            let name = unsafe { CStr::from_ptr(interface.ifa_name) }.to_string_lossy();
+            let has_ip = matches!(family, libc::AF_INET | libc::AF_INET6);
+            let is_up = flags & libc::IFF_UP != 0;
+            let is_loopback = flags & libc::IFF_LOOPBACK != 0;
+            if has_ip && is_up && !is_loopback && is_route_capable_interface_name(&name) {
+                available = true;
+                break;
+            }
+        }
+        cursor = interface.ifa_next;
+    }
+    // SAFETY: successful `getifaddrs` returned `head`, including a permitted null empty list.
+    unsafe { libc::freeifaddrs(head) };
+    available
+}
 
 struct RecursiveMetadataPermit;
 
@@ -1249,6 +1325,39 @@ pub fn run() {
             _ => {}
         }
     }
+
+    // A Mac may retain authenticated sockets across sleep even though their TCP routes are no
+    // longer valid. Interface transitions and a suspended event-loop gap therefore invalidate
+    // only reusable protocol sessions; transfer jobs, resumable fragments, and user pause state
+    // stay intact. The probe reads local kernel state and never contacts an external endpoint.
+    #[cfg(target_os = "macos")]
+    let _network_environment_monitor = {
+        let timer = slint::Timer::default();
+        let initial_link = network_link_available();
+        let detector = Rc::new(Cell::new(EnvironmentChangeDetector::new(
+            SystemTime::now(),
+            initial_link,
+        )));
+        let detector_for_tick = detector.clone();
+        let engine_for_tick = engine.clone();
+        timer.start(
+            slint::TimerMode::Repeated,
+            NETWORK_ENVIRONMENT_POLL_INTERVAL,
+            move || {
+                let network_available = network_link_available();
+                let mut detector = detector_for_tick.get();
+                if detector.observe(SystemTime::now(), network_available) {
+                    tracing::info!(
+                        network_available,
+                        "network environment changed; refreshing transfer sessions"
+                    );
+                    engine_for_tick.network_environment_changed(network_available);
+                }
+                detector_for_tick.set(detector);
+            },
+        );
+        timer
+    };
 
     if benchmark {
         // `scripts/bench-cold-start.sh` measures real platform/UI/controller construction but
@@ -11472,6 +11581,30 @@ mod path_safety_tests {
         path
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn environment_detector_distinguishes_polling_network_changes_and_wake_gaps() {
+        let start = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let mut detector = EnvironmentChangeDetector::new(start, true);
+        assert!(!detector.observe(start + Duration::from_secs(2), true));
+        assert!(detector.observe(start + Duration::from_secs(4), false));
+        assert!(!detector.observe(start + Duration::from_secs(6), false));
+        assert!(detector.observe(start + Duration::from_secs(8), true));
+        assert!(detector.observe(start + Duration::from_secs(20), true));
+        assert!(detector.observe(start, true));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn only_route_capable_macos_interfaces_drive_transfer_recovery() {
+        for name in ["en0", "bridge100", "utun3", "ppp0", "ipsec0"] {
+            assert!(is_route_capable_interface_name(name));
+        }
+        for name in ["lo0", "awdl0", "llw0", "anpi0", "gif0"] {
+            assert!(!is_route_capable_interface_name(name));
+        }
+    }
+
     fn send_key(ui: &App, key: impl Into<slint::SharedString>, pressed: bool) {
         let text = key.into();
         ui.window().dispatch_event(if pressed {
@@ -11551,6 +11684,27 @@ mod path_safety_tests {
             "a physical pointer click must reach custom toolbar controls"
         );
 
+        // Compact sidebar actions deliberately keep a 28 px hit target around a 12 px glyph.
+        // Guard both the geometry and the physical event path: visual refinement must never make
+        // the server action hard to hit or reintroduce the v0.2.0 click-through regression.
+        ui.set_filtered_connections(ModelRc::from(Rc::new(VecModel::from(vec![ConnRow {
+            id: 17,
+            label: "Demo".into(),
+            sub: "ftp.example.com".into(),
+            protocol: "FTP".into(),
+            connected: false,
+        }]))));
+        let sidebar_connects = Rc::new(RefCell::new(Vec::new()));
+        let recorded = sidebar_connects.clone();
+        ui.on_connect_selected_to_pane(move |pane| recorded.borrow_mut().push(pane.to_string()));
+        let sidebar_connect = ElementHandle::find_by_accessible_label(&ui, "Connect to Demo")
+            .next()
+            .expect("the compact saved-server action must be exposed");
+        let sidebar_size = sidebar_connect.size();
+        assert_eq!((sidebar_size.width, sidebar_size.height), (28.0, 28.0));
+        sidebar_connect.mock_single_click(slint::platform::PointerEventButton::Left);
+        assert_eq!(sidebar_connects.borrow().as_slice(), &["local"]);
+
         let filter = ElementHandle::find_by_accessible_label(&ui, "Filter files in left pane")
             .next()
             .expect("the left file filter must be exposed as a text field");
@@ -11584,6 +11738,43 @@ mod path_safety_tests {
             .accessible_value()
             .and_then(|value| value.parse::<f32>().ok())
             .is_some_and(|value| value >= 220.0));
+
+        // The updater is a full-window overlay. Its two actions must remain physically clickable;
+        // this specifically guards the failure mode where a transparent scrim or a zero-sized
+        // custom action area leaves the dialog visible but inert.
+        let update_downloads = Rc::new(Cell::new(0));
+        let recorded = update_downloads.clone();
+        ui.on_download_update(move || recorded.set(recorded.get() + 1));
+        let update_dismisses = Rc::new(Cell::new(0));
+        let recorded = update_dismisses.clone();
+        ui.on_dismiss_update(move || recorded.set(recorded.get() + 1));
+        ui.set_update_version("0.2.2".into());
+        ui.set_update_notes("Pointer regression check".into());
+        ui.set_update_open(true);
+
+        let download = ElementHandle::find_by_accessible_label(&ui, "Download & Verify")
+            .next()
+            .expect("the updater download action must be exposed");
+        let download_size = download.size();
+        assert!(download_size.width > 0.0 && download_size.height > 0.0);
+        download.mock_single_click(slint::platform::PointerEventButton::Left);
+        assert_eq!(
+            update_downloads.get(),
+            1,
+            "the updater download action must receive a physical pointer click"
+        );
+
+        let later = ElementHandle::find_by_accessible_label(&ui, "Later")
+            .next()
+            .expect("the updater dismiss action must be exposed");
+        let later_size = later.size();
+        assert!(later_size.width > 0.0 && later_size.height > 0.0);
+        later.mock_single_click(slint::platform::PointerEventButton::Left);
+        assert_eq!(
+            update_dismisses.get(),
+            1,
+            "the updater dismiss action must receive a physical pointer click"
+        );
     }
 
     #[test]

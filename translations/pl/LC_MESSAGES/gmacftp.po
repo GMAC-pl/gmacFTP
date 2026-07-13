@@ -1090,7 +1090,7 @@ msgid "Stopped"
 msgstr "Zatrzymany"
 
 msgid "Sync"
-msgstr "Synchronizacja"
+msgstr "Synchronizuj"
 
 msgid "TAGS"
 msgstr "TAGI"

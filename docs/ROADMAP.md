@@ -1,5 +1,8 @@
 # gmacFTP improvement roadmap
 
+> This post-0.1.1 roadmap is complete. Current development continues in
+> [`ROADMAP_0.3_TO_1.0.md`](ROADMAP_0.3_TO_1.0.md).
+
 This is the implementation checklist for the post-0.1.1 hardening and product work. Items are
 checked only after the implementation, automated tests, and relevant manual verification are done.
 Security and data-integrity work comes before convenience features.

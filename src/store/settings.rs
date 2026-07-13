@@ -372,15 +372,18 @@ pub fn load() -> Settings {
     let Some(p) = path() else {
         return Settings::default();
     };
-    let settings = match read_regular_limited(&p, MAX_SETTINGS_BYTES) {
-        Ok(bytes) if !bytes.iter().all(u8::is_ascii_whitespace) => serde_json::from_slice(&bytes)
+    match read_regular_limited(&p, MAX_SETTINGS_BYTES) {
+        Ok(bytes) if !bytes.iter().all(u8::is_ascii_whitespace) => parse_and_validate(&bytes)
             .unwrap_or_else(|e| {
                 tracing::warn!(error = %e, "settings parse failed; using defaults");
                 Settings::default()
             }),
         _ => Settings::default(),
-    };
-    validate(settings)
+    }
+}
+
+fn parse_and_validate(bytes: &[u8]) -> Result<Settings, serde_json::Error> {
+    serde_json::from_slice(bytes).map(validate)
 }
 
 /// Normalize every value that can influence resource use or behavior. Applied both after reading
@@ -745,6 +748,89 @@ pub fn try_save(s: &Settings) -> Result<(), std::io::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const SETTINGS_V0_0_17: &[u8] =
+        include_bytes!("../../tests/fixtures/migrations/v0.0.17/settings.json");
+    const SETTINGS_V0_1_1: &[u8] =
+        include_bytes!("../../tests/fixtures/migrations/v0.1.1/settings.json");
+    const SETTINGS_V0_2_0: &[u8] =
+        include_bytes!("../../tests/fixtures/migrations/v0.2.0/settings.json");
+
+    #[test]
+    fn clean_install_defaults_are_offline_strict_and_non_destructive() {
+        let settings = Settings::default();
+        assert!(!settings.accept_any_cert);
+        assert!(!settings.check_updates_automatically);
+        assert!(!settings.sync_via_icloud);
+        assert!(settings.confirm_deletes);
+        assert!(settings.remote_quarantine_deletes);
+        assert_eq!(settings.existing_file_policy, "ask");
+        assert_eq!(settings.batch_error_policy, "ask");
+        assert_eq!(settings.queue_recovery_policy, "ask");
+        assert!(settings.last_left_local_path.is_none());
+        assert!(settings.last_right_local_path.is_none());
+        assert!(settings.sync_profiles.is_empty());
+        assert!(settings.remote_places.is_empty());
+    }
+
+    #[test]
+    fn settings_fixture_from_v0_0_x_migrates_with_safe_new_defaults() {
+        let settings = parse_and_validate(SETTINGS_V0_0_17).unwrap();
+        assert_eq!(settings.locale, "pl");
+        assert_eq!(settings.theme, "dark");
+        assert_eq!(settings.local_favorites, ["/Users/demo/Sites"]);
+        assert_eq!(settings.transfer_concurrency, DEFAULT_TRANSFER_CONCURRENCY);
+        assert_eq!(
+            settings.per_server_transfer_concurrency,
+            DEFAULT_SERVER_TRANSFER_CONCURRENCY
+        );
+        assert!(!settings.check_updates_automatically);
+        assert!(!settings.sync_via_icloud);
+        assert!(settings.keychain_migrated_v2);
+        assert!(!settings.endpoint_credentials_migrated_v2);
+        assert_eq!(settings.editor_temp_retention, "on_error");
+    }
+
+    #[test]
+    fn settings_fixture_from_v0_1_x_preserves_bounded_user_choices() {
+        let settings = parse_and_validate(SETTINGS_V0_1_1).unwrap();
+        assert_eq!(settings.transfer_concurrency, 5);
+        assert_eq!(settings.local_favorites.len(), 2);
+        assert!(settings.keychain_migrated_v2);
+        assert!(settings.endpoint_credentials_migrated_v2);
+        assert!(!settings.check_updates_automatically);
+        assert!(!settings.sync_via_icloud);
+        assert!(settings.confirm_deletes);
+    }
+
+    #[test]
+    fn settings_fixture_from_v0_2_x_runs_current_normalization() {
+        let settings = parse_and_validate(SETTINGS_V0_2_0).unwrap();
+        assert_eq!(settings.transfer_concurrency, 4);
+        assert_eq!(settings.per_server_transfer_concurrency, 2);
+        assert_eq!(
+            settings.last_left_local_path.as_deref(),
+            Some("/Users/demo/Sites")
+        );
+        assert_eq!(settings.sync_comparison, "size_only");
+        assert_eq!(settings.sync_profiles.len(), 1);
+        assert_eq!(settings.sync_profiles[0].comparison, "size_only");
+        assert_eq!(settings.remote_places.len(), 1);
+        assert_eq!(settings.editor_temp_retention, "cleanup");
+        assert!(!settings.editor_retain_on_error);
+    }
+
+    #[test]
+    fn tracked_migration_settings_are_demo_only_and_password_free() {
+        for bytes in [SETTINGS_V0_0_17, SETTINGS_V0_1_1, SETTINGS_V0_2_0] {
+            let text = std::str::from_utf8(bytes).unwrap();
+            assert!(!text.replace("/Users/demo", "").contains("/Users/"));
+            assert!(!text.contains("\"password\":"));
+            assert!(!text.contains("\"secret\":"));
+            assert!(!text.contains("\"token\":"));
+            assert!(text.contains("/Users/demo") || text.contains("\"sync_folder\": null"));
+        }
+    }
 
     #[test]
     fn old_migration_flag_does_not_skip_endpoint_key_upgrade() {

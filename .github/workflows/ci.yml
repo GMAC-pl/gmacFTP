@@ -25,7 +25,7 @@ jobs:
         with:
           toolchain: stable
           components: clippy, rustfmt
-          targets: aarch64-apple-darwin,x86_64-apple-darwin
+          targets: aarch64-apple-darwin
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       # Formatting gate: the tree must stay rustfmt-clean (cargo fmt is part of the build contract).
       - run: cargo fmt --all -- --check
@@ -36,17 +36,14 @@ jobs:
       # Run unit, integration and example targets. Tests that need an explicitly configured
       # external server skip safely when that server is absent.
       - run: cargo test --all-targets
-      # Both public release architectures must compile on every change. The release script joins
-      # these exact outputs with lipo and verifies the resulting universal binary before signing.
+      # Deterministic screenshots exercise the real Slint tree in both themes and with every
+      # important overlay. Fixtures contain example.com hosts and /Users/demo paths only.
+      - run: bash scripts/check-ui-render.sh /tmp/gmacftp-render-check
+      # The public release target must compile on every change. Distribution is intentionally
+      # Apple Silicon-only; the release script verifies the arm64 image before signing.
       - run: cargo build --release --locked --target aarch64-apple-darwin
-      - run: cargo build --release --locked --target x86_64-apple-darwin
       - run: |
-          lipo -create \
-            target/aarch64-apple-darwin/release/gmacftp \
-            target/x86_64-apple-darwin/release/gmacftp \
-            -output /tmp/gmacftp-universal
-          test "$(lipo -archs /tmp/gmacftp-universal)" = "x86_64 arm64" || \
-            test "$(lipo -archs /tmp/gmacftp-universal)" = "arm64 x86_64"
+          test "$(lipo -archs target/aarch64-apple-darwin/release/gmacftp)" = "arm64"
       - run: bash -n scripts/build-app.sh scripts/build-dmg.sh
 
   # Dependency vulnerability gate. We run `cargo audit` directly (NOT the rustsec/audit-check

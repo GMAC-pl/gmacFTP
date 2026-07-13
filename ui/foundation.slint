@@ -51,6 +51,13 @@ export global Tokens {
     out property <length> r-button: 7px;
     out property <length> r-track:  3px;
     out property <length> r-chip:   4px;
+    // Optical icon and control scale. The clickable surface may be larger than the glyph inside;
+    // this keeps compact sidebar actions easy to hit without making them visually dominant.
+    out property <length> icon-small:     12px;
+    out property <length> icon-regular:   16px;
+    out property <length> icon-large:     24px;
+    out property <length> control-compact: 28px;
+    out property <length> control-toolbar: 32px;
 }
 export global I18n {
     in-out property <string> locale: "en";
@@ -109,7 +116,7 @@ export global Fmt {
         clamp((y - top + 15px) / 30px, 0, count)
     }
     public pure function saved-drop-index(y: length, top: length, count: int) -> int {
-        clamp((y - top + 16px) / 32px, 0, count)
+        clamp((y - top + 18px) / 36px, 0, count)
     }
 }
 
