@@ -354,13 +354,12 @@ fn parse_config_text(text: &str) -> Result<SshConfig, NetError> {
                 &mut params.proxy_jump,
                 vec![one_argument(arguments, "ProxyJump", line_number)?.to_string()],
             ),
-            "proxycommand" => {
+            "proxycommand"
                 if !arguments
                     .first()
-                    .is_some_and(|value| value.eq_ignore_ascii_case("none"))
-                {
-                    params.proxy_command = true;
-                }
+                    .is_some_and(|value| value.eq_ignore_ascii_case("none")) =>
+            {
+                params.proxy_command = true;
             }
             _ => {}
         }

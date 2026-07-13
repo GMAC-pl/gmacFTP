@@ -51,7 +51,7 @@ jobs:
 
   # Dependency vulnerability gate. We run `cargo audit` directly (NOT the rustsec/audit-check
   # action — it has no way to disable failing on unmaintained/unsound *warnings*, of which there
-  # are currently 14 mostly-Linux-only transitive deps via Slint's winit backends). cargo-audit's own
+  # are currently 15 mostly-Linux-only transitive deps via Slint's winit backends). cargo-audit's own
   # exit code drives pass/fail: non-zero ONLY on real vulnerabilities (after the ignores), zero
   # on informational warnings. See SECURITY.md for the full classification.
   #

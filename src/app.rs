@@ -7415,7 +7415,7 @@ fn compare_directory_entry(
         (Some(_), None) => "left_only",
         (None, Some(_)) => "right_only",
         (Some(left), Some(right)) if left.is_dir != right.is_dir => "type",
-        (Some(left), Some(right)) if left.is_dir => "same",
+        (Some(left), Some(_)) if left.is_dir => "same",
         (Some(left), Some(right)) if left.size != right.size => "size",
         (Some(left), Some(right)) => match (left.mtime, right.mtime) {
             (Some(left), Some(right)) if left.abs_diff(right) > 2 && left > right => "left_newer",

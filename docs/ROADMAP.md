@@ -6,14 +6,14 @@ Security and data-integrity work comes before convenience features.
 
 ## Definition of done
 
-- [ ] `cargo fmt --check`, `cargo check --all-targets`, `cargo clippy --all-targets -- -D warnings`,
+- [x] `cargo fmt --check`, `cargo check --all-targets`, `cargo clippy --all-targets -- -D warnings`,
       and `cargo test --all-targets` pass.
-- [ ] Network and filesystem failure paths have regression tests; no completed transfer is reported
+- [x] Network and filesystem failure paths have regression tests; no completed transfer is reported
       before the destination is safely finalized.
-- [ ] No credentials, private server data, local account paths, signing secrets, or unrelated
+- [x] No credentials, private server data, local account paths, signing secrets, or unrelated
       contributor attribution are added to tracked files or release artifacts.
-- [ ] User-facing behavior is documented in English and Polish where the README exposes it.
-- [ ] The signed/notarized release is built only after all milestones intended for that release pass.
+- [x] User-facing behavior is documented in English and Polish where the README exposes it.
+- [x] The signed/notarized release is built only after all milestones intended for that release pass.
 
 ## Milestone A — data integrity and recovery
 
@@ -101,5 +101,5 @@ Security and data-integrity work comes before convenience features.
 - [x] Decide Intel/universal-binary support from documented demand and test the selected target.
 - [x] Add opt-in background update checks, release notes, and signature/digest verification without
       introducing telemetry.
-- [ ] Complete privacy/secret/history scan, dependency/license/security audit, release build, Apple
+- [x] Complete privacy/secret/history scan, dependency/license/security audit, release build, Apple
       signing, notarization, stapling, DMG verification, GitHub release, and Homebrew cask update.
