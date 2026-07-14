@@ -103,14 +103,43 @@ else
 fi
 
 NOTARY_PROFILE="${MACKFTP_NOTARY_PROFILE:-}"
-if [ -n "$NOTARY_PROFILE" ]; then
+NOTARY_KEY="${MACKFTP_NOTARY_KEY:-}"
+NOTARY_KEY_ID="${MACKFTP_NOTARY_KEY_ID:-}"
+NOTARY_ISSUER="${MACKFTP_NOTARY_ISSUER:-}"
+NOTARY_ARGS=()
+
+if [ -n "$NOTARY_PROFILE" ] && { [ -n "$NOTARY_KEY" ] || [ -n "$NOTARY_KEY_ID" ] || [ -n "$NOTARY_ISSUER" ]; }; then
+  echo "ERROR: select either a Keychain notary profile or App Store Connect API key credentials" >&2
+  exit 1
+elif [ -n "$NOTARY_PROFILE" ]; then
+  NOTARY_ARGS=(--keychain-profile "$NOTARY_PROFILE")
+elif [ -n "$NOTARY_KEY" ] || [ -n "$NOTARY_KEY_ID" ] || [ -n "$NOTARY_ISSUER" ]; then
+  [ -f "$NOTARY_KEY" ] || {
+    echo "ERROR: MACKFTP_NOTARY_KEY must name an existing App Store Connect private key" >&2
+    exit 1
+  }
+  [[ "$NOTARY_KEY_ID" =~ ^[A-Z0-9]{8,32}$ ]] || {
+    echo "ERROR: MACKFTP_NOTARY_KEY_ID has an invalid format" >&2
+    exit 1
+  }
+  NOTARY_ARGS=(--key "$NOTARY_KEY" --key-id "$NOTARY_KEY_ID")
+  if [ -n "$NOTARY_ISSUER" ]; then
+    [[ "$NOTARY_ISSUER" =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]] || {
+      echo "ERROR: MACKFTP_NOTARY_ISSUER must be a UUID" >&2
+      exit 1
+    }
+    NOTARY_ARGS+=(--issuer "$NOTARY_ISSUER")
+  fi
+fi
+
+if [ "${#NOTARY_ARGS[@]}" -gt 0 ]; then
   echo "==> submitting DMG for Apple notarization"
-  xcrun notarytool submit "$OUT" --keychain-profile "$NOTARY_PROFILE" --wait
+  xcrun notarytool submit "$OUT" "${NOTARY_ARGS[@]}" --wait
   xcrun stapler staple "$OUT"
   xcrun stapler validate "$OUT"
   spctl --assess --type open --context context:primary-signature --verbose=2 "$OUT"
 elif [ "${MACKFTP_STRICT_RELEASE:-0}" = "1" ]; then
-  echo "ERROR: MACKFTP_NOTARY_PROFILE is required for a public release" >&2
+  echo "ERROR: notary credentials are required for a public release" >&2
   exit 1
 fi
 

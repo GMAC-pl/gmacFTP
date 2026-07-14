@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.2.2 — 2026-07-14
+
+The Apple Silicon UI and release-stabilization update.
+
+- **A more coherent macOS interface.** Normalized icon geometry, row heights, hit targets, sidebar
+  hierarchy, protocol badges, toolbar emphasis, EN/PL spacing, and light/dark presentation make
+  connection and file-management controls more consistent without changing established workflows.
+- **Deterministic UI regression coverage.** Nine privacy-safe render scenarios exercise the real
+  Slint component, while physical-pointer tests protect both sidebar connection actions and the
+  updater's Download & Verify and dismiss buttons from overlay/input regressions.
+- **Safer upgrades and recovery.** Representative 0.0.x, 0.1.x, and 0.2.x settings and connection
+  fixtures verify clean migration. Sleep, wake, network loss, and network recovery now invalidate
+  stale pooled sessions without discarding queued or resumable transfer work.
+- **Apple Silicon distribution.** Public releases now contain only the native `arm64` executable;
+  CI and strict release tooling reject unexpected architecture slices. macOS 11 or newer remains
+  the supported baseline.
+- **Private crash symbols, public privacy.** Release builds preserve an exact-UUID private dSYM for
+  symbolication, strip the shipped executable, and fail if symbols enter the app or DMG. Updated
+  screenshots contain documented demo data only.
+- **Verified quality gates.** 188 automated tests, nine UI render scenarios, warning-free Clippy,
+  dependency auditing, ARM64 release compilation, and source/history/privacy scans pass before
+  publication.
+
 ## 0.2.1 — 2026-07-13
 
 - Fixed a critical pointer-input regression from 0.2.0 that left custom toolbar buttons, sidebar
