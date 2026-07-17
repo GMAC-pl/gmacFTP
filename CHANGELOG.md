@@ -15,9 +15,10 @@ The FTP transport-clarity and compatibility update.
   metadata cannot be saved from the editor.
 - **Reliable iCloud credential upgrades.** A synced vault that still uses the older `(host, user)`
   password format is detected after download instead of producing a misleading “missing
-  credential” error. gmacFTP offers an explicit, redacted recovery step, converts only unambiguous
-  server mappings, and leaves ambiguous entries for manual re-entry rather than risking credential
-  reuse on a different endpoint.
+  credential” error. gmacFTP offers an explicit, redacted recovery step at startup and again when
+  an affected server is opened after recovery was deferred. It converts only unambiguous server
+  mappings and leaves ambiguous entries for manual re-entry rather than risking credential reuse
+  on a different endpoint.
 - **Verified Apple Silicon release.** The signed and notarized ARM64 package is checked by exact app
   version, bundle identifier, Developer ID team, Gatekeeper, and an end-to-end upload/download hash
   comparison before publication.

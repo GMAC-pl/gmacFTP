@@ -3710,15 +3710,33 @@ fn connect_into_pane(
     pane: usize,
     conn_id: i32,
 ) {
-    let Some(spec) = conns
-        .lock()
-        .expect("connections lock")
-        .iter()
-        .find(|c| c.id.0 as i32 == conn_id)
-        .cloned()
-    else {
-        return;
+    let spec = {
+        let saved = conns.lock().expect("connections lock");
+        let Some(spec) = saved
+            .iter()
+            .find(|connection| connection.id.0 as i32 == conn_id)
+            .cloned()
+        else {
+            return;
+        };
+        spec
     };
+
+    // A legacy vault may arrive from iCloud only after an older release has already marked its
+    // local Keychain migration complete. Re-check the post-sync vault whenever a saved server is
+    // opened: if the startup prompt was deferred, show it again instead of reducing a recoverable
+    // upgrade state to the misleading generic "missing credential" error.
+    if password_for(&store, &spec).is_none() {
+        // The full list is needed only for the exceptional recovery path; successful connections
+        // do not clone all saved profiles.
+        let all_specs = conns.lock().expect("connections lock").clone();
+        if let Some(app) = ui.upgrade() {
+            if !offer_legacy_credential_recovery(&app, store.as_ref(), &all_specs) {
+                app.set_error("missing credential".into());
+            }
+        }
+        return;
+    }
     // Connect ADDS a background session (the pane's previous session stays alive in the pool).
     show_session_in_pane(handle, store, sessions, panes, ui, pane, &spec, true);
 }
@@ -5113,9 +5131,9 @@ fn offer_legacy_credential_recovery(
     ui: &App,
     store: &dyn CredentialStore,
     specs: &[ConnectionSpec],
-) {
+) -> bool {
     if ui.get_passphrase_open() || ui.get_credential_recovery_open() {
-        return;
+        return true;
     }
     match store.credential_health(specs) {
         Ok(health) if health.recoverable_legacy_credentials > 0 => {
@@ -5134,6 +5152,7 @@ fn offer_legacy_credential_recovery(
                 ambiguous = health.ambiguous_legacy_credentials,
                 "legacy synced credentials require an explicit recovery decision"
             );
+            true
         }
         Ok(health) if health.ambiguous_legacy_credentials > 0 => {
             ui.set_status(
@@ -5143,10 +5162,12 @@ fn offer_legacy_credential_recovery(
                 )
                 .into(),
             );
+            false
         }
-        Ok(_) => {}
+        Ok(_) => false,
         Err(error) => {
             tracing::warn!(%error, "could not inspect encrypted credential consistency");
+            false
         }
     }
 }
@@ -11677,6 +11698,55 @@ mod path_safety_tests {
     use std::cell::{Cell, RefCell};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    struct PostSyncLegacyStore;
+
+    impl CredentialStore for PostSyncLegacyStore {
+        fn get(&self, _host: &str, _user: &str) -> Result<Vec<u8>, store::CredentialError> {
+            Err(store::CredentialError::NotFound)
+        }
+
+        fn set(
+            &self,
+            _host: &str,
+            _user: &str,
+            _secret: &[u8],
+        ) -> Result<(), store::CredentialError> {
+            Ok(())
+        }
+
+        fn delete(&self, _host: &str, _user: &str) -> Result<(), store::CredentialError> {
+            Ok(())
+        }
+
+        fn get_for(&self, _key: &CredentialKey) -> Result<Vec<u8>, store::CredentialError> {
+            Err(store::CredentialError::NotFound)
+        }
+
+        fn set_for(
+            &self,
+            _key: &CredentialKey,
+            _secret: &[u8],
+        ) -> Result<(), store::CredentialError> {
+            Ok(())
+        }
+
+        fn delete_for(&self, _key: &CredentialKey) -> Result<(), store::CredentialError> {
+            Ok(())
+        }
+
+        fn credential_health(
+            &self,
+            _specs: &[ConnectionSpec],
+        ) -> Result<store::CredentialHealth, store::CredentialError> {
+            Ok(store::CredentialHealth {
+                vault_entries: 1,
+                legacy_entries: 1,
+                recoverable_legacy_credentials: 1,
+                ..store::CredentialHealth::default()
+            })
+        }
+    }
+
     fn scratch_dir() -> PathBuf {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
         let path = std::env::temp_dir().join(format!(
@@ -11686,6 +11756,77 @@ mod path_safety_tests {
         ));
         std::fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn post_sync_legacy_credentials_are_reoffered_after_completed_local_migration() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = App::new().unwrap();
+        let mut spec = design_demo_connections().remove(0);
+        spec.id = ConnectionId(94_001);
+        spec.host = "post-sync-upgrade.example.test".into();
+        spec.user = "upgrade-regression".into();
+        let specs = vec![spec];
+        let connections: ConnList = Arc::new(Mutex::new(specs.clone()));
+        let credential_store: Arc<dyn CredentialStore> = Arc::new(PostSyncLegacyStore);
+        let sessions: Sessions = Arc::new(Mutex::new(Vec::new()));
+        let panes: Panes = Arc::new(Mutex::new([
+            PaneState {
+                kind: PaneKind::Local,
+                conn: None,
+                cwd: "/".into(),
+                nav: Nav::at("/".into()),
+            },
+            PaneState {
+                kind: PaneKind::Local,
+                conn: None,
+                cwd: "/".into(),
+                nav: Nav::at("/".into()),
+            },
+        ]));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        // This is the exact v0.2.2 upgrade shape: the one-shot local migration was already
+        // marked complete, and only afterwards did iCloud provide a legacy-format vault. The
+        // post-sync health check must remain independent of that old marker.
+        let upgraded_settings = store::settings::Settings {
+            endpoint_credentials_migrated_v2: true,
+            ..store::settings::Settings::default()
+        };
+        assert!(upgraded_settings.endpoint_credentials_migrated_v2);
+        connect_into_pane(
+            runtime.handle(),
+            credential_store.clone(),
+            connections.clone(),
+            sessions.clone(),
+            panes.clone(),
+            ui.as_weak(),
+            1,
+            94_001,
+        );
+        assert!(ui.get_credential_recovery_open());
+        assert_eq!(ui.get_credential_recovery_count(), 1);
+        assert!(ui.get_error().is_empty());
+        assert!(matches!(panes.lock().unwrap()[1].kind, PaneKind::Local));
+
+        // Deferring the prompt must not turn the recoverable state into a permanent generic
+        // login error. A later connection attempt performs the same redacted health check and
+        // offers recovery again.
+        ui.set_credential_recovery_open(false);
+        connect_into_pane(
+            runtime.handle(),
+            credential_store,
+            connections,
+            sessions,
+            panes,
+            ui.as_weak(),
+            1,
+            94_001,
+        );
+        assert!(ui.get_credential_recovery_open());
     }
 
     #[cfg(target_os = "macos")]
