@@ -29,3 +29,12 @@ Icon?
 *.mobileprovision
 master.key
 embedded.provisionprofile
+
+# Internal planning and verification notes — never publish
+/docs/ROADMAP*.md
+/docs/*SMOKE_TEST*.md
+/docs/WORKLOG*.md
+/docs/*_WORKLOG.md
+/docs/WIP*.md
+/docs/*_NOTES.md
+/.work/
