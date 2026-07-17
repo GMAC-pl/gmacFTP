@@ -11,6 +11,9 @@ The in-app updater compatibility fix.
 - **Security checks remain strict.** The updater still exposes the file only after the exact GitHub
   SHA-256 digest and size, Developer ID signature, Apple team, DMG identifier, and stapled ticket
   all pass verification.
+- **Isolated design mode.** The local screenshot/demo flag now selects only built-in example
+  servers, default preferences, empty favorites, and synthetic paths before persistent state is
+  read. A design run can no longer display saved server profiles from the normal installation.
 - **One-time manual upgrade.** Versions through 0.2.3 run the old validation code before installing
   an update, so moving to 0.2.4 requires the signed DMG or Homebrew once. In-app installation works
   normally again for subsequent releases.

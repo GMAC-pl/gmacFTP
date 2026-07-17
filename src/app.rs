@@ -763,8 +763,15 @@ pub fn run() {
         crate::i18n::runtime(message.as_str(), locale.as_str()).into()
     });
 
+    // Design/screenshot mode must be isolated before any persistent app state is read. It uses
+    // only built-in example profiles and synthetic pane contents; normal public launches never
+    // set this process-local developer flag.
+    let design_demo = use_design_demo_main();
+
     // Native macOS menu bar (App/File/Edit/View/Window/Help). No-op off macOS.
-    crate::macos_menu::install(ui.as_weak());
+    if !design_demo {
+        crate::macos_menu::install(ui.as_weak());
+    }
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -774,7 +781,11 @@ pub fn run() {
 
     // Settings → locale + theme. TLS exceptions live on each ConnectionSpec, never in a global
     // process setting, so concurrent connections cannot inherit one server's exception.
-    let settings = store::settings::load();
+    let settings = if design_demo {
+        store::settings::Settings::default()
+    } else {
+        store::settings::load()
+    };
     apply_locale(&ui, &settings.locale);
     ui.set_transfer_concurrency(settings.transfer_concurrency as i32);
     ui.set_background_folder_metadata(settings.background_folder_metadata);
@@ -788,12 +799,17 @@ pub fn run() {
     crate::Tokens::get(&ui).set_theme(effective_theme(&ui, &theme).into());
     restore_window_geometry(&ui, &settings);
     ui.set_accept_any_cert(false);
-    refresh_local_favorites_model(&ui);
+    if design_demo {
+        ui.set_local_favorites(ModelRc::from(Rc::new(VecModel::from(Vec::<
+            LocalFavoriteRow,
+        >::new()))));
+    } else {
+        refresh_local_favorites_model(&ui);
+    }
 
     // Upgrade legacy `(host, user)` credentials only for endpoints already present in the local,
     // pre-sync metadata. Doing this before reading an unauthenticated sync-folder metadata file
     // prevents that file from redirecting a legacy password into a new protocol or port.
-    let design_demo = use_design_demo_main();
     if !design_demo && !settings.endpoint_credentials_migrated_v2 {
         let migration_store = store::default_store();
         match migrate_saved_passwords(&migration_store) {
@@ -825,7 +841,7 @@ pub fn run() {
     if store.is_locked() {
         ui.set_passphrase_mode("enter".into());
         ui.set_passphrase_open(true);
-    } else if store::cloud::enabled() && !settings.sync_passphrase_set {
+    } else if !design_demo && store::cloud::enabled() && !settings.sync_passphrase_set {
         // Sync is on but no passphrase set here yet. If a wrapped key already exists in the
         // sync folder, ANOTHER Mac already set up sync → JOIN it (enter that passphrase).
         // Otherwise this is the first Mac → SET a new one.
@@ -848,7 +864,11 @@ pub fn run() {
     }
     let conns: ConnList = Arc::new(Mutex::new(connections));
 
-    let home = home_dir();
+    let home = if design_demo {
+        PathBuf::from("/Users/demo/Sites")
+    } else {
+        home_dir()
+    };
     let restored_local = |saved: &Option<String>| {
         saved
             .as_ref()
@@ -1401,12 +1421,22 @@ fn bootstrap(store: &Arc<dyn CredentialStore>) -> Vec<ConnectionSpec> {
 }
 
 fn use_design_demo_connections() -> bool {
-    if std::env::var_os("MACKFTP_DEMO_CONNECTIONS").is_some() {
+    design_demo_connections_requested(
+        use_design_demo_main(),
+        std::env::var_os("MACKFTP_DEMO_CONNECTIONS").is_some(),
+        std::env::var("MACKFTP_OPEN_PANEL").ok().as_deref(),
+    )
+}
+
+fn design_demo_connections_requested(
+    main_demo: bool,
+    explicit_connections: bool,
+    panel: Option<&str>,
+) -> bool {
+    if main_demo || explicit_connections {
         return true;
     }
-    let Ok(panel) = std::env::var("MACKFTP_OPEN_PANEL") else {
-        return false;
-    };
+    let Some(panel) = panel else { return false };
     matches!(
         panel.trim().to_lowercase().as_str(),
         "servers"
@@ -11827,6 +11857,23 @@ mod path_safety_tests {
             94_001,
         );
         assert!(ui.get_credential_recovery_open());
+    }
+
+    #[test]
+    fn main_design_demo_always_uses_built_in_connection_metadata() {
+        assert!(design_demo_connections_requested(true, false, None));
+        assert!(design_demo_connections_requested(
+            true,
+            false,
+            Some("unrelated-panel")
+        ));
+        assert!(design_demo_connections_requested(false, true, None));
+        assert!(design_demo_connections_requested(
+            false,
+            false,
+            Some("servers")
+        ));
+        assert!(!design_demo_connections_requested(false, false, None));
     }
 
     #[cfg(target_os = "macos")]
