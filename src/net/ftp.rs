@@ -1,9 +1,9 @@
 //! FTP / FTPS client (suppaftp 10 + native-tls).
 //!
-//! Security ordering: connect (plaintext control channel) -> into_secure (AUTH TLS) ->
-//! login (USER/PASS). The password is never sent until explicit FTPS is established. Plain
-//! FTP remains available only after a deliberate, application-level opt-in for a legacy host;
-//! a refused `AUTH TLS` can never silently downgrade an authenticated session.
+//! Security ordering for FTPS: connect (plaintext control channel) -> into_secure (AUTH TLS) ->
+//! login (USER/PASS). The password is never sent until explicit FTPS is established. Plain FTP is
+//! a separate, deliberate per-host transport mode; TLS failures never trigger an automatic
+//! downgrade and the two modes never share a control connection.
 
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
@@ -338,9 +338,9 @@ pub fn accept_invalid_tls(spec: &ConnectionSpec) -> bool {
             .unwrap_or(false)
 }
 
-/// Whether this one saved connection was explicitly approved for plaintext FTP. This deliberately
-/// reads the per-connection setting instead of a process-wide switch: accepting legacy FTP for
-/// one LAN server must never authorize a downgrade for another host.
+/// Whether this one saved connection explicitly uses plaintext-only FTP. This deliberately reads
+/// the per-connection setting instead of a process-wide switch: selecting legacy FTP for one LAN
+/// server must never authorize a downgrade for another host.
 pub fn allow_plaintext_ftp(spec: &ConnectionSpec) -> bool {
     spec.allow_plaintext_ftp
 }
@@ -872,12 +872,32 @@ fn require_implicit_private_data<T: suppaftp::TlsStream>(
     Ok(())
 }
 
-/// Connect + authenticate with explicit or implicit FTPS.
+fn connect_plaintext(spec: &ConnectionSpec, password: &str) -> Result<Box<dyn FtpConn>, NetError> {
+    tracing::warn!(
+        host = %spec.host,
+        "connecting with explicitly selected plaintext-only FTP; credentials and files are not encrypted"
+    );
+    let plain = FtpStream::connect_with_stream(connect_tcp(
+        spec,
+        &spec.host,
+        spec.effective_port(),
+        connection_timeout(spec),
+    )?)
+    .map_err(NetError::from_ftp)?;
+    let mut plain = configure_data_connection(plain, spec, None)?;
+    map_login(plain.login(spec.user.as_str(), password))?;
+    configure_filename_encoding(&mut plain, spec)?;
+    plain
+        .transfer_type(FileType::Binary)
+        .map_err(NetError::from_ftp)?;
+    Ok(Box::new(plain))
+}
+
+/// Connect + authenticate with the explicitly selected FTP transport.
 ///
-/// A refused `AUTH TLS` is an error by default. A legacy plaintext connection is attempted only
-/// when [`ConnectionSpec::allow_plaintext_ftp`] was explicitly enabled for this exact saved
-/// connection; even then it starts over on a fresh
-/// control socket, so no credentials ever cross the failed FTPS attempt.
+/// FTPS never falls back after a refused `AUTH TLS`, certificate error, or handshake failure.
+/// [`ConnectionSpec::allow_plaintext_ftp`] selects a separate plaintext-only connection before any
+/// TLS negotiation starts, making the credential exposure explicit and deterministic.
 ///
 /// TLS strictness follows `ConnectionSpec::accept_invalid_tls` (**default OFF = strict** — verify
 /// the cert chain). `MACKFTP_TLS_INSECURE=1` is a test/CI escape hatch (logged WARN).
@@ -895,6 +915,14 @@ fn connect(spec: &ConnectionSpec, password: &str) -> Result<Box<dyn FtpConn>, Ne
         return Err(NetError::Ftp(
             "an FTPS client certificate cannot be used with plaintext FTP".into(),
         ));
+    }
+    if spec.allow_plaintext_ftp && (spec.tls_pinned_sha256.is_some() || spec.accept_invalid_tls) {
+        return Err(NetError::Ftp(
+            "FTPS certificate trust settings cannot be used with plaintext FTP".into(),
+        ));
+    }
+    if allow_plaintext_ftp(spec) {
+        return connect_plaintext(spec, password);
     }
 
     if let Some(raw_pin) = spec.tls_pinned_sha256.as_deref() {
@@ -957,16 +985,7 @@ fn connect(spec: &ConnectionSpec, password: &str) -> Result<Box<dyn FtpConn>, Ne
             configure_filename_encoding(&mut sec, spec)?;
             sec.transfer_type(FileType::Binary)
                 .map_err(NetError::from_ftp)?; // TYPE I — preserve binary integrity
-            return Ok(Box::new(sec));
-        }
-        Err(FtpError::UnexpectedResponse(resp))
-            if spec.ftp_tls_mode == FtpTlsMode::Explicit && allow_plaintext_ftp(spec) =>
-        {
-            tracing::warn!(
-                host = %spec.host,
-                code = resp.status.code(),
-                "server refused FTPS; opening explicitly authorized plaintext FTP session"
-            );
+            Ok(Box::new(sec))
         }
         Err(FtpError::UnexpectedResponse(resp)) => {
             let message = match spec.ftp_tls_mode {
@@ -979,7 +998,7 @@ fn connect(spec: &ConnectionSpec, password: &str) -> Result<Box<dyn FtpConn>, Ne
                     resp.status.code()
                 ),
             };
-            return Err(NetError::Ftp(message));
+            Err(NetError::Ftp(message))
         }
         // Any other failure (e.g. certificate rejected under strict TLS) is a real TLS problem.
         // Never silently downgrade to a credential-leaking plaintext session.
@@ -996,27 +1015,9 @@ fn connect(spec: &ConnectionSpec, password: &str) -> Result<Box<dyn FtpConn>, Ne
                     ));
                 }
             }
-            return Err(NetError::from_ftp(e));
+            Err(NetError::from_ftp(e))
         }
     }
-
-    // `allow_plaintext_ftp(spec)` was true for the refused-AUTH-TLS branch above. A fresh socket is
-    // required because the failed negotiation may have left bytes buffered on the first one.
-    let plain = FtpStream::connect_with_stream(connect_tcp(
-        spec,
-        &spec.host,
-        spec.effective_port(),
-        connect_timeout,
-    )?)
-    .map_err(NetError::from_ftp)?;
-    let mut plain = configure_data_connection(plain, spec, None)?;
-    map_login(plain.login(spec.user.as_str(), password))?;
-    configure_filename_encoding(&mut plain, spec)?;
-    plain
-        .transfer_type(FileType::Binary)
-        .map_err(NetError::from_ftp)?;
-    // The caller can surface that this explicitly approved session is plaintext.
-    Ok(Box::new(plain))
 }
 
 fn connect_with_certificate_pin(
@@ -2729,9 +2730,76 @@ mod tests {
     fn plaintext_ftp_is_opt_in_for_each_connection() {
         assert!(!allow_plaintext_ftp(&spec(false)));
         assert!(allow_plaintext_ftp(&spec(true)));
-        // This is deliberately not global state: approving one legacy server cannot enable a
-        // downgrade for another server in the same process.
+        // This is deliberately not global state: selecting plaintext for one legacy server cannot
+        // change the transport used by another server in the same process.
         assert!(!allow_plaintext_ftp(&spec(false)));
+    }
+
+    #[test]
+    fn plaintext_only_mode_authenticates_without_an_auth_tls_probe() {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let commands = Arc::new(Mutex::new(Vec::<String>::new()));
+        let recorded = commands.clone();
+        let server = std::thread::spawn(move || loop {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream.write_all(b"220 test FTP ready\r\n").unwrap();
+            stream.flush().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut quit = false;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap() == 0 {
+                    break;
+                }
+                let command = line.trim_end_matches(['\r', '\n']).to_string();
+                recorded.lock().unwrap().push(command.clone());
+                let response = if command.starts_with("USER ") {
+                    "331 password required\r\n"
+                } else if command.starts_with("PASS ") {
+                    "230 logged in\r\n"
+                } else if command == "TYPE I" || command == "OPTS UTF8 ON" {
+                    "200 command accepted\r\n"
+                } else if command == "AUTH TLS" {
+                    // Keep this branch so a regression to the old probe-then-fallback behavior
+                    // completes quickly and fails the command-order assertion below.
+                    stream.write_all(b"500 TLS unavailable\r\n").unwrap();
+                    stream.flush().unwrap();
+                    break;
+                } else if command == "QUIT" {
+                    quit = true;
+                    "221 goodbye\r\n"
+                } else {
+                    "500 unexpected command\r\n"
+                };
+                stream.write_all(response.as_bytes()).unwrap();
+                stream.flush().unwrap();
+                if quit {
+                    break;
+                }
+            }
+            if quit {
+                break;
+            }
+        });
+
+        let mut connection_spec = spec(true);
+        connection_spec.host = address.ip().to_string();
+        connection_spec.port = address.port();
+        connection_spec.timeout_secs = Some(2);
+        let mut connection = connect(&connection_spec, "test-password").unwrap();
+        assert!(connection.is_plaintext());
+        connection.quit().unwrap();
+        server.join().unwrap();
+
+        let commands = commands.lock().unwrap();
+        assert!(commands
+            .first()
+            .is_some_and(|command| command == "USER alice"));
+        assert!(commands.iter().all(|command| command != "AUTH TLS"));
     }
 
     #[test]

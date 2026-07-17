@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.2.3 — 2026-07-17
+
+The FTP transport-clarity and compatibility update.
+
+- **Deterministic FTP security modes.** The legacy plaintext option now selects a direct,
+  plaintext-only connection for that saved endpoint. FTPS remains the default and never falls back
+  after an `AUTH TLS`, certificate, or handshake failure.
+- **Better legacy-server compatibility.** Servers that intentionally provide plain FTP can connect
+  without first entering an incompatible TLS handshake, while the app continues to display the
+  unencrypted-session warning before and after connection.
+- **Coherent connection settings.** Selecting plaintext mode clears and hides incompatible TLS
+  mode, certificate-pin, trust-exception, and client-certificate controls so contradictory security
+  metadata cannot be saved from the editor.
+- **Reliable iCloud credential upgrades.** A synced vault that still uses the older `(host, user)`
+  password format is detected after download instead of producing a misleading “missing
+  credential” error. gmacFTP offers an explicit, redacted recovery step, converts only unambiguous
+  server mappings, and leaves ambiguous entries for manual re-entry rather than risking credential
+  reuse on a different endpoint.
+- **Verified Apple Silicon release.** The signed and notarized ARM64 package is checked by exact app
+  version, bundle identifier, Developer ID team, Gatekeeper, and an end-to-end upload/download hash
+  comparison before publication.
+
 ## 0.2.2 — 2026-07-14
 
 The Apple Silicon UI and release-stabilization update.

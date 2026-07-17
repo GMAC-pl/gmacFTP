@@ -51,6 +51,26 @@ const EXACT_PL: &[(&str, &str)] = &[
         "Vault unlocked — passwords are available.",
         "Sejf odblokowany — hasła są dostępne.",
     ),
+    (
+        "Older encrypted credentials were found. Confirm the downloaded server list to recover them.",
+        "Znaleziono starsze zaszyfrowane dane logowania. Potwierdź pobraną listę serwerów, aby je odzyskać.",
+    ),
+    (
+        "Password recovery was not performed. No credential data was changed.",
+        "Nie wykonano odzyskiwania haseł. Dane logowania nie zostały zmienione.",
+    ),
+    (
+        "Could not lock saved connections for password recovery.",
+        "Nie udało się zablokować zapisanych połączeń na czas odzyskiwania haseł.",
+    ),
+    (
+        "The server list or encrypted vault changed before recovery. Review it and try again.",
+        "Lista serwerów lub zaszyfrowany sejf zmieniły się przed odzyskiwaniem. Sprawdź je i spróbuj ponownie.",
+    ),
+    (
+        "No password could be recovered. The encrypted vault was left unchanged.",
+        "Nie udało się odzyskać żadnego hasła. Zaszyfrowany sejf pozostał bez zmian.",
+    ),
     ("Wrong passphrase.", "Nieprawidłowe hasło."),
     (
         "SFTP host key was not trusted; connection cancelled.",
@@ -63,6 +83,14 @@ const EXACT_PL: &[(&str, &str)] = &[
     (
         "FTPS certificate was not trusted; connection cancelled.",
         "Certyfikat FTPS nie został zatwierdzony; anulowano połączenie.",
+    ),
+    (
+        "Testing connection without saving…",
+        "Testowanie połączenia bez zapisywania…",
+    ),
+    (
+        "Connected via plaintext FTP — password was sent unencrypted.",
+        "Połączono przez nieszyfrowany FTP — hasło wysłano bez szyfrowania.",
     ),
     (
         "The FTPS certificate fingerprint was malformed.",
@@ -322,6 +350,27 @@ const EXACT_PL: &[(&str, &str)] = &[
 // path, file name, item count, protocol reply or operating-system error.
 const FRAGMENTS_PL: &[(&str, &str)] = &[
     (
+        "Could not recover saved passwords: ",
+        "Nie udało się odzyskać zapisanych haseł: ",
+    ),
+    (
+        "Could not inspect saved passwords: ",
+        "Nie udało się sprawdzić zapisanych haseł: ",
+    ),
+    (
+        ". You can connect normally now.",
+        ". Możesz teraz normalnie się łączyć.",
+    ),
+    (
+        "; ambiguous passwords requiring manual re-entry: ",
+        "; niejednoznaczne hasła wymagające ponownego wpisania: ",
+    ),
+    (
+        "Ambiguous synced passwords requiring manual re-entry: ",
+        "Niejednoznaczne zsynchronizowane hasła wymagające ponownego wpisania: ",
+    ),
+    ("Recovered saved passwords: ", "Odzyskane zapisane hasła: "),
+    (
         "Could not save the FTPS certificate pin: ",
         "Nie udało się zapisać przypięcia certyfikatu FTPS: ",
     ),
@@ -405,6 +454,23 @@ const FRAGMENTS_PL: &[(&str, &str)] = &[
     (
         "Update download failed: ",
         "Pobieranie aktualizacji nie powiodło się: ",
+    ),
+    (
+        "Connection successful — listed ",
+        "Połączenie udane — odczytano elementy (",
+    ),
+    (
+        " item(s), but the session is plaintext FTP.",
+        "), ale sesja korzysta z nieszyfrowanego FTP.",
+    ),
+    (
+        "Connection successful — authentication and listing completed (",
+        "Połączenie udane — zakończono logowanie i listowanie; elementy (",
+    ),
+    (" item(s)).", ")."),
+    (
+        "Connection test failed: ",
+        "Test połączenia nie powiódł się: ",
     ),
     ("gmacFTP is up to date (v", "gmacFTP jest aktualny (v"),
     ("Verified update ", "Zweryfikowaną aktualizację "),
@@ -552,6 +618,34 @@ mod tests {
             "Zdalny Kosz jest pusty."
         );
         assert_eq!(runtime("opaque server reply", "pl"), "opaque server reply");
+        assert_eq!(
+            runtime(
+                "Connection successful — listed 3 item(s), but the session is plaintext FTP.",
+                "pl"
+            ),
+            "Połączenie udane — odczytano elementy (3), ale sesja korzysta z nieszyfrowanego FTP."
+        );
+        assert_eq!(
+            runtime(
+                "Connected via plaintext FTP — password was sent unencrypted.",
+                "pl"
+            ),
+            "Połączono przez nieszyfrowany FTP — hasło wysłano bez szyfrowania."
+        );
+        assert_eq!(
+            runtime(
+                "Recovered saved passwords: 12. You can connect normally now.",
+                "pl"
+            ),
+            "Odzyskane zapisane hasła: 12. Możesz teraz normalnie się łączyć."
+        );
+        assert_eq!(
+            runtime(
+                "Password recovery was not performed. No credential data was changed.",
+                "pl"
+            ),
+            "Nie wykonano odzyskiwania haseł. Dane logowania nie zostały zmienione."
+        );
     }
 
     #[test]

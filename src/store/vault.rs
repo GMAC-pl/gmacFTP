@@ -38,7 +38,8 @@ use rand::RngCore;
 use zeroize::Zeroizing;
 
 use super::creds::{
-    canonical_host, legacy_v1_id, CredentialError, CredentialKey, CredentialStore, SERVICE_PREFIX,
+    canonical_host, legacy_v1_id, CredentialError, CredentialHealth, CredentialKey,
+    CredentialStore, LegacyCredentialRecovery, SERVICE_PREFIX,
 };
 #[cfg(target_os = "macos")]
 use super::keychain::MacCredentialStore;
@@ -149,25 +150,142 @@ fn copy_legacy_v1_for_candidates(
     map: &mut HashMap<String, String>,
     candidates: &[CredentialKey],
 ) -> usize {
-    let mut migrated = 0;
+    let legacy = legacy_index(map);
+    let mut inserts = Vec::new();
     for key in candidates {
         let v2_id = key.vault_id();
         if map.contains_key(&v2_id) {
             continue;
         }
-        let legacy = map.iter().find_map(|(id, secret)| {
-            let (host, user) = id.split_once('\0')?;
-            (!id.starts_with("v2\0")
-                && user == key.user()
-                && canonical_host(host).ok().as_deref() == Some(key.host()))
-            .then(|| secret.clone())
-        });
-        if let Some(secret) = legacy {
-            map.insert(v2_id, secret);
-            migrated += 1;
+        let identity = (key.host().to_string(), key.user().to_string());
+        if let Some(record) = legacy.get(&identity).filter(|record| !record.conflicting) {
+            inserts.push((v2_id, record.secret.clone()));
         }
     }
+    drop(legacy);
+    let migrated = inserts.len();
+    map.extend(inserts);
     migrated
+}
+
+fn candidate_groups(
+    specs: &[crate::model::ConnectionSpec],
+) -> (HashMap<(String, String), HashSet<CredentialKey>>, usize) {
+    let mut groups: HashMap<(String, String), HashSet<CredentialKey>> = HashMap::new();
+    let mut invalid = 0;
+    for spec in specs {
+        match CredentialKey::for_spec(spec) {
+            Ok(key) => {
+                groups
+                    .entry((key.host().to_string(), key.user().to_string()))
+                    .or_default()
+                    .insert(key);
+            }
+            Err(_) => invalid += 1,
+        }
+    }
+    (groups, invalid)
+}
+
+struct LegacyRecord<'a> {
+    secret: &'a String,
+    conflicting: bool,
+}
+
+fn legacy_index(map: &HashMap<String, String>) -> HashMap<(String, String), LegacyRecord<'_>> {
+    let mut index: HashMap<(String, String), LegacyRecord<'_>> = HashMap::new();
+    for (id, secret) in map {
+        if id.starts_with("v2\0") {
+            continue;
+        }
+        let Some((host, user)) = id.split_once('\0') else {
+            continue;
+        };
+        let Ok(host) = canonical_host(host) else {
+            continue;
+        };
+        index
+            .entry((host, user.to_string()))
+            .and_modify(|record| record.conflicting |= record.secret != secret)
+            .or_insert(LegacyRecord {
+                secret,
+                conflicting: false,
+            });
+    }
+    index
+}
+
+fn credential_health_for_map(
+    map: &HashMap<String, String>,
+    specs: &[crate::model::ConnectionSpec],
+) -> CredentialHealth {
+    let (groups, invalid_endpoint_specs) = candidate_groups(specs);
+    let legacy = legacy_index(map);
+    let mut health = CredentialHealth {
+        vault_entries: map.len(),
+        endpoint_bound_entries: map.keys().filter(|id| id.starts_with("v2\0")).count(),
+        legacy_entries: map.keys().filter(|id| !id.starts_with("v2\0")).count(),
+        invalid_endpoint_specs,
+        ..CredentialHealth::default()
+    };
+
+    for ((host, user), keys) in groups {
+        let missing = keys
+            .iter()
+            .filter(|key| {
+                if map.contains_key(&key.vault_id()) {
+                    health.matching_endpoint_credentials += 1;
+                    false
+                } else {
+                    true
+                }
+            })
+            .count();
+        if missing == 0 {
+            continue;
+        }
+        let Some(record) = legacy.get(&(host, user)) else {
+            continue;
+        };
+        if keys.len() == 1 && !record.conflicting {
+            health.recoverable_legacy_credentials += 1;
+        } else {
+            health.ambiguous_legacy_credentials += missing;
+        }
+    }
+    health
+}
+
+fn recover_legacy_for_map(
+    map: &mut HashMap<String, String>,
+    specs: &[crate::model::ConnectionSpec],
+) -> LegacyCredentialRecovery {
+    let (groups, _) = candidate_groups(specs);
+    let legacy = legacy_index(map);
+    let mut result = LegacyCredentialRecovery::default();
+    let mut inserts = Vec::new();
+    for ((host, user), keys) in groups {
+        let missing: Vec<_> = keys
+            .iter()
+            .filter(|key| !map.contains_key(&key.vault_id()))
+            .cloned()
+            .collect();
+        if missing.is_empty() {
+            continue;
+        }
+        let Some(record) = legacy.get(&(host, user)) else {
+            continue;
+        };
+        if keys.len() != 1 || record.conflicting {
+            result.ambiguous += missing.len();
+            continue;
+        }
+        inserts.push((missing[0].vault_id(), record.secret.clone()));
+        result.recovered += 1;
+    }
+    drop(legacy);
+    map.extend(inserts);
+    result
 }
 
 /// Encrypted at-rest credential store (in-memory decrypted map mirrored to vault.bin).
@@ -462,6 +580,48 @@ impl FileVault {
         }
         Ok(migrated)
     }
+
+    /// Count vault/endpoint relationships without returning identifiers or secret material.
+    pub fn credential_health(
+        &self,
+        specs: &[crate::model::ConnectionSpec],
+    ) -> Result<CredentialHealth, CredentialError> {
+        let map = self
+            .map
+            .lock()
+            .map_err(|_| CredentialError::Other("vault mutex poisoned".to_string()))?;
+        Ok(credential_health_for_map(&map, specs))
+    }
+
+    /// Copy legacy vault records into endpoint-bound records after an explicit user decision.
+    /// A shared `(host, user)` used by more than one protocol/port is ambiguous and is left alone.
+    pub fn recover_legacy_credentials(
+        &self,
+        specs: &[crate::model::ConnectionSpec],
+    ) -> Result<LegacyCredentialRecovery, CredentialError> {
+        if self.write_blocked.load(Ordering::Acquire) {
+            return Err(CredentialError::NoStorageAccess);
+        }
+        let mut map = self
+            .map
+            .lock()
+            .map_err(|_| CredentialError::Other("vault mutex poisoned".to_string()))?;
+        let previous = map.clone();
+        let result = recover_legacy_for_map(&mut map, specs);
+
+        if result.recovered > 0 {
+            if let Err(error) = self.persist_map(&map, true) {
+                *map = previous;
+                return Err(error);
+            }
+            tracing::info!(
+                recovered = result.recovered,
+                ambiguous = result.ambiguous,
+                "recovered confirmed legacy vault credentials into endpoint-bound records"
+            );
+        }
+        Ok(result)
+    }
 }
 
 impl CredentialStore for FileVault {
@@ -518,6 +678,20 @@ impl CredentialStore for FileVault {
 
     fn delete_for(&self, key: &CredentialKey) -> Result<(), CredentialError> {
         self.delete_entry(&key.vault_id())
+    }
+
+    fn credential_health(
+        &self,
+        specs: &[crate::model::ConnectionSpec],
+    ) -> Result<CredentialHealth, CredentialError> {
+        FileVault::credential_health(self, specs)
+    }
+
+    fn recover_legacy_credentials(
+        &self,
+        specs: &[crate::model::ConnectionSpec],
+    ) -> Result<LegacyCredentialRecovery, CredentialError> {
+        FileVault::recover_legacy_credentials(self, specs)
     }
 }
 
@@ -616,6 +790,20 @@ impl CredentialStore for MigratingStore {
 
     fn migrate_from_keychain(&self) -> Result<usize, CredentialError> {
         self.vault.migrate_from_keychain()
+    }
+
+    fn credential_health(
+        &self,
+        specs: &[crate::model::ConnectionSpec],
+    ) -> Result<CredentialHealth, CredentialError> {
+        self.vault.credential_health(specs)
+    }
+
+    fn recover_legacy_credentials(
+        &self,
+        specs: &[crate::model::ConnectionSpec],
+    ) -> Result<LegacyCredentialRecovery, CredentialError> {
+        self.vault.recover_legacy_credentials(specs)
     }
 }
 
@@ -1745,6 +1933,82 @@ mod tests {
             vault.get_for(&unlisted),
             Err(CredentialError::NotFound)
         ));
+
+        let mut conflicting = HashMap::from([
+            (legacy_v1_id("example.com", "alice"), B64.encode(b"one")),
+            (
+                legacy_v1_id("EXAMPLE.com.", "alice"),
+                B64.encode(b"different"),
+            ),
+        ]);
+        assert_eq!(
+            copy_legacy_v1_for_candidates(&mut conflicting, std::slice::from_ref(&ftp)),
+            0,
+            "canonical-equivalent legacy records with different secrets must fail closed"
+        );
+        assert!(!conflicting.contains_key(&ftp.vault_id()));
+    }
+
+    #[test]
+    fn synced_legacy_recovery_is_redacted_and_refuses_ambiguous_endpoints() {
+        let mut one = connection(1, "one.example.com", "alice");
+        let mut shared_ftp = connection(2, "shared.example.com", "bob");
+        let mut shared_sftp = connection(3, "shared.example.com", "bob");
+        let conflicting = connection(4, "conflict.example.com", "carol");
+        one.port = 21;
+        shared_ftp.port = 21;
+        shared_sftp.protocol = Protocol::Sftp;
+        shared_sftp.port = 22;
+        let specs = vec![
+            one.clone(),
+            shared_ftp.clone(),
+            shared_sftp.clone(),
+            conflicting.clone(),
+        ];
+        let mut map = HashMap::from([
+            (
+                legacy_v1_id("ONE.example.com.", "alice"),
+                B64.encode(b"one"),
+            ),
+            (
+                legacy_v1_id("shared.example.com", "bob"),
+                B64.encode(b"shared"),
+            ),
+            (
+                legacy_v1_id("conflict.example.com", "carol"),
+                B64.encode(b"first"),
+            ),
+            (
+                legacy_v1_id("CONFLICT.example.com.", "carol"),
+                B64.encode(b"different"),
+            ),
+        ]);
+
+        let before = credential_health_for_map(&map, &specs);
+        assert_eq!(before.vault_entries, 4);
+        assert_eq!(before.endpoint_bound_entries, 0);
+        assert_eq!(before.legacy_entries, 4);
+        assert_eq!(before.matching_endpoint_credentials, 0);
+        assert_eq!(before.recoverable_legacy_credentials, 1);
+        assert_eq!(before.ambiguous_legacy_credentials, 3);
+
+        let recovered = recover_legacy_for_map(&mut map, &specs);
+        assert_eq!(
+            recovered,
+            LegacyCredentialRecovery {
+                recovered: 1,
+                ambiguous: 3,
+            }
+        );
+        assert!(map.contains_key(&CredentialKey::for_spec(&one).unwrap().vault_id()));
+        assert!(!map.contains_key(&CredentialKey::for_spec(&shared_ftp).unwrap().vault_id()));
+        assert!(!map.contains_key(&CredentialKey::for_spec(&shared_sftp).unwrap().vault_id()));
+        assert!(!map.contains_key(&CredentialKey::for_spec(&conflicting).unwrap().vault_id()));
+
+        let after = credential_health_for_map(&map, &specs);
+        assert_eq!(after.matching_endpoint_credentials, 1);
+        assert_eq!(after.recoverable_legacy_credentials, 0);
+        assert_eq!(after.ambiguous_legacy_credentials, 3);
     }
 
     #[test]

@@ -154,6 +154,11 @@ export component App inherits Window {
     in-out property <string> passphrase-mode: "set"; // set | enter | backup_export | backup_import
     in-out property <string> passphrase-value: "";
     in-out property <string> passphrase-confirm: "";
+    // A pulled vault can contain the legacy `(host, user)` credential format. Conversion to the
+    // endpoint-bound format requires an explicit trust decision for the downloaded server list.
+    in-out property <bool> credential-recovery-open: false;
+    in-out property <int> credential-recovery-count: 0;
+    in-out property <int> credential-recovery-ambiguous: 0;
     // First-contact SFTP host-key trust dialog. The fingerprint is supplied by the SSH layer
     // before password authentication and must be verified independently by the user.
     in-out property <bool> host-key-open: false;
@@ -421,6 +426,7 @@ export component App inherits Window {
     callback resolve-overwrite(int);      // overwrite dialog: 0=cancel, 1=overwrite, 2=save-as-new
     callback resolve-transfer-error(bool); // true=skip failed file and continue, false=stop batch
     callback resolve-passphrase(string, string); // passphrase dialog: (value, confirm); empty value = cancel
+    callback resolve-credential-recovery(bool);  // true only after trusting the synced server list
     callback resolve-host-key-trust(bool);       // true only after user verified the displayed fingerprint
     callback resolve-keyboard-interactive(bool); // Rust reads and immediately clears responses
     callback resolve-tls-certificate(int);       // 0 cancel, 1 trust once, 2 pin and save
@@ -2169,6 +2175,49 @@ export component App inherits Window {
             }
         }
 
+        // ── explicit recovery of legacy credentials pulled from iCloud ──
+        if root.credential-recovery-open : Rectangle {
+            background: Tokens.scrim;
+            TouchArea { clicked => { } }
+            Rectangle {
+                x: (root.width - self.width) / 2;
+                y: (root.height - self.height) / 2;
+                width: 470px; height: root.credential-recovery-ambiguous > 0 ? 340px : 312px;
+                background: Tokens.surface-raised;
+                border-radius: 14px; border-width: 1px; border-color: Tokens.border-strong;
+                drop-shadow-blur: 60px; drop-shadow-offset-y: 24px; drop-shadow-color: #00000066;
+                TouchArea { clicked => { } }
+                VerticalLayout { padding: 24px; spacing: 13px;
+                    Rectangle {
+                        width: 42px; height: 42px; border-radius: 21px; background: Tokens.accent-soft;
+                        Icon { kind: "shield"; fg: Tokens.accent; width: 21px; height: 21px; x: 10px; y: 10px; }
+                    }
+                    Text { text: @tr("Recover synced passwords?"); color: Tokens.text; font-size: 16px; font-weight: 700; }
+                    Text {
+                        text: @tr("{n} saved password can be recovered" | "{n} saved passwords can be recovered" % root.credential-recovery-count);
+                        color: Tokens.accent-text; font-size: 12px; font-weight: 700;
+                    }
+                    Text {
+                        text: @tr("The encrypted vault uses an older credential format. Continue only if you recognize and trust the server profiles downloaded from iCloud.");
+                        color: Tokens.text-sec; font-size: 12px; wrap: word-wrap;
+                    }
+                    Text {
+                        text: @tr("Recovery creates endpoint-bound records inside the encrypted vault. Password values are never displayed or sent to a server during recovery.");
+                        color: Tokens.text-ter; font-size: 10px; wrap: word-wrap;
+                    }
+                    if root.credential-recovery-ambiguous > 0 : Text {
+                        text: @tr("{n} ambiguous password requires manual re-entry" | "{n} ambiguous passwords require manual re-entry" % root.credential-recovery-ambiguous);
+                        color: Tokens.warning; font-size: 10px; wrap: word-wrap;
+                    }
+                    Rectangle { vertical-stretch: 1; }
+                    HorizontalLayout { spacing: 10px; alignment: end;
+                        GhostButton { text: @tr("Not Now"); clicked => { root.resolve-credential-recovery(false); } }
+                        PrimaryButton { text: @tr("Trust & Recover"); clicked => { root.resolve-credential-recovery(true); } }
+                    }
+                }
+            }
+        }
+
         // ── SFTP keyboard-interactive / 2FA challenge ──
         if root.ssh-auth-open : Rectangle {
             background: Tokens.scrim;
@@ -2979,7 +3028,7 @@ export component App inherits Window {
                                     Icon { kind: "eye"; fg: Tokens.text-ter; x: parent.width - 28px; y: (parent.height - self.height) / 2; }
                                 }
                             }
-                            if root.editor-protocol == "ftp" : VerticalLayout { spacing: 6px;
+                            if root.editor-protocol == "ftp" && !root.editor-allow-plaintext-ftp : VerticalLayout { spacing: 6px;
                                 Text { text: @tr("FTPS TLS MODE"); color: Tokens.text-ter; font-size: 9px; font-weight: 700; letter-spacing: 1px; }
                                 Rectangle { height: 34px; border-radius: 7px; background: Tokens.field-bg; border-width: 1px; border-color: Tokens.border-strong;
                                     HorizontalLayout { padding: 3px; spacing: 3px;
@@ -3022,30 +3071,30 @@ export component App inherits Window {
                             }
                             if root.editor-protocol == "ftp" : Rectangle {
                                 height: 38px;
-                                Text { x: 0px; y: 2px; width: 392px; height: 15px; text: @tr("Allow plaintext FTP (unsafe)"); color: Tokens.danger; font-size: 12px; font-weight: 600; vertical-alignment: center; horizontal-alignment: left; }
-                                Text { x: 0px; y: 20px; width: 392px; height: 14px; text: @tr("Only for a trusted legacy/LAN server — password and files are readable on the network."); color: Tokens.text-sec; font-size: 10px; vertical-alignment: center; horizontal-alignment: left; overflow: elide; }
+                                Text { x: 0px; y: 2px; width: 392px; height: 15px; text: @tr("Use plaintext FTP only (unsafe)"); color: Tokens.danger; font-size: 12px; font-weight: 600; vertical-alignment: center; horizontal-alignment: left; }
+                                Text { x: 0px; y: 20px; width: 392px; height: 14px; text: @tr("Connect directly without TLS. Passwords and files are readable on the network."); color: Tokens.text-sec; font-size: 10px; vertical-alignment: center; horizontal-alignment: left; overflow: elide; }
                                 Rectangle {
                                     x: 402px; y: 7px; width: 38px; height: 22px; border-radius: 11px;
                                     background: root.editor-allow-plaintext-ftp ? Tokens.danger : Tokens.border-strong;
                                     forward-focus: plaintext_ftp_action;
                                     accessible-role: switch;
-                                    accessible-label: @tr("Allow plaintext FTP (unsafe)");
+                                    accessible-label: @tr("Use plaintext FTP only (unsafe)");
                                     accessible-checkable: true;
                                     accessible-checked: root.editor-allow-plaintext-ftp;
-                                    accessible-action-default => { if (!root.editor-allow-plaintext-ftp) { root.editor-ftp-tls-mode = "explicit"; root.editor-tls-client-cert = ""; root.editor-tls-client-key = ""; } root.editor-allow-plaintext-ftp = !root.editor-allow-plaintext-ftp; }
+                                    accessible-action-default => { if (!root.editor-allow-plaintext-ftp) { root.editor-ftp-tls-mode = "explicit"; root.editor-tls-pin = ""; root.editor-legacy-invalid-tls = false; root.editor-tls-client-cert = ""; root.editor-tls-client-key = ""; } root.editor-allow-plaintext-ftp = !root.editor-allow-plaintext-ftp; }
                                     Rectangle {
                                         width: 16px; height: 16px; border-radius: 8px;
                                         x: root.editor-allow-plaintext-ftp ? 19px : 3px; y: 3px; background: #FFFFFF;
                                     }
-                                    plaintext_ftp_action := KeyboardActionArea { clicked => { if (!root.editor-allow-plaintext-ftp) { root.editor-ftp-tls-mode = "explicit"; root.editor-tls-client-cert = ""; root.editor-tls-client-key = ""; } root.editor-allow-plaintext-ftp = !root.editor-allow-plaintext-ftp; } }
+                                    plaintext_ftp_action := KeyboardActionArea { clicked => { if (!root.editor-allow-plaintext-ftp) { root.editor-ftp-tls-mode = "explicit"; root.editor-tls-pin = ""; root.editor-legacy-invalid-tls = false; root.editor-tls-client-cert = ""; root.editor-tls-client-key = ""; } root.editor-allow-plaintext-ftp = !root.editor-allow-plaintext-ftp; } }
                                 }
                             }
-                            if root.editor-protocol == "ftp" : Rectangle {
+                            if root.editor-protocol == "ftp" && !root.editor-allow-plaintext-ftp : Rectangle {
                                 height: 33px;
                                 Text { x: 0px; y: 2px; width: parent.width; height: 15px; text: root.editor-legacy-invalid-tls ? (@tr("Certificate verification disabled (unsafe)")) : (root.editor-tls-pin != "" ? (@tr("Pinned server certificate")) : (@tr("Strict certificate verification"))); color: root.editor-legacy-invalid-tls ? Tokens.danger-text : (root.editor-tls-pin != "" ? Tokens.accent-text : Tokens.text); font-size: 12px; font-weight: 600; vertical-alignment: center; horizontal-alignment: left; }
                                 Text { x: 0px; y: 19px; width: parent.width; height: 12px; text: @tr("A new certificate requires fingerprint review before trust is saved."); color: Tokens.text-sec; font-size: 10px; vertical-alignment: center; horizontal-alignment: left; }
                             }
-                            if root.editor-protocol == "ftp" && (root.editor-tls-pin != "" || root.editor-legacy-invalid-tls) : VerticalLayout { spacing: 6px;
+                            if root.editor-protocol == "ftp" && !root.editor-allow-plaintext-ftp && (root.editor-tls-pin != "" || root.editor-legacy-invalid-tls) : VerticalLayout { spacing: 6px;
                                 Text { text: @tr("ADVANCED TLS TRUST"); color: Tokens.text-ter; font-size: 9px; font-weight: 700; letter-spacing: 1px; }
                                 Text { text: root.editor-tls-pin != "" ? root.editor-tls-pin : (@tr("Legacy exception: certificate verification disabled")); color: root.editor-legacy-invalid-tls ? Tokens.danger-text : Tokens.accent-text; font-family: "JetBrains Mono"; font-size: 9px; wrap: word-wrap; }
                                 GhostButton { text: @tr("Reset Saved Trust"); clicked => { root.reset-editor-tls-trust(); } }

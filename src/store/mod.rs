@@ -13,7 +13,10 @@ pub mod settings;
 pub mod vault;
 
 pub use connections::{load_filezilla, load_metadata, load_seed, save_metadata, ImportError};
-pub use creds::{canonical_host, CredentialError, CredentialKey, CredentialStore, SERVICE_PREFIX};
+pub use creds::{
+    canonical_host, CredentialError, CredentialHealth, CredentialKey, CredentialStore,
+    LegacyCredentialRecovery, SERVICE_PREFIX,
+};
 #[cfg(target_os = "macos")]
 pub use keychain::MacCredentialStore;
 pub use memory::InMemoryStore;

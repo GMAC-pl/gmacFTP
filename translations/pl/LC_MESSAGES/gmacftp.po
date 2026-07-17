@@ -960,8 +960,8 @@ msgstr "AUTO"
 msgid "Active"
 msgstr "Aktywny"
 
-msgid "Allow plaintext FTP (unsafe)"
-msgstr "Zezwól na nieszyfrowany FTP (niebezpieczne)"
+msgid "Use plaintext FTP only (unsafe)"
+msgstr "Użyj wyłącznie nieszyfrowanego FTP (niebezpieczne)"
 
 msgid "CONNECT"
 msgstr "POŁĄCZ"
@@ -1017,8 +1017,8 @@ msgstr "Brak zapisanych serwerów.\nUżyj POŁĄCZEŃ, aby dodać\nlub zaimporto
 msgid "No transfers yet.\nDrag between panes or use the center arrows."
 msgstr "Brak transferów.\nPrzeciągnij między panelami lub użyj środkowych strzałek."
 
-msgid "Only for a trusted legacy/LAN server — password and files are readable on the network."
-msgstr "Tylko dla zaufanego starszego serwera/LAN — hasło i pliki są widoczne w sieci."
+msgid "Connect directly without TLS. Passwords and files are readable on the network."
+msgstr "Łączy bezpośrednio bez TLS. Hasła i pliki są widoczne w sieci."
 
 msgid "PASSIVE"
 msgstr "PASYWNY"
@@ -1402,3 +1402,30 @@ msgstr "Tekst do znalezienia w nazwach plików"
 
 msgid "Use exclusion preset {}"
 msgstr "Użyj zestawu wykluczeń {}"
+
+msgid "Recover synced passwords?"
+msgstr "Odzyskać zsynchronizowane hasła?"
+
+msgid "{n} saved password can be recovered"
+msgid_plural "{n} saved passwords can be recovered"
+msgstr[0] "Można odzyskać {n} zapisane hasło"
+msgstr[1] "Można odzyskać {n} zapisane hasła"
+msgstr[2] "Można odzyskać {n} zapisanych haseł"
+
+msgid "The encrypted vault uses an older credential format. Continue only if you recognize and trust the server profiles downloaded from iCloud."
+msgstr "Zaszyfrowany sejf używa starszego formatu danych logowania. Kontynuuj tylko wtedy, gdy rozpoznajesz i ufasz profilom serwerów pobranym z iCloud."
+
+msgid "Recovery creates endpoint-bound records inside the encrypted vault. Password values are never displayed or sent to a server during recovery."
+msgstr "Odzyskiwanie tworzy w zaszyfrowanym sejfie wpisy przypisane do konkretnych serwerów. Wartości haseł nie są wyświetlane ani wysyłane do serwera podczas odzyskiwania."
+
+msgid "{n} ambiguous password requires manual re-entry"
+msgid_plural "{n} ambiguous passwords require manual re-entry"
+msgstr[0] "{n} niejednoznaczne hasło wymaga ponownego wpisania"
+msgstr[1] "{n} niejednoznaczne hasła wymagają ponownego wpisania"
+msgstr[2] "{n} niejednoznacznych haseł wymaga ponownego wpisania"
+
+msgid "Not Now"
+msgstr "Nie teraz"
+
+msgid "Trust & Recover"
+msgstr "Zaufaj i odzyskaj"

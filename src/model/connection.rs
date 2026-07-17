@@ -92,8 +92,8 @@ pub struct ConnectionSpec {
     /// Optional single SSH jump host (`[user@]host[:port]` or an alias from SSH config).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssh_proxy_jump: Option<String>,
-    /// Legacy FTP is unencrypted. It is opt-in per saved host only, so approving one old/LAN
-    /// server cannot silently permit a TLS-downgrade to plaintext for another connection.
+    /// Plaintext-only FTP is unencrypted. It is an explicit transport mode per saved host, so a
+    /// TLS error can never silently downgrade this or any other connection.
     #[serde(default)]
     pub allow_plaintext_ftp: bool,
     /// Certificate exceptions are security decisions for one endpoint, never a global switch.
@@ -195,6 +195,8 @@ mod tests {
         let mut implicit = spec(0, Protocol::Ftp);
         implicit.ftp_tls_mode = FtpTlsMode::Implicit;
         assert_eq!(implicit.effective_port(), 990);
+        implicit.allow_plaintext_ftp = true;
+        assert_eq!(implicit.effective_port(), 21);
         implicit.port = 2121;
         assert_eq!(implicit.effective_port(), 2121);
         assert_eq!(spec(0, Protocol::Sftp).effective_port(), 22);

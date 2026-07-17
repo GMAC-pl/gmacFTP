@@ -160,7 +160,7 @@ pub(super) fn editor_connection_draft(
     } else {
         FtpFilenameEncoding::Auto
     };
-    let ftp_tls_mode = if protocol == Protocol::Ftp {
+    let configured_ftp_tls_mode = if protocol == Protocol::Ftp {
         match ui.get_editor_ftp_tls_mode().as_str() {
             "explicit" => FtpTlsMode::Explicit,
             "implicit" => FtpTlsMode::Implicit,
@@ -170,15 +170,19 @@ pub(super) fn editor_connection_draft(
         FtpTlsMode::Explicit
     };
     let allow_plaintext_ftp = protocol == Protocol::Ftp && ui.get_editor_allow_plaintext_ftp();
-    if allow_plaintext_ftp && ftp_tls_mode == FtpTlsMode::Implicit {
-        return Err("plaintext FTP cannot be combined with implicit TLS mode".into());
-    }
+    // Plaintext is a distinct transport, not a fallback policy. Canonicalize the unused TLS mode
+    // so saved metadata cannot contain a contradictory plaintext + implicit-TLS combination.
+    let ftp_tls_mode = if allow_plaintext_ftp {
+        FtpTlsMode::Explicit
+    } else {
+        configured_ftp_tls_mode
+    };
     if ftp_data_mode == FtpDataMode::Active && (allow_plaintext_ftp || proxy_url.is_some()) {
         return Err(
             "active data mode requires FTPS and cannot be combined with HTTP/SOCKS5 proxy".into(),
         );
     }
-    let tls_pinned_sha256 = if protocol == Protocol::Ftp {
+    let tls_pinned_sha256 = if protocol == Protocol::Ftp && !allow_plaintext_ftp {
         let raw = ui.get_editor_tls_pin();
         if raw.trim().is_empty() {
             None
@@ -191,10 +195,10 @@ pub(super) fn editor_connection_draft(
     } else {
         None
     };
-    let tls_client_cert = (protocol == Protocol::Ftp)
+    let tls_client_cert = (protocol == Protocol::Ftp && !allow_plaintext_ftp)
         .then(|| ui.get_editor_tls_client_cert().trim().to_string())
         .filter(|path| !path.is_empty());
-    let tls_client_key = (protocol == Protocol::Ftp)
+    let tls_client_key = (protocol == Protocol::Ftp && !allow_plaintext_ftp)
         .then(|| ui.get_editor_tls_client_key().trim().to_string())
         .filter(|path| !path.is_empty());
     if tls_client_cert.is_some() != tls_client_key.is_some() {
@@ -241,7 +245,9 @@ pub(super) fn editor_connection_draft(
             use_ssh_config,
             ssh_proxy_jump,
             allow_plaintext_ftp,
-            accept_invalid_tls: protocol == Protocol::Ftp && ui.get_editor_legacy_invalid_tls(),
+            accept_invalid_tls: protocol == Protocol::Ftp
+                && !allow_plaintext_ftp
+                && ui.get_editor_legacy_invalid_tls(),
             tls_pinned_sha256,
             tls_client_cert,
             tls_client_key,

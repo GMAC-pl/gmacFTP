@@ -17,7 +17,7 @@ files — quickly and safely.
 
 ## ⬇️ Download & install
 
-**[↓ Download gmacFTP for Mac — gmacFTP-0.2.2.dmg](https://github.com/GMAC-pl/gmacftp/releases/download/v0.2.2/gmacFTP-0.2.2.dmg)** · macOS 11+, Apple Silicon
+**[↓ Download gmacFTP for Mac — gmacFTP-0.2.3.dmg](https://github.com/GMAC-pl/gmacftp/releases/download/v0.2.3/gmacFTP-0.2.3.dmg)** · macOS 11+, Apple Silicon
 
 1. Download the `.dmg`.
 2. Open it and **drag gmacFTP into the Applications folder** (a shortcut is inside).
@@ -55,7 +55,7 @@ Signed with an **Apple Developer ID** and **notarized by Apple** — opens clean
 
 ### Download
 
-**[⬇ gmacFTP-0.2.2.dmg](https://github.com/GMAC-pl/gmacftp/releases/download/v0.2.2/gmacFTP-0.2.2.dmg)** — install steps are at the top of this page.
+**[⬇ gmacFTP-0.2.3.dmg](https://github.com/GMAC-pl/gmacftp/releases/download/v0.2.3/gmacFTP-0.2.3.dmg)** — install steps are at the top of this page.
 
 Prefer to build it yourself? See [Build](#build).
 
@@ -63,6 +63,8 @@ Prefer to build it yourself? See [Build](#build).
 
 - **Dual-pane** browser — independent left/right panes (local, remote, or two servers at once)
 - **FTP**, **explicit or implicit FTPS**, and **SFTP** (pure-Rust SSH stack; password, private key, SSH Agent, keyboard-interactive/2FA, and safe `~/.ssh/config` aliases)
+- Plain FTP is a separate, explicit per-server mode for legacy endpoints; FTPS never downgrades
+  after a TLS error
 - Optional FTPS mutual TLS with a local PEM certificate chain + protected PKCS#8 key; bounded credential-free HTTP CONNECT/SOCKS5 proxy tunnels
 - Pipelined SFTP, reused per-server sessions, parallel endpoints, and a live **transfer queue**
 - Transactional local/FTP/FTPS/SFTP writes, resumable uploads/downloads, crash recovery, and
@@ -81,6 +83,8 @@ Prefer to build it yourself? See [Build](#build).
   storage, notifications, automatic updates, and workspace restoration
 - **macOS Keychain** secret storage (master key never on disk)
 - Optional **iCloud sync** of saved servers across your Macs (toggle in the app menu; if two Macs edit at once, the newest change wins)
+- Explicit recovery for older synced password records; gmacFTP converts only unambiguous mappings
+  after you confirm that you trust the downloaded server list
 - Connection manager, FileZilla `sitemanager.xml` + JSON import (including implicit-FTPS entries)
 - Native macOS **menu bar** (App / File / Edit / View / Window / Help) + About panel
 - Light/dark themes and a complete EN/PL UI that follows the macOS language by default
@@ -208,7 +212,7 @@ która po prostu przenosi Twoje pliki — szybko i bezpiecznie.
 
 ### Pobranie i instalacja
 
-**[⬇ Pobierz gmacFTP dla Maca — gmacFTP-0.2.2.dmg](https://github.com/GMAC-pl/gmacftp/releases/download/v0.2.2/gmacFTP-0.2.2.dmg)** · macOS 11+, Apple Silicon
+**[⬇ Pobierz gmacFTP dla Maca — gmacFTP-0.2.3.dmg](https://github.com/GMAC-pl/gmacftp/releases/download/v0.2.3/gmacFTP-0.2.3.dmg)** · macOS 11+, Apple Silicon
 
 1. Pobierz plik `.dmg`.
 2. Otwórz go i **przeciągnij gmacFTP do folderu Aplikacje** (skrót jest w środku).
@@ -228,6 +232,8 @@ Podpisana **Apple Developer ID** i **zanotaryzowana przez Apple** — uruchamia 
 
 - **Dwupanelowa** przeglądarka — niezależne panele (lokalny, zdalny albo dwa serwery naraz)
 - **FTP**, **FTPS** (explicit lub implicit TLS) i **SFTP** (SSH w czystym Ruście; hasło, klucz, SSH Agent, keyboard-interactive/2FA i bezpieczne aliasy `~/.ssh/config`)
+- Zwykły FTP jest osobnym, jawnym trybem dla konkretnego starszego serwera; FTPS nigdy nie obniża
+  ochrony po błędzie TLS
 - Opcjonalne wzajemne TLS dla FTPS z lokalnym łańcuchem certyfikatów PEM i chronionym kluczem PKCS#8; ograniczone tunele proxy HTTP CONNECT/SOCKS5 bez danych logowania
 - Potokowe SFTP, współdzielone sesje per serwer, równoległe endpointy i live **kolejka transferów**
 - Transakcyjne zapisy lokalne/FTP/FTPS/SFTP, wznawianie wysyłania i pobierania, odzyskiwanie po
@@ -246,6 +252,8 @@ Podpisana **Apple Developer ID** i **zanotaryzowana przez Apple** — uruchamia 
   pamięci, powiadomień, aktualizacji i odtwarzania obszaru roboczego
 - Sekrety w **macOS Keychain** (klucz główny nigdy na dysku)
 - Opcjonalna **synchronizacja iCloud** zapisanych serwerów między Macami (przełącznik w menu; przy jednoczesnej edycji na dwóch Macach wygrywa najnowsza zmiana)
+- Kontrolowane odzyskiwanie starszych zsynchronizowanych haseł — gmacFTP konwertuje tylko
+  jednoznaczne wpisy po potwierdzeniu, że ufasz pobranej liście serwerów
 - Menedżer połączeń, import z FileZilla `sitemanager.xml` + JSON (także wpisy implicit FTPS)
 - Natywne **menu** macOS (App / File / Edit / View / Window / Help) + panel About
 - Jasny/ciemny motyw oraz pełny interfejs EN/PL, domyślnie zgodny z językiem macOS
@@ -312,8 +320,8 @@ Więcej: [`SECURITY.md`](SECURITY.md).
 ### Status
 
 gmacFTP to **wersja rozwojowa (pre-1.0)**. Wersja 0.2 dodaje odporne transakcyjne transfery,
-zaawansowane zarządzanie plikami, natywne ustawienia, dostępność i obsługę wszystkich współczesnych
-Maców; przed 1.0 skupiamy się na szerokiej kompatybilności serwerów i dopracowaniu UI.
+zaawansowane zarządzanie plikami, natywne ustawienia, dostępność i obsługę Maców z Apple Silicon;
+przed 1.0 skupiamy się na szerokiej kompatybilności serwerów i dopracowaniu UI.
 
 ### Wesprzyj gmacFTP
 

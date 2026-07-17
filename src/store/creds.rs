@@ -111,6 +111,27 @@ pub enum CredentialError {
     Other(String),
 }
 
+/// Privacy-safe summary of how an encrypted vault relates to the currently saved endpoints.
+/// It deliberately exposes only counts: never hosts, accounts, identifiers, or secret bytes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CredentialHealth {
+    pub vault_entries: usize,
+    pub endpoint_bound_entries: usize,
+    pub legacy_entries: usize,
+    pub matching_endpoint_credentials: usize,
+    pub recoverable_legacy_credentials: usize,
+    pub ambiguous_legacy_credentials: usize,
+    pub invalid_endpoint_specs: usize,
+}
+
+/// Result of an explicitly confirmed conversion from legacy `(host, user)` records to
+/// endpoint-bound records. Ambiguous records are never copied automatically.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LegacyCredentialRecovery {
+    pub recovered: usize,
+    pub ambiguous: usize,
+}
+
 /// Platform-agnostic secret store. Implementations: [`MacCredentialStore`] (Keychain,
 /// macOS only) and [`InMemoryStore`] (tests / fallback).
 pub trait CredentialStore: Send + Sync {
@@ -149,6 +170,24 @@ pub trait CredentialStore: Send + Sync {
     /// callers never mark an incomplete migration as finished. Default: no migrated entries.
     fn migrate_from_keychain(&self) -> Result<usize, CredentialError> {
         Ok(0)
+    }
+
+    /// Return a redacted consistency summary for support/recovery UI. Store implementations that
+    /// do not use the encrypted file vault may keep the default empty summary.
+    fn credential_health(
+        &self,
+        _specs: &[ConnectionSpec],
+    ) -> Result<CredentialHealth, CredentialError> {
+        Ok(CredentialHealth::default())
+    }
+
+    /// Convert legacy vault entries only after the user has confirmed that the downloaded server
+    /// list is trusted. Implementations must refuse ambiguous `(host, user)` mappings.
+    fn recover_legacy_credentials(
+        &self,
+        _specs: &[ConnectionSpec],
+    ) -> Result<LegacyCredentialRecovery, CredentialError> {
+        Ok(LegacyCredentialRecovery::default())
     }
 }
 

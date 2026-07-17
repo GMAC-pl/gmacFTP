@@ -843,6 +843,9 @@ pub fn run() {
     } else {
         bootstrap(&store)
     };
+    if !design_demo && !ui.get_passphrase_open() {
+        offer_legacy_credential_recovery(&ui, store.as_ref(), &connections);
+    }
     let conns: ConnList = Arc::new(Mutex::new(connections));
 
     let home = home_dir();
@@ -1166,6 +1169,7 @@ pub fn run() {
         panes.clone(),
         engine.clone(),
     );
+    wire_credential_recovery(&ui, store.clone(), conns.clone());
     wire_keyboard_interactive(&ui, &handle);
     wire_host_key_trust(&ui, &handle, store.clone(), panes.clone());
     wire_tls_certificate_trust(
@@ -5105,6 +5109,116 @@ fn wire_overwrite(
 
 /// Wire the sync-passphrase dialog: "set" (first time enabling sync) wraps the master key +
 /// enables sync; "enter" (a pulled vault that's locked here) unlocks it with the passphrase.
+fn offer_legacy_credential_recovery(
+    ui: &App,
+    store: &dyn CredentialStore,
+    specs: &[ConnectionSpec],
+) {
+    if ui.get_passphrase_open() || ui.get_credential_recovery_open() {
+        return;
+    }
+    match store.credential_health(specs) {
+        Ok(health) if health.recoverable_legacy_credentials > 0 => {
+            let recoverable =
+                i32::try_from(health.recoverable_legacy_credentials).unwrap_or(i32::MAX);
+            let ambiguous = i32::try_from(health.ambiguous_legacy_credentials).unwrap_or(i32::MAX);
+            ui.set_credential_recovery_count(recoverable);
+            ui.set_credential_recovery_ambiguous(ambiguous);
+            ui.set_credential_recovery_open(true);
+            ui.set_status(
+                "Older encrypted credentials were found. Confirm the downloaded server list to recover them."
+                    .into(),
+            );
+            tracing::warn!(
+                recoverable = health.recoverable_legacy_credentials,
+                ambiguous = health.ambiguous_legacy_credentials,
+                "legacy synced credentials require an explicit recovery decision"
+            );
+        }
+        Ok(health) if health.ambiguous_legacy_credentials > 0 => {
+            ui.set_status(
+                format!(
+                    "Ambiguous synced passwords requiring manual re-entry: {}.",
+                    health.ambiguous_legacy_credentials
+                )
+                .into(),
+            );
+        }
+        Ok(_) => {}
+        Err(error) => {
+            tracing::warn!(%error, "could not inspect encrypted credential consistency");
+        }
+    }
+}
+
+fn wire_credential_recovery(ui: &App, store: Arc<dyn CredentialStore>, conns: ConnList) {
+    let (st, cn, uw) = (store, conns, ui.as_weak());
+    ui.on_resolve_credential_recovery(move |approved| {
+        let Some(ui) = uw.upgrade() else {
+            return;
+        };
+        ui.set_credential_recovery_open(false);
+        if !approved {
+            ui.set_status(
+                "Password recovery was not performed. No credential data was changed.".into(),
+            );
+            return;
+        }
+        let specs = match cn.lock() {
+            Ok(connections) => connections.clone(),
+            Err(_) => {
+                ui.set_error("Could not lock saved connections for password recovery.".into());
+                return;
+            }
+        };
+        let expected = ui.get_credential_recovery_count().max(0) as usize;
+        let before = match st.credential_health(&specs) {
+            Ok(health) => health,
+            Err(error) => {
+                ui.set_error(format!("Could not inspect saved passwords: {error}").into());
+                return;
+            }
+        };
+        if before.recoverable_legacy_credentials != expected {
+            ui.set_error(
+                "The server list or encrypted vault changed before recovery. Review it and try again."
+                    .into(),
+            );
+            return;
+        }
+        match st.recover_legacy_credentials(&specs) {
+            Ok(result) if result.recovered > 0 => {
+                let mut settings = store::settings::load();
+                settings.endpoint_credentials_migrated_v2 = true;
+                if let Err(error) = store::settings::try_save(&settings) {
+                    tracing::warn!(%error, "credential recovery succeeded but migration state was not saved");
+                }
+                ui.set_credential_recovery_count(0);
+                ui.set_credential_recovery_ambiguous(0);
+                ui.set_error("".into());
+                let message = if result.ambiguous == 0 {
+                    format!(
+                        "Recovered saved passwords: {}. You can connect normally now.",
+                        result.recovered
+                    )
+                } else {
+                    format!(
+                        "Recovered saved passwords: {}; ambiguous passwords requiring manual re-entry: {}.",
+                        result.recovered, result.ambiguous
+                    )
+                };
+                ui.set_status(message.into());
+            }
+            Ok(_) => ui.set_error(
+                "No password could be recovered. The encrypted vault was left unchanged.".into(),
+            ),
+            Err(error) => {
+                ui.set_error(format!("Could not recover saved passwords: {error}").into())
+            }
+        }
+    });
+}
+
 fn validate_new_sync_passphrase(value: &str) -> Result<(), String> {
     if value.chars().count() < MIN_SYNC_PASSPHRASE_CHARS || value.len() > MAX_SYNC_PASSPHRASE_BYTES
     {
@@ -5148,6 +5262,13 @@ fn wire_passphrase(
                 }
                 if let Some(ui) = uw.upgrade() {
                     ui.set_settings_message("Encrypted settings operation cancelled.".into());
+                }
+            } else if let Some(ui) = uw.upgrade() {
+                // The master key may already be available through iCloud Keychain even when the
+                // local passphrase-setup flag still opened this dialog. Cancelling must not hide
+                // a separately recoverable legacy vault until the next launch.
+                if let Ok(specs) = cn.lock() {
+                    offer_legacy_credential_recovery(&ui, st.as_ref(), &specs);
                 }
             }
             return; // Cancel
@@ -5382,6 +5503,9 @@ fn wire_passphrase(
             if let Some(ui) = uw.upgrade() {
                 refresh_connections_model(&ui, &cn);
                 ui.set_status("Vault unlocked — passwords are available.".into());
+                if let Ok(specs) = cn.lock() {
+                    offer_legacy_credential_recovery(&ui, st.as_ref(), &specs);
+                }
             }
         } else if let Some(ui) = uw.upgrade() {
             ui.set_error("Wrong passphrase.".into());
@@ -11758,6 +11882,31 @@ mod path_safety_tests {
             1,
             "the updater dismiss action must receive a physical pointer click"
         );
+
+        // Legacy-vault recovery is another full-window security prompt. Both choices must stay
+        // reachable by a real pointer event so the user can recover or safely defer.
+        ui.set_update_open(false);
+        let recovery_decisions = Rc::new(RefCell::new(Vec::new()));
+        let recorded = recovery_decisions.clone();
+        ui.on_resolve_credential_recovery(move |approved| recorded.borrow_mut().push(approved));
+        ui.set_credential_recovery_count(2);
+        ui.set_credential_recovery_open(true);
+
+        let recover = ElementHandle::find_by_accessible_label(&ui, "Trust & Recover")
+            .next()
+            .expect("the credential recovery action must be exposed");
+        let recover_size = recover.size();
+        assert!(recover_size.width > 0.0 && recover_size.height > 0.0);
+        recover.mock_single_click(slint::platform::PointerEventButton::Left);
+        assert_eq!(recovery_decisions.borrow().as_slice(), &[true]);
+
+        let defer = ElementHandle::find_by_accessible_label(&ui, "Not Now")
+            .next()
+            .expect("the credential recovery defer action must be exposed");
+        let defer_size = defer.size();
+        assert!(defer_size.width > 0.0 && defer_size.height > 0.0);
+        defer.mock_single_click(slint::platform::PointerEventButton::Left);
+        assert_eq!(recovery_decisions.borrow().as_slice(), &[true, false]);
     }
 
     #[test]
