@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.2.4 — 2026-07-17
+
+The in-app updater compatibility fix.
+
+- **Reliable Apple ticket validation.** Downloaded releases now retain `.dmg` as the final suffix
+  of their private staging filename. Apple's `stapler` therefore recognizes the file as a disk
+  image and validates its already-stapled notarization ticket instead of rejecting the temporary
+  `.part` name as a generic document.
+- **Security checks remain strict.** The updater still exposes the file only after the exact GitHub
+  SHA-256 digest and size, Developer ID signature, Apple team, DMG identifier, and stapled ticket
+  all pass verification.
+- **One-time manual upgrade.** Versions through 0.2.3 run the old validation code before installing
+  an update, so moving to 0.2.4 requires the signed DMG or Homebrew once. In-app installation works
+  normally again for subsequent releases.
+
 ## 0.2.3 — 2026-07-17
 
 The FTP transport-clarity and compatibility update.

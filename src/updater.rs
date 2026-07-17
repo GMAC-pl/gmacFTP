@@ -245,6 +245,18 @@ pub fn is_newer(latest: &str, current: &str) -> bool {
     matches!((parse_version(latest), parse_version(current)), (Some(a), Some(b)) if a > b)
 }
 
+fn download_staging_path(dir: &Path, version: &str) -> PathBuf {
+    // `xcrun stapler` determines whether it can validate a disk image from the filename suffix.
+    // A complete DMG staged as `*.part` is rejected as a generic Document before its ticket is
+    // inspected. Keep `.dmg` as the final extension while retaining a hidden, unique partial name.
+    dir.join(format!(
+        ".gmacFTP-{version}-{}-{:016x}{:016x}.part.dmg",
+        std::process::id(),
+        rand::random::<u64>(),
+        rand::random::<u64>()
+    ))
+}
+
 /// Download, hash, verify the signed/notarized DMG, then atomically expose it in Downloads.
 pub fn download(
     url: &str,
@@ -266,12 +278,7 @@ pub fn download(
         .and_then(|d| d.download_dir()?.canonicalize().ok())
         .ok_or_else(|| "Downloads directory is unavailable".to_string())?;
     let final_path = dir.join(format!("gmacFTP-{version}.dmg"));
-    let part = dir.join(format!(
-        ".gmacFTP-{version}-{}-{:016x}{:016x}.part",
-        std::process::id(),
-        rand::random::<u64>(),
-        rand::random::<u64>()
-    ));
+    let part = download_staging_path(&dir, version);
 
     let result = (|| -> Result<(), String> {
         let response = ureq::get(url)
@@ -435,6 +442,18 @@ mod tests {
         assert!(normalized_sha256("sha256:abcd").is_err());
         assert!(normalized_sha256(&"z".repeat(64)).is_err());
         assert_eq!(encode_hex(&[0x00, 0x0f, 0xa5, 0xff]), "000fa5ff");
+    }
+
+    #[test]
+    fn download_staging_file_remains_a_recognizable_disk_image() {
+        let path = download_staging_path(Path::new("/private/tmp"), "1.2.3");
+        let name = path.file_name().unwrap().to_string_lossy();
+        assert!(name.starts_with(".gmacFTP-1.2.3-"));
+        assert!(name.ends_with(".part.dmg"));
+        assert_eq!(
+            path.extension().and_then(|value| value.to_str()),
+            Some("dmg")
+        );
     }
 
     fn valid_newer_release(notes: &str) -> Vec<u8> {

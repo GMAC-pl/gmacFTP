@@ -17,7 +17,7 @@ files — quickly and safely.
 
 ## ⬇️ Download & install
 
-**[↓ Download gmacFTP for Mac — gmacFTP-0.2.3.dmg](https://github.com/GMAC-pl/gmacftp/releases/download/v0.2.3/gmacFTP-0.2.3.dmg)** · macOS 11+, Apple Silicon
+**[↓ Download gmacFTP for Mac — gmacFTP-0.2.4.dmg](https://github.com/GMAC-pl/gmacftp/releases/download/v0.2.4/gmacFTP-0.2.4.dmg)** · macOS 11+, Apple Silicon
 
 1. Download the `.dmg`.
 2. Open it and **drag gmacFTP into the Applications folder** (a shortcut is inside).
@@ -55,7 +55,7 @@ Signed with an **Apple Developer ID** and **notarized by Apple** — opens clean
 
 ### Download
 
-**[⬇ gmacFTP-0.2.3.dmg](https://github.com/GMAC-pl/gmacftp/releases/download/v0.2.3/gmacFTP-0.2.3.dmg)** — install steps are at the top of this page.
+**[⬇ gmacFTP-0.2.4.dmg](https://github.com/GMAC-pl/gmacftp/releases/download/v0.2.4/gmacFTP-0.2.4.dmg)** — install steps are at the top of this page.
 
 Prefer to build it yourself? See [Build](#build).
 
@@ -212,7 +212,7 @@ która po prostu przenosi Twoje pliki — szybko i bezpiecznie.
 
 ### Pobranie i instalacja
 
-**[⬇ Pobierz gmacFTP dla Maca — gmacFTP-0.2.3.dmg](https://github.com/GMAC-pl/gmacftp/releases/download/v0.2.3/gmacFTP-0.2.3.dmg)** · macOS 11+, Apple Silicon
+**[⬇ Pobierz gmacFTP dla Maca — gmacFTP-0.2.4.dmg](https://github.com/GMAC-pl/gmacftp/releases/download/v0.2.4/gmacFTP-0.2.4.dmg)** · macOS 11+, Apple Silicon
 
 1. Pobierz plik `.dmg`.
 2. Otwórz go i **przeciągnij gmacFTP do folderu Aplikacje** (skrót jest w środku).
