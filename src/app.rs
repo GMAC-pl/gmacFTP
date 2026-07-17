@@ -793,8 +793,7 @@ pub fn run() {
     // Upgrade legacy `(host, user)` credentials only for endpoints already present in the local,
     // pre-sync metadata. Doing this before reading an unauthenticated sync-folder metadata file
     // prevents that file from redirecting a legacy password into a new protocol or port.
-    let benchmark = benchmark_mode();
-    let design_demo = use_design_demo_main() || benchmark;
+    let design_demo = use_design_demo_main();
     if !design_demo && !settings.endpoint_credentials_migrated_v2 {
         let migration_store = store::default_store();
         match migrate_saved_passwords(&migration_store) {
@@ -839,7 +838,7 @@ pub fn run() {
         ui.set_passphrase_open(true);
     }
 
-    let connections = if use_design_demo_connections() || benchmark {
+    let connections = if use_design_demo_connections() {
         design_demo_connections()
     } else {
         bootstrap(&store)
@@ -1094,11 +1093,7 @@ pub fn run() {
         panes.clone(),
         engine.clone(),
     );
-    wire_updates(
-        &ui,
-        settings.check_updates_automatically,
-        !design_demo && !benchmark,
-    );
+    wire_updates(&ui, settings.check_updates_automatically, !design_demo);
     wire_sort(&ui, 0);
     wire_sort(&ui, 1);
     // connection manager
@@ -1246,7 +1241,6 @@ pub fn run() {
 
     if settings.open_connection_manager_on_launch
         && std::env::var_os("MACKFTP_OPEN_PANEL").is_none()
-        && !benchmark
     {
         ui.set_manager_open(true);
     }
@@ -1359,13 +1353,6 @@ pub fn run() {
         timer
     };
 
-    if benchmark {
-        // `scripts/bench-cold-start.sh` measures real platform/UI/controller construction but
-        // must neither touch the user's vault nor wait indefinitely in the event loop.
-        slint::Timer::single_shot(Duration::from_millis(1), || {
-            let _ = slint::quit_event_loop();
-        });
-    }
     ui.run().expect("gmacFTP event loop exited with error");
     // Persist only non-secret workspace coordinates after a clean event-loop exit. Remote server
     // paths and credentials are deliberately excluded from this lightweight restoration state.
@@ -1430,10 +1417,6 @@ fn use_design_demo_connections() -> bool {
 
 fn use_design_demo_main() -> bool {
     std::env::var_os("MACKFTP_DEMO_MAIN").is_some()
-}
-
-fn benchmark_mode() -> bool {
-    std::env::args_os().any(|argument| argument == "--bench")
 }
 
 fn design_demo_connections() -> Vec<ConnectionSpec> {
@@ -12187,106 +12170,6 @@ mod path_safety_tests {
 
         assert!(snapshot.is_none());
         assert_eq!(batches, vec![256]);
-        let _ = std::fs::remove_dir_all(temp);
-    }
-
-    #[test]
-    #[ignore = "repeatable performance benchmark; run through scripts/bench-performance.sh"]
-    fn benchmark_virtualized_models_10k_and_50k_rows() {
-        for count in [10_000_usize, 50_000] {
-            let started = Instant::now();
-            let rows = (0..count)
-                .map(|index| {
-                    demo_entry(
-                        &format!("entry-{index:05}.bin"),
-                        index % 17 == 0,
-                        "",
-                        "1 KB",
-                        1024,
-                        index as i32,
-                    )
-                })
-                .collect::<Vec<_>>();
-            let model = VecModel::from(rows);
-            let construction = started.elapsed();
-
-            // Approximate repeated ListView viewport reads without eagerly instantiating one UI
-            // component per file. Every sampled scroll reads only a small visible window.
-            let viewport_started = Instant::now();
-            let mut checksum = 0usize;
-            for scroll in 0..200 {
-                let start = scroll * count.saturating_sub(80) / 199;
-                for index in start..(start + 80).min(count) {
-                    checksum ^=
-                        std::hint::black_box(model.row_data(index).unwrap().name.len() + index);
-                }
-            }
-            let viewport = viewport_started.elapsed();
-            assert_eq!(model.row_count(), count);
-            std::hint::black_box(checksum);
-            println!(
-                "BENCH virtualized_rows: rows={count} construct_ms={} viewport_reads_ms={}",
-                construction.as_millis(),
-                viewport.as_millis()
-            );
-        }
-    }
-
-    #[test]
-    #[ignore = "repeatable performance benchmark; run through scripts/bench-performance.sh"]
-    fn benchmark_many_small_transactional_file_copies() {
-        let count = std::env::var("GMACFTP_BENCH_SMALL_FILES")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(1_000)
-            .clamp(100, 20_000);
-        let temp = scratch_dir();
-        let source = temp.join("source");
-        let destination = temp.join("destination");
-        std::fs::create_dir_all(&source).unwrap();
-        for index in 0..count {
-            std::fs::write(source.join(format!("file-{index:05}.bin")), [0x5a; 256]).unwrap();
-        }
-
-        let started = Instant::now();
-        let copied = fs_copy_tree(&source, &destination).unwrap();
-        let elapsed = started.elapsed();
-        assert_eq!(copied, count);
-        println!(
-            "BENCH many_small_files: files={count} elapsed_ms={} files_per_second={:.0}",
-            elapsed.as_millis(),
-            count as f64 / elapsed.as_secs_f64()
-        );
-        let _ = std::fs::remove_dir_all(temp);
-    }
-
-    #[test]
-    #[ignore = "repeatable performance benchmark; run through scripts/bench-performance.sh"]
-    fn benchmark_recursive_local_metadata() {
-        let count = std::env::var("GMACFTP_BENCH_METADATA_FILES")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(10_000)
-            .clamp(1_000, 100_000);
-        let temp = scratch_dir();
-        let root = temp.join("tree");
-        for index in 0..count {
-            let directory = root.join(format!("group-{:03}", index % 100));
-            std::fs::create_dir_all(&directory).unwrap();
-            std::fs::write(directory.join(format!("file-{index:06}")), [0x33; 64]).unwrap();
-        }
-
-        let started = Instant::now();
-        let stats = local_folder_stats(&root, count + 1);
-        let elapsed = started.elapsed();
-        assert_eq!(stats.files_scanned, count);
-        assert_eq!(stats.size, count as u64 * 64);
-        assert!(!stats.truncated);
-        println!(
-            "BENCH recursive_metadata: files={count} elapsed_ms={} files_per_second={:.0}",
-            elapsed.as_millis(),
-            count as f64 / elapsed.as_secs_f64()
-        );
         let _ = std::fs::remove_dir_all(temp);
     }
 

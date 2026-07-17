@@ -3459,47 +3459,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "repeatable performance benchmark; run through scripts/bench-performance.sh"]
-    async fn benchmark_high_latency_sftp_upload() {
-        let mib = std::env::var("GMACFTP_BENCH_SFTP_MIB")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(4)
-            .clamp(1, 256);
-        let latency_ms = std::env::var("GMACFTP_BENCH_SFTP_LATENCY_MS")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(40)
-            .clamp(1, 1_000);
-        let expected = (0..mib * 1024 * 1024)
-            .map(|index| (index % 251) as u8)
-            .collect::<Vec<_>>();
-        let remote = Arc::new(Mutex::new(Vec::new()));
-        let sftp =
-            memory_sftp_with_latency(remote.clone(), false, Duration::from_millis(latency_ms))
-                .await;
-        let dir = TestDir::new();
-        let source = dir.0.join("latency-benchmark.bin");
-        std::fs::write(&source, &expected).unwrap();
-        let file = tokio::fs::File::open(&source).await.unwrap();
-
-        let started = Instant::now();
-        let uploaded = upload_with_session(&sftp, file, "/bench.bin", |_| {}, None, None)
-            .await
-            .unwrap();
-        let elapsed = started.elapsed();
-        let mebibytes_per_second = uploaded as f64 / 1024.0 / 1024.0 / elapsed.as_secs_f64();
-
-        assert_eq!(uploaded, expected.len() as u64);
-        assert_eq!(*remote.lock().unwrap(), expected);
-        println!(
-            "BENCH high_latency_sftp: bytes={uploaded} latency_ms={latency_ms} elapsed_ms={} MiB/s={mebibytes_per_second:.2}",
-            elapsed.as_millis()
-        );
-        let _ = sftp.close_session();
-    }
-
-    #[tokio::test]
     async fn sftp_upload_replaces_existing_file_only_after_complete_stage() {
         let destination = "/site/app.bin";
         let state = transactional_state(destination, b"old complete data");

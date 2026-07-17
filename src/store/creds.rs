@@ -1,5 +1,5 @@
 //! Credential storage abstraction. Passwords NEVER live in app state — only here,
-//! behind the macOS Keychain (or an in-memory stand-in for tests/non-macOS).
+//! behind the macOS Keychain (or an in-memory fallback on non-macOS platforms).
 
 use crate::model::{ConnectionSpec, Protocol};
 

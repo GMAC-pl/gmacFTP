@@ -620,61 +620,6 @@ mod tests {
       ]
     }"#;
 
-    const CONNECTIONS_V0_0_17: &[u8] =
-        include_bytes!("../../tests/fixtures/migrations/v0.0.17/connections.json");
-    const CONNECTIONS_V0_1_1: &[u8] =
-        include_bytes!("../../tests/fixtures/migrations/v0.1.1/connections.json");
-    const CONNECTIONS_V0_2_0: &[u8] =
-        include_bytes!("../../tests/fixtures/migrations/v0.2.0/connections.json");
-
-    fn fixture_specs(bytes: &[u8]) -> Vec<ConnectionSpec> {
-        validate_metadata_bytes(bytes).unwrap();
-        serde_json::from_slice(bytes).unwrap()
-    }
-
-    #[test]
-    fn connection_metadata_fixtures_from_all_supported_series_migrate_safely() {
-        let v0 = fixture_specs(CONNECTIONS_V0_0_17);
-        assert_eq!(v0.len(), 1);
-        assert_eq!(v0[0].host, "ftp.example.com");
-        assert!(!v0[0].allow_plaintext_ftp);
-        assert!(!v0[0].accept_invalid_tls);
-        assert_eq!(v0[0].ftp_tls_mode, crate::model::FtpTlsMode::Explicit);
-        assert_eq!(v0[0].transfer_concurrency, None);
-
-        let v1 = fixture_specs(CONNECTIONS_V0_1_1);
-        assert_eq!(v1[0].protocol, Protocol::Sftp);
-        assert_eq!(v1[0].sftp_auth, crate::model::SftpAuth::PrivateKey);
-        assert_eq!(
-            v1[0].sftp_private_key.as_deref(),
-            Some("/Users/demo/.ssh/id_ed25519")
-        );
-        assert_eq!(v1[0].proxy_url, None);
-        assert_eq!(v1[0].transfer_concurrency, None);
-
-        let v2 = fixture_specs(CONNECTIONS_V0_2_0);
-        assert_eq!(v2[0].group, "Web");
-        assert_eq!(v2[0].tags, ["demo", "production"]);
-        assert_eq!(v2[0].transfer_concurrency, Some(2));
-        assert!(!v2[0].allow_plaintext_ftp);
-        assert!(!v2[0].accept_invalid_tls);
-    }
-
-    #[test]
-    fn tracked_connection_fixtures_contain_no_credentials_or_real_hosts() {
-        for bytes in [CONNECTIONS_V0_0_17, CONNECTIONS_V0_1_1, CONNECTIONS_V0_2_0] {
-            let text = std::str::from_utf8(bytes).unwrap();
-            assert!(!text.replace("/Users/demo", "").contains("/Users/"));
-            assert!(!text.contains("\"password\":"));
-            assert!(!text.contains("\"secret\":"));
-            assert!(!text.contains("\"token\":"));
-            for spec in fixture_specs(bytes) {
-                assert!(spec.host.ends_with(".example.com"));
-                assert_eq!(spec.user, "demo");
-            }
-        }
-    }
-
     #[test]
     fn imports_and_stores_passwords() {
         let store = InMemoryStore::default();

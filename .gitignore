@@ -15,6 +15,25 @@
 *.iml
 *.swp
 
+# local development workspaces
+/examples/
+/tests/
+/devtools/
+*.pen
+
+# local verification and generated reports
+/coverage/
+/reports/
+/artifacts/
+*.log
+*.profraw
+*.profdata
+junit*.xml
+/scripts/bench-*.sh
+/scripts/check-*.sh
+/scripts/capture-*.sh
+/scripts/fix-*.sh
+
 # macOS
 .DS_Store
 **/.DS_Store
@@ -37,4 +56,9 @@ embedded.provisionprofile
 /docs/*_WORKLOG.md
 /docs/WIP*.md
 /docs/*_NOTES.md
+/docs/*TEST*.md
+/docs/*BENCHMARK*.md
+/docs/*REPORT*.md
+/docs/*CHECKLIST*.md
+/docs/*VISUAL_SYSTEM*.md
 /.work/

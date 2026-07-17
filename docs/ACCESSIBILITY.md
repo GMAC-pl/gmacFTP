@@ -30,14 +30,6 @@ keyboard operation in both English and Polish.
 Focus is shown with a high-contrast accent ring or line. Mouse behavior, Finder-style
 `Shift-click` / `Command-click`, and drag and drop are unchanged.
 
-## Regression coverage
-
-The headless UI test `keyboard_only_shortcuts_and_focus_activation_reach_ui_actions` dispatches
-real key events and verifies Command-A, Shift+Arrow, Return, Tab, and Space. It also inspects the
-compiled accessibility tree and verifies representative button, text-input, checkbox, and slider
-roles, localized labels, checkbox state/action, and slider values. Slint introspection metadata is
-compiled into development and test profiles only; release binaries do not contain it.
-
 ## Polski
 
 gmacFTP udostępnia własne kontrolki usługom dostępności macOS i pozwala obsługiwać interfejs bez

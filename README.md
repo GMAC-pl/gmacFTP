@@ -99,9 +99,8 @@ Prefer to build it yourself? See [Build](#build).
 |   ![Transfers](docs/screenshots/transfers.png)   |       ![Updater](docs/screenshots/update.png)      |
 |                  Transfer queue                  |          Verified update workflow                  |
 
-All screenshots are generated from the isolated demo fixture (`example.com`, `demo`, and
-`/Users/demo`). It never opens saved connections, the Keychain, or the network. Regenerate the
-complete set with `bash scripts/capture-demo-screenshots.sh`.
+All screenshots contain isolated demonstration data only (`example.com`, `demo`, and
+`/Users/demo`). They contain no saved connections, Keychain data, or private server details.
 
 ### Tech stack
 
@@ -149,7 +148,7 @@ connection manager, and local copy flows with no server at all.
   private data.
 - Passwords are never stored in connection metadata.
 
-More in [`docs/PRIVACY.md`](docs/PRIVACY.md) and [`SECURITY.md`](SECURITY.md).
+More in [`SECURITY.md`](SECURITY.md).
 
 ### Status
 
@@ -265,9 +264,8 @@ Podpisana **Apple Developer ID** i **zanotaryzowana przez Apple** — uruchamia 
 |   ![Transfers](docs/screenshots/transfers.png)   |       ![Updater](docs/screenshots/update.png)      |
 |                Kolejka transferów                |       Weryfikowany proces aktualizacji             |
 
-Wszystkie zrzuty są generowane z odizolowanych danych demo (`example.com`, `demo` i
-`/Users/demo`). Generator nie otwiera zapisanych połączeń, Pęku kluczy ani sieci. Cały zestaw można
-odtworzyć poleceniem `bash scripts/capture-demo-screenshots.sh`.
+Wszystkie zrzuty zawierają wyłącznie odizolowane dane demonstracyjne (`example.com`, `demo` i
+`/Users/demo`). Nie zawierają zapisanych połączeń, danych Pęku kluczy ani prywatnych serwerów.
 
 ### Stos techniczny
 
@@ -309,7 +307,7 @@ sortowanie, menedżer połączeń i lokalne kopiowanie bez żadnego serwera.
 - `data/`, `.env*`, artefakty builda i stan narzędzi są gitignorowane; repo nie zawiera prywatnych danych.
 - Hasła nigdy nie trafiają do metadanych połączeń.
 
-Więcej: [`docs/PRIVACY.md`](docs/PRIVACY.md) oraz [`SECURITY.md`](SECURITY.md).
+Więcej: [`SECURITY.md`](SECURITY.md).
 
 ### Status
 

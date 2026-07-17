@@ -21,16 +21,3 @@ Rust. `src/i18n.rs` translates only known fixed text and fixed fragments, preser
 details unchanged. Add a precise entry there when introducing a new message shown through a
 runtime-localized status, summary, or error property. Never translate or redact a server detail by
 guessing at its content.
-
-## Checks
-
-Run:
-
-```sh
-cargo test i18n::tests
-cargo check --all-targets
-```
-
-The localization regression test verifies that every `@tr` source string has a Polish catalog
-entry, that the old inline language conditionals do not return, and that the displayed app version
-is not hard-coded.

@@ -7,10 +7,6 @@ description = "gmacFTP — native, lightweight FTP/FTPS/SFTP client for macOS"
 license = "GPL-3.0"
 publish = false
 
-[[example]]
-name = "ui_render_check"
-path = "devtools/ui_render_check.rs"
-
 [dependencies]
 # --- GUI: Slint 1.x, FemtoVG renderer on wgpu (Metal). NO Skia, NO Qt, NO web view. ---
 slint = { version = "1.16", default-features = false, features = [
@@ -88,14 +84,6 @@ slint-build = "1.16"
 [dev-dependencies]
 # Headless UI event delivery for keyboard/focus regression tests; never linked into release builds.
 i-slint-backend-testing = "=1.16.1"
-# Headless screenshot generation for `devtools/ui_render_check.rs`. Dev dependency features are
-# not present in signed release binaries.
-slint = { version = "1.16", default-features = false, features = [
-    "std",
-    "renderer-software",
-    "compat-1-2",
-] }
-image = { version = "0.25", default-features = false, features = ["png"] }
 
 # --- Release profile: small binary + fast cold start. MEASURE with hyperfine, don't guess. ---
 [profile.release]

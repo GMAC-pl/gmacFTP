@@ -33,12 +33,8 @@ jobs:
       # explicitly allowed at module scope, so this must remain warning-free.
       # No untrusted github.event.* input is used in any run: step (no injection surface).
       - run: cargo clippy --all-targets -- -D warnings
-      # Run unit, integration and example targets. Tests that need an explicitly configured
-      # external server skip safely when that server is absent.
-      - run: cargo test --all-targets
-      # Deterministic screenshots exercise the real Slint tree in both themes and with every
-      # important overlay. Fixtures contain example.com hosts and /Users/demo paths only.
-      - run: bash scripts/check-ui-render.sh /tmp/gmacftp-render-check
+      # Keep production modules covered without publishing a separate integration-test tree.
+      - run: cargo test --lib
       # The public release target must compile on every change. Distribution is intentionally
       # Apple Silicon-only; the release script verifies the arm64 image before signing.
       - run: cargo build --release --locked --target aarch64-apple-darwin

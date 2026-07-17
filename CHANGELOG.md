@@ -113,9 +113,8 @@ operations, modern SFTP authentication, safe remote editing, and dry-run folder 
 - **Security and privacy gates.** Host keys remain explicit trust-on-first-use, transfer temp files
   are private and link-safe, remote paths are contained, dependency auditing is current, and the
   complete Git history plus release tree pass a secret scan.
-- **Regression coverage.** 74 library tests, 15 controller/path tests, and 4 relay integration tests
-  cover the new pipeline, resume, cancellation, concurrency, path, key-file, synchronization, and
-  no-clobber behavior.
+- **Reliability hardening.** The pipeline, resume, cancellation, concurrency, path, key-file,
+  synchronization, and no-clobber behavior received additional safeguards.
 
 ## 0.0.20 — 2026-07-11
 
@@ -134,8 +133,8 @@ Multi-selection and resilient batch-transfer release.
   remaining files in that batch; unrelated batches are not cancelled.
 - **Visible single-file failures.** A lone failed transfer shows the file name and concrete error in
   a modal message, while the transfer panel retains the diagnostic details.
-- **Regression coverage.** Automated tests cover all/range/disjoint selection and both batch-error
-  decisions (continue and stop).
+- **Selection hardening.** Range and disjoint selection, together with both batch-error decisions,
+  now preserve the intended file set consistently.
 
 ## 0.0.19 — 2026-07-10
 
