@@ -45,7 +45,7 @@ keyring = { version = "4", features = ["apple-native-keyring-store"] }
 aes-gcm = "0.11"
 rand = "0.8"
 base64 = "0.22"
-argon2 = "0.5"   # derive the master-key-wrapping key from the user's sync passphrase
+argon2 = "0.6"   # derive the master-key-wrapping key from the user's sync passphrase
 
 # --- Ergonomics / safety / observability ---
 anyhow = "1"
